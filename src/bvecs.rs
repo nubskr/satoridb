@@ -1,8 +1,8 @@
-use std::fs::File;
-use std::io::{self, Read, BufReader};
-use std::path::Path;
-use flate2::read::GzDecoder;
 use crate::storage::Vector;
+use flate2::read::GzDecoder;
+use std::fs::File;
+use std::io::{self, BufReader, Read};
+use std::path::Path;
 
 pub struct BvecsReader {
     reader: BufReader<GzDecoder<File>>,
@@ -35,7 +35,7 @@ impl BvecsReader {
                 return Err(e.into());
             }
             let dim = u32::from_le_bytes(buf) as usize;
-            
+
             // Validate dim (SIFT is 128)
             if dim != 128 {
                 // In generic bvecs, dim can vary? No, usually fixed.

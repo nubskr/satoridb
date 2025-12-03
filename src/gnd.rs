@@ -1,11 +1,11 @@
-use std::fs::File;
-use std::io::{self, Read, BufReader};
-use std::path::Path;
 use flate2::read::GzDecoder;
+use std::fs::File;
+use std::io::{self, Read};
+use std::path::Path;
 use tar::Archive;
 
 pub struct GndReader {
-    // We load all into memory because random access or parallel check is needed, 
+    // We load all into memory because random access or parallel check is needed,
     // and GT files are usually small (10k queries * 100 ints = 4MB).
     pub ground_truth: Vec<Vec<u32>>,
 }
@@ -33,7 +33,9 @@ impl GndReader {
         }
 
         if ivecs_data.is_empty() {
-            return Err(anyhow::anyhow!("No .ivecs file found in ground truth archive"));
+            return Err(anyhow::anyhow!(
+                "No .ivecs file found in ground truth archive"
+            ));
         }
 
         // Parse ivecs

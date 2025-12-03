@@ -1,6 +1,6 @@
-use hnsw_rs::prelude::*;
-use anyhow::Result;
 use crate::quantizer::Quantizer;
+use anyhow::Result;
+use hnsw_rs::prelude::*;
 
 pub struct Router {
     index: Hnsw<'static, u8, DistL2>,
@@ -23,11 +23,9 @@ impl Router {
         // Direct u8 search
         let ef_search = std::cmp::max(top_k * 20, 200);
         let neighbors = self.index.search(vector, top_k, ef_search);
-        
-        let ids = neighbors.iter()
-            .map(|n| n.d_id as u64)
-            .collect();
-            
+
+        let ids = neighbors.iter().map(|n| n.d_id as u64).collect();
+
         Ok(ids)
     }
 }

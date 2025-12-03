@@ -1,20 +1,20 @@
 use crate::wal::block::{Block, Metadata};
 use crate::wal::config::{
-    DEFAULT_BLOCK_SIZE, FsyncSchedule, MAX_FILE_SIZE, PREFIX_META_SIZE, debug_print,
+    debug_print, FsyncSchedule, DEFAULT_BLOCK_SIZE, MAX_FILE_SIZE, PREFIX_META_SIZE,
 };
 use crate::wal::paths::WalPathManager;
-use crate::wal::storage::{SharedMmapKeeper, set_fsync_schedule};
+use crate::wal::storage::{set_fsync_schedule, SharedMmapKeeper};
 use std::collections::{HashMap, HashSet};
 use std::fs;
 use std::sync::mpsc;
 use std::sync::{Arc, RwLock};
 
-use super::WalIndex;
-use super::allocator::{BlockAllocator, BlockStateTracker, FileStateTracker, flush_check};
+use super::allocator::{flush_check, BlockAllocator, BlockStateTracker, FileStateTracker};
 use super::background::start_background_workers;
 use super::reader::Reader;
 use super::topic_clean::{CleanMarkerStore, TopicCleanTracker};
 use super::writer::Writer;
+use super::WalIndex;
 use rkyv::Deserialize;
 
 #[derive(Clone, Copy, Debug)]

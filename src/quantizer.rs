@@ -15,22 +15,32 @@ impl Quantizer {
 
         for vec in vectors {
             for &val in vec {
-                if val < min { min = val; }
-                if val > max { max = val; }
+                if val < min {
+                    min = val;
+                }
+                if val > max {
+                    max = val;
+                }
             }
         }
-        
+
         // Add padding to prevent boundary issues
         (min - 0.01, max + 0.01)
     }
 
     pub fn quantize(&self, vec: &[f32]) -> Vec<u8> {
         let range = self.max - self.min;
-        let scale = if range.abs() < f32::EPSILON { 0.0 } else { 255.0 / range };
+        let scale = if range.abs() < f32::EPSILON {
+            0.0
+        } else {
+            255.0 / range
+        };
 
-        vec.iter().map(|&v| {
-            let normalized = (v - self.min) * scale;
-            normalized.clamp(0.0, 255.0) as u8
-        }).collect()
+        vec.iter()
+            .map(|&v| {
+                let normalized = (v - self.min) * scale;
+                normalized.clamp(0.0, 255.0) as u8
+            })
+            .collect()
     }
 }

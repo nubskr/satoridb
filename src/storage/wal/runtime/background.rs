@@ -1,11 +1,11 @@
-use crate::wal::config::{FsyncSchedule, debug_print};
-use crate::wal::storage::{StorageImpl, open_storage_for_path};
+use crate::wal::config::{debug_print, FsyncSchedule};
+use crate::wal::storage::{open_storage_for_path, StorageImpl};
 use std::collections::{HashMap, HashSet};
 use std::fs;
 use std::path::Path;
-use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::mpsc;
+use std::sync::Arc;
 use std::thread;
 use std::time::Duration;
 

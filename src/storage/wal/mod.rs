@@ -1,11 +1,11 @@
-mod block;
-mod config;
-mod paths;
-mod runtime;
-mod storage;
+pub mod block;
+pub mod config;
+pub mod paths;
+pub mod runtime;
+pub mod storage;
 
 pub use block::Entry;
-pub use config::{FsyncSchedule, PREFIX_META_SIZE, disable_fd_backend, enable_fd_backend};
+pub use config::{disable_fd_backend, enable_fd_backend, FsyncSchedule, PREFIX_META_SIZE};
 pub use runtime::{ReadConsistency, WalIndex, Walrus};
 
 #[doc(hidden)]

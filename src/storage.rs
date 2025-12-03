@@ -1,10 +1,11 @@
-use rkyv::{Archive, Deserialize, Serialize};
-use std::path::PathBuf;
+use crate::storage::wal::block::Entry;
+use crate::storage::wal::runtime::Walrus;
 use anyhow::Result;
-use glommio::io::{DmaBuffer, DmaFile, rename, ReadResult};
-use std::convert::TryInto;
+use rkyv::{Archive, Deserialize, Serialize};
+use std::sync::Arc;
 use uuid::Uuid;
-use std::fs;
+
+pub mod wal;
 
 #[derive(Archive, Deserialize, Serialize, Debug, PartialEq, Clone)]
 #[archive(check_bytes)]
@@ -43,97 +44,49 @@ impl Bucket {
 
 #[derive(Clone)]
 pub struct Storage {
-    root_path: PathBuf,
+    wal: Arc<Walrus>,
 }
 
 impl Storage {
-    pub fn new(path: impl Into<PathBuf>) -> Self {
-        let root_path = path.into();
-        std::fs::create_dir_all(&root_path).expect("Failed to create storage directory");
-        Self {
-            root_path,
-        }
+    pub fn new(wal: Arc<Walrus>) -> Self {
+        Self { wal }
     }
 
-    /// Fetches raw content of a specific file path.
-    pub async fn fetch_file(&self, path: PathBuf) -> Result<ReadResult> {
-        let file = DmaFile::open(&path).await
-            .map_err(|e| anyhow::anyhow!("Failed to open file {:?}: {:?}", path, e))?;
-            
-        let size = file.file_size().await
-            .map_err(|e| anyhow::anyhow!("Failed to get file size for {:?}: {:?}", path, e))?;
-            
-        let buffer = file.read_at(0, size as usize).await
-            .map_err(|e| anyhow::anyhow!("Failed to read file {:?}: {:?}", path, e))?;
-            
-        file.close().await
-            .map_err(|e| anyhow::anyhow!("Failed to close file {:?}: {:?}", path, e))?;
-            
-        Ok(buffer)
+    fn topic_for(bucket_id: u64) -> String {
+        format!("bucket_{}", bucket_id)
     }
 
-    /// Persists a bucket as a new chunk (immutable file).
+    /// Persists a bucket as an append-only wal entry.
     pub async fn put_chunk(&self, bucket: &Bucket) -> Result<()> {
         let uuid = Uuid::new_v4();
         let file_name = format!("bucket_{}_{}.rkyv", bucket.id, uuid);
-        let final_path = self.root_path.join(&file_name);
-        
-        // Serialize the bucket
+
         let bytes = rkyv::to_bytes::<_, 1024>(bucket)
             .map_err(|e| anyhow::anyhow!("Failed to serialize bucket: {}", e))?;
 
-        // Create file
-        let file = DmaFile::create(&final_path).await
-            .map_err(|e| anyhow::anyhow!("Failed to create file {:?}: {:?}", final_path, e))?;
+        // Keep the legacy len prefix to stay compatible with existing consumers.
+        let mut payload = Vec::with_capacity(8 + bytes.len());
+        payload.extend_from_slice(&bytes.len().to_le_bytes());
+        payload.extend_from_slice(bytes.as_slice());
 
-        // Prepare buffer with length prefix
-        let archive_len = bytes.len();
-        let total_len = 8 + archive_len;
-        let aligned_len = (total_len + 511) & !511;
-
-        // Allocate aligned buffer
-        let mut dma_buf = file.alloc_dma_buffer(aligned_len);
-        
-        // Write length prefix
-        dma_buf.as_bytes_mut()[0..8].copy_from_slice(&archive_len.to_le_bytes());
-        
-        // Copy archive data
-        dma_buf.as_bytes_mut()[8..8+archive_len].copy_from_slice(bytes.as_slice());
-        
-        // Zero padding
-        if 8 + archive_len < aligned_len {
-            dma_buf.as_bytes_mut()[8+archive_len..].fill(0);
-        }
-            
-        // Write at offset 0
-        file.write_at(dma_buf, 0).await
-            .map_err(|e| anyhow::anyhow!("Failed to write to file {:?}: {:?}", final_path, e))?;
-            
-        file.close().await
-            .map_err(|e| anyhow::anyhow!("Failed to close file {:?}: {:?}", final_path, e))?;
-
-        Ok(())
+        self.wal
+            .append_for_topic(&Self::topic_for(bucket.id), &payload)
+            .map_err(|e| anyhow::anyhow!("Walrus append failed ({}): {:?}", file_name, e))
     }
 
     /// Retrieves all chunks for a bucket.
-    pub async fn get_chunks(&self, bucket_id: u64) -> Result<Vec<ReadResult>> {
-        let prefix = format!("bucket_{}_", bucket_id);
-        let mut chunks = Vec::new();
-        
-        // Scan directory (Blocking, but fast enough for metadata)
-        let entries = fs::read_dir(&self.root_path)?;
-        
-        for entry in entries {
-            let entry = entry?;
-            let fname = entry.file_name().into_string().unwrap_or_default();
-            if fname.starts_with(&prefix) && fname.ends_with(".rkyv") {
-                let path = entry.path();
-                // Async read
-                let buffer = self.fetch_file(path).await?;
-                chunks.push(buffer);
-            }
+    pub async fn get_chunks(&self, bucket_id: u64) -> Result<Vec<Vec<u8>>> {
+        let topic = Self::topic_for(bucket_id);
+        let topic_size = self.wal.get_topic_size(&topic) as usize;
+        if topic_size == 0 {
+            return Ok(Vec::new());
         }
-        
-        Ok(chunks)
+
+        let entries: Vec<Entry> = self
+            .wal
+            .batch_read_for_topic(&topic, topic_size + 1024, false, Some(0))
+            .map_err(|e| anyhow::anyhow!("Walrus read failed for {}: {:?}", topic, e))?;
+
+        Ok(entries.into_iter().map(|e| e.data).collect())
     }
 }

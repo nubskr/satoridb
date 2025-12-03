@@ -1,3 +1,5 @@
+wal_files/
+gist/
 satori_data/
 *.gz
 /target
