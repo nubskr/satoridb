@@ -12,18 +12,21 @@ impl Indexer {
             return vec![];
         }
 
-        let dim = vectors[0].data.len();
-        let mut rng = rand::thread_rng();
-
-        // 1. Init centroids (Forgy method: choose k random observations)
-        let mut centroids: Vec<Vec<f32>> = vectors
-            .choose_multiple(&mut rng, k)
-            .map(|v| v.data.clone())
+        // Convert to f32 for K-Means math
+        let float_data: Vec<Vec<f32>> = vectors.iter()
+            .map(|v| v.data.iter().map(|&x| x as f32).collect())
             .collect();
 
-        // If we didn't get enough unique vectors (e.g. dataset < k), handle it
+        let dim = float_data[0].len();
+        let mut rng = rand::thread_rng();
+
+        // 1. Init centroids
+        let mut centroids: Vec<Vec<f32>> = float_data
+            .choose_multiple(&mut rng, k)
+            .cloned()
+            .collect();
+
         while centroids.len() < k {
-             // fill with random noise or just duplicate
              let mut random_vec = vec![0.0; dim];
              for x in random_vec.iter_mut() { *x = rng.gen(); }
              centroids.push(random_vec);
@@ -38,12 +41,12 @@ impl Indexer {
             let mut counts = vec![0; k];
 
             // Assign
-            for (i, vec) in vectors.iter().enumerate() {
+            for (i, vec_data) in float_data.iter().enumerate() {
                 let mut min_dist = f32::MAX;
                 let mut best_cluster = 0;
 
                 for (c_idx, centroid) in centroids.iter().enumerate() {
-                    let dist = l2_dist_sq(&vec.data, centroid);
+                    let dist = l2_dist_sq(vec_data, centroid);
                     if dist < min_dist {
                         min_dist = dist;
                         best_cluster = c_idx;
@@ -55,8 +58,8 @@ impl Indexer {
                     changed = true;
                 }
 
-                // Accumulate for update
-                for (d, val) in vec.data.iter().enumerate() {
+                // Accumulate
+                for (d, &val) in vec_data.iter().enumerate() {
                     sums[best_cluster][d] += val;
                 }
                 counts[best_cluster] += 1;
@@ -66,29 +69,21 @@ impl Indexer {
                 break;
             }
 
-            // Update centroids
+            // Update
             for j in 0..k {
                 if counts[j] > 0 {
                     for d in 0..dim {
                         centroids[j][d] = sums[j][d] / counts[j] as f32;
                     }
                 } else {
-                    // Re-init empty cluster to a random vector's position (or keep same)
-                    // Simple strategy: leave it or reset to a random point. 
-                    // Leaving it often results in it staying empty.
-                    // Resetting to a random vector from the dataset:
-                    if let Some(v) = vectors.choose(&mut rng) {
-                        centroids[j] = v.data.clone();
+                    if let Some(v) = float_data.choose(&mut rng) {
+                        centroids[j] = v.clone();
                     }
                 }
             }
         }
 
         // Build Buckets
-        // We need to group vectors by assignment.
-        // Since we consumed 'vectors', we can move them.
-        
-        // Prepare buckets
         let mut buckets_data: Vec<Vec<Vector>> = (0..k).map(|_| Vec::new()).collect();
         
         for (i, vec) in vectors.into_iter().enumerate() {
@@ -98,7 +93,6 @@ impl Indexer {
 
         let mut buckets = Vec::new();
         for (i, b_vectors) in buckets_data.into_iter().enumerate() {
-            // Only create bucket if it has vectors (or we could keep empty ones)
             if !b_vectors.is_empty() {
                 let mut b = Bucket::new(i as u64, centroids[i].clone());
                 b.vectors = b_vectors;

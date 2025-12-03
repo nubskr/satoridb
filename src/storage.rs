@@ -3,12 +3,14 @@ use std::path::PathBuf;
 use anyhow::Result;
 use glommio::io::{DmaBuffer, DmaFile, rename, ReadResult};
 use std::convert::TryInto;
+use uuid::Uuid;
+use std::fs;
 
 #[derive(Archive, Deserialize, Serialize, Debug, PartialEq, Clone)]
 #[archive(check_bytes)]
 pub struct Vector {
     pub id: u64,
-    pub data: Vec<f32>,
+    pub data: Vec<u8>,
 }
 
 #[derive(Archive, Deserialize, Serialize, Debug, PartialEq, Clone)]
@@ -20,7 +22,7 @@ pub struct Bucket {
 }
 
 impl Vector {
-    pub fn new(id: u64, data: Vec<f32>) -> Self {
+    pub fn new(id: u64, data: Vec<u8>) -> Self {
         Self { id, data }
     }
 }
@@ -53,38 +55,36 @@ impl Storage {
         }
     }
 
-    /// Fetches the raw file content (including length prefix) for a bucket.
-    pub async fn fetch_raw(&self, bucket_id: u64) -> Result<ReadResult> {
-        let file_path = self.root_path.join(format!("bucket_{}.rkyv", bucket_id));
-        
-        let file = DmaFile::open(&file_path).await
-            .map_err(|e| anyhow::anyhow!("Failed to open file {:?}: {:?}", file_path, e))?;
+    /// Fetches raw content of a specific file path.
+    pub async fn fetch_file(&self, path: PathBuf) -> Result<ReadResult> {
+        let file = DmaFile::open(&path).await
+            .map_err(|e| anyhow::anyhow!("Failed to open file {:?}: {:?}", path, e))?;
             
         let size = file.file_size().await
-            .map_err(|e| anyhow::anyhow!("Failed to get file size for {:?}: {:?}", file_path, e))?;
+            .map_err(|e| anyhow::anyhow!("Failed to get file size for {:?}: {:?}", path, e))?;
             
         let buffer = file.read_at(0, size as usize).await
-            .map_err(|e| anyhow::anyhow!("Failed to read file {:?}: {:?}", file_path, e))?;
+            .map_err(|e| anyhow::anyhow!("Failed to read file {:?}: {:?}", path, e))?;
             
         file.close().await
-            .map_err(|e| anyhow::anyhow!("Failed to close file {:?}: {:?}", file_path, e))?;
+            .map_err(|e| anyhow::anyhow!("Failed to close file {:?}: {:?}", path, e))?;
             
         Ok(buffer)
     }
 
-    /// Persists a bucket to disk atomically.
-    pub async fn put(&self, bucket: &Bucket) -> Result<()> {
-        let file_name = format!("bucket_{}.rkyv", bucket.id);
+    /// Persists a bucket as a new chunk (immutable file).
+    pub async fn put_chunk(&self, bucket: &Bucket) -> Result<()> {
+        let uuid = Uuid::new_v4();
+        let file_name = format!("bucket_{}_{}.rkyv", bucket.id, uuid);
         let final_path = self.root_path.join(&file_name);
-        let temp_path = self.root_path.join(format!("{}.tmp", file_name));
         
         // Serialize the bucket
         let bytes = rkyv::to_bytes::<_, 1024>(bucket)
             .map_err(|e| anyhow::anyhow!("Failed to serialize bucket: {}", e))?;
 
-        // Create temp file
-        let file = DmaFile::create(&temp_path).await
-            .map_err(|e| anyhow::anyhow!("Failed to create file {:?}: {:?}", temp_path, e))?;
+        // Create file
+        let file = DmaFile::create(&final_path).await
+            .map_err(|e| anyhow::anyhow!("Failed to create file {:?}: {:?}", final_path, e))?;
 
         // Prepare buffer with length prefix
         let archive_len = bytes.len();
@@ -107,48 +107,33 @@ impl Storage {
             
         // Write at offset 0
         file.write_at(dma_buf, 0).await
-            .map_err(|e| anyhow::anyhow!("Failed to write to file {:?}: {:?}", temp_path, e))?;
+            .map_err(|e| anyhow::anyhow!("Failed to write to file {:?}: {:?}", final_path, e))?;
             
         file.close().await
-            .map_err(|e| anyhow::anyhow!("Failed to close file {:?}: {:?}", temp_path, e))?;
-
-        // Atomic Rename
-        rename(&temp_path, &final_path).await
-            .map_err(|e| anyhow::anyhow!("Failed to rename {:?} to {:?}: {:?}", temp_path, final_path, e))?;
+            .map_err(|e| anyhow::anyhow!("Failed to close file {:?}: {:?}", final_path, e))?;
 
         Ok(())
     }
 
-    /// Retrieves buckets from disk by their IDs.
-    pub async fn get(&self, bucket_ids: &[u64]) -> Result<Vec<Bucket>> {
-        let mut buckets = Vec::with_capacity(bucket_ids.len());
+    /// Retrieves all chunks for a bucket.
+    pub async fn get_chunks(&self, bucket_id: u64) -> Result<Vec<ReadResult>> {
+        let prefix = format!("bucket_{}_", bucket_id);
+        let mut chunks = Vec::new();
         
-        for id in bucket_ids {
-            let buffer = self.fetch_raw(*id).await?;
-            
-            // Use as_ref() (or deref) to access bytes
-            let bytes = &*buffer;
-            
-            if bytes.len() < 8 {
-                return Err(anyhow::anyhow!("File too small (corrupted header) for bucket {}", id));
+        // Scan directory (Blocking, but fast enough for metadata)
+        let entries = fs::read_dir(&self.root_path)?;
+        
+        for entry in entries {
+            let entry = entry?;
+            let fname = entry.file_name().into_string().unwrap_or_default();
+            if fname.starts_with(&prefix) && fname.ends_with(".rkyv") {
+                let path = entry.path();
+                // Async read
+                let buffer = self.fetch_file(path).await?;
+                chunks.push(buffer);
             }
-
-            let len_bytes: [u8; 8] = bytes[0..8].try_into()
-                .map_err(|e| anyhow::anyhow!("Failed to read length prefix: {:?}", e))?;
-            let archive_len = u64::from_le_bytes(len_bytes) as usize;
-
-            if 8 + archive_len > bytes.len() {
-                return Err(anyhow::anyhow!("Archive length {} exceeds buffer size {}", archive_len, bytes.len()));
-            }
-                
-            let archive_slice = &bytes[8..8+archive_len];
-                
-            let bucket: Bucket = rkyv::from_bytes(archive_slice)
-                .map_err(|e| anyhow::anyhow!("Failed to deserialize bucket {}: {}", id, e))?;
-                
-            buckets.push(bucket);
         }
         
-        Ok(buckets)
+        Ok(chunks)
     }
 }
