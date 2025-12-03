@@ -19,10 +19,11 @@ impl Router {
         self.index.insert((&q_vec, id as usize));
     }
 
-    pub fn query(&self, vector: &[u8], top_k: usize) -> Result<Vec<u64>> {
-        // Direct u8 search
+    pub fn query(&self, vector: &[f32], top_k: usize) -> Result<Vec<u64>> {
+        // Quantize the incoming float vector to match centroid space.
+        let q_vec = self.quantizer.quantize(vector);
         let ef_search = std::cmp::max(top_k * 20, 200);
-        let neighbors = self.index.search(vector, top_k, ef_search);
+        let neighbors = self.index.search(&q_vec, top_k, ef_search);
 
         let ids = neighbors.iter().map(|n| n.d_id as u64).collect();
 

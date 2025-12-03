@@ -49,8 +49,9 @@ impl BvecsReader {
             let mut data_buf = vec![0u8; dim];
             self.reader.read_exact(&mut data_buf)?;
 
-            // data_buf is already Vec<u8>
-            vectors.push(Vector::new(self.current_id, data_buf));
+            // Upcast to f32 for distance calculations.
+            let data: Vec<f32> = data_buf.iter().map(|&v| v as f32).collect();
+            vectors.push(Vector::new(self.current_id, data));
             self.current_id += 1;
         }
 

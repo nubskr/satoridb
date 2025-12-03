@@ -86,7 +86,7 @@ impl Executor {
 
     pub async fn query(
         &self,
-        query_vec: &[u8],
+        query_vec: &[f32],
         bucket_ids: &[u64],
         top_k: usize,
     ) -> Result<Vec<(u64, f32)>> {
@@ -99,7 +99,7 @@ impl Executor {
                     if vector.data.len() != query_vec.len() {
                         continue;
                     }
-                    let dist = l2_distance_u8(&vector.data, query_vec);
+                    let dist = l2_distance_f32(&vector.data, query_vec);
                     candidates.push((vector.id, dist));
                 }
                 continue;
@@ -110,7 +110,7 @@ impl Executor {
                 if vector.data.len() != query_vec.len() {
                     continue;
                 }
-                let dist = l2_distance_u8(&vector.data, query_vec);
+                let dist = l2_distance_f32(&vector.data, query_vec);
                 candidates.push((vector.id, dist));
             }
             cache.put(id, loaded);
@@ -128,14 +128,14 @@ impl Executor {
     }
 }
 
-fn l2_distance_u8(a: &[u8], b: &[u8]) -> f32 {
-    let sum_sq: u32 = a
+fn l2_distance_f32(a: &[f32], b: &[f32]) -> f32 {
+    let sum_sq: f32 = a
         .iter()
         .zip(b.iter())
         .map(|(&x, &y)| {
-            let diff = x as i32 - y as i32;
-            (diff * diff) as u32
+            let diff = x - y;
+            diff * diff
         })
         .sum();
-    (sum_sq as f32).sqrt()
+    sum_sq.sqrt()
 }

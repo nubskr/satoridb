@@ -11,7 +11,7 @@ pub mod wal;
 #[archive(check_bytes)]
 pub struct Vector {
     pub id: u64,
-    pub data: Vec<u8>,
+    pub data: Vec<f32>,
 }
 
 #[derive(Archive, Deserialize, Serialize, Debug, PartialEq, Clone)]
@@ -23,7 +23,7 @@ pub struct Bucket {
 }
 
 impl Vector {
-    pub fn new(id: u64, data: Vec<u8>) -> Self {
+    pub fn new(id: u64, data: Vec<f32>) -> Self {
         Self { id, data }
     }
 }

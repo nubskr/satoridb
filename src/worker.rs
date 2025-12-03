@@ -9,7 +9,7 @@ use std::collections::HashMap;
 use std::sync::Arc;
 
 pub struct QueryRequest {
-    pub query_vec: Vec<u8>,
+    pub query_vec: Vec<f32>,
     pub bucket_ids: Vec<u64>,
     pub respond_to: oneshot::Sender<anyhow::Result<Vec<(u64, f32)>>>,
 }
@@ -19,6 +19,9 @@ pub enum WorkerMessage {
     Ingest {
         bucket_id: u64,
         vectors: Vec<Vector>,
+    },
+    Flush {
+        respond_to: oneshot::Sender<()>,
     },
 }
 
@@ -57,6 +60,22 @@ pub async fn run_worker(id: usize, receiver: Receiver<WorkerMessage>, wal: Arc<W
                         );
                     }
                 }
+            }
+            WorkerMessage::Flush { respond_to } => {
+                for (bucket_id, vectors) in ingest_buffers.iter_mut() {
+                    if vectors.is_empty() {
+                        continue;
+                    }
+                    let mut bucket = Bucket::new(*bucket_id, vec![]);
+                    bucket.vectors = std::mem::take(vectors);
+                    if let Err(e) = storage.put_chunk(&bucket).await {
+                        error!(
+                            "Worker {} failed to flush bucket {} on flush signal: {:?}",
+                            id, bucket_id, e
+                        );
+                    }
+                }
+                let _ = respond_to.send(());
             }
         }
     }

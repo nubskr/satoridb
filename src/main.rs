@@ -52,7 +52,7 @@ struct DatasetConfig {
 }
 
 struct RouterTask {
-    query_vec: Vec<u8>,
+    query_vec: Vec<f32>,
     top_k: usize,
     respond_to: oneshot::Sender<anyhow::Result<Vec<u64>>>,
 }
@@ -397,6 +397,20 @@ async fn run_benchmark_mode(
             }
             total_processed += stream_batch_size;
         }
+        info!("Flushing all workers before queries...");
+        let mut flush_waiters = Vec::new();
+        for sender in &senders {
+            let (tx, rx) = oneshot::channel();
+            if let Err(e) = sender.send(WorkerMessage::Flush { respond_to: tx }).await {
+                log::error!("Failed to send flush: {:?}", e);
+            } else {
+                flush_waiters.push(rx);
+            }
+        }
+        // Wait for all workers to confirm flush so queries see every vector.
+        for rx in flush_waiters {
+            let _ = rx.await;
+        }
         info!(
             "Ingestion complete. Total vectors ingested or scanned: {}",
             total_processed
@@ -452,6 +466,14 @@ async fn run_benchmark_mode(
                 .map_err(|e| anyhow!("router send: {:?}", e))?;
             let bucket_ids = rx.await.map_err(|e| anyhow!("router recv: {:?}", e))??;
 
+            if i == 0 {
+                info!(
+                    "Debug query[0]: router returned {} bucket ids (top_k={})",
+                    bucket_ids.len(),
+                    router_top_k
+                );
+            }
+
             let mut pending = Vec::new();
             let mut requests: HashMap<usize, Vec<u64>> = HashMap::new();
             for &bid in &bucket_ids {
@@ -479,6 +501,12 @@ async fn run_benchmark_mode(
                     all_results.extend(candidates);
                 }
             }
+            if i == 0 {
+                info!(
+                    "Debug query[0]: collected {} candidates from workers",
+                    all_results.len()
+                );
+            }
             all_results.sort_by(|a, b| a.1.partial_cmp(&b.1).unwrap_or(std::cmp::Ordering::Equal));
 
             if let Some(ref gt) = ground_truth {
@@ -494,6 +522,10 @@ async fn run_benchmark_mode(
 
                     let my_top_10: Vec<u32> =
                         all_results.iter().take(10).map(|r| r.0 as u32).collect();
+                    if i == 0 {
+                        info!("Debug query[0]: my_top_10={:?}", my_top_10);
+                        info!("Debug query[0]: gt_top_10={:?}", gt_top_10);
+                    }
                     let hits = my_top_10.iter().filter(|id| gt_top_10.contains(id)).count();
                     total_hits_at_10 += hits;
                     total_queries_checked += 1;

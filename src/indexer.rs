@@ -104,7 +104,17 @@ impl Indexer {
             }
         }
 
-        Self::rebalance_buckets(buckets)
+        let balanced = Self::rebalance_buckets(buckets);
+
+        // Reindex buckets to ensure unique, dense IDs after rebalancing/splitting.
+        let mut reindexed = Vec::with_capacity(balanced.len());
+        for (i, b) in balanced.into_iter().enumerate() {
+            let mut nb = Bucket::new(i as u64, b.centroid);
+            nb.vectors = b.vectors;
+            reindexed.push(nb);
+        }
+
+        reindexed
     }
 
     pub fn split_bucket(bucket: Bucket) -> Vec<Bucket> {

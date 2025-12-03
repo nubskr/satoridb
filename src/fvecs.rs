@@ -35,14 +35,13 @@ impl FvecsReader {
             let mut data_buf = vec![0u8; dim * 4];
             self.reader.read_exact(&mut data_buf)?;
 
-            let mut quantized = Vec::with_capacity(dim);
+            let mut data = Vec::with_capacity(dim);
             for chunk in data_buf.chunks_exact(4) {
                 let val = f32::from_le_bytes([chunk[0], chunk[1], chunk[2], chunk[3]]);
-                let clamped = val.clamp(0.0, 255.0);
-                quantized.push(clamped.round() as u8);
+                data.push(val);
             }
 
-            vectors.push(Vector::new(self.current_id, quantized));
+            vectors.push(Vector::new(self.current_id, data));
             self.current_id += 1;
         }
 
