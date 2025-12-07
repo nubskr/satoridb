@@ -129,13 +129,45 @@ impl Executor {
 }
 
 fn l2_distance_f32(a: &[f32], b: &[f32]) -> f32 {
-    let sum_sq: f32 = a
-        .iter()
-        .zip(b.iter())
-        .map(|(&x, &y)| {
-            let diff = x - y;
-            diff * diff
-        })
-        .sum();
-    sum_sq.sqrt()
+    if cfg!(target_arch = "x86_64") && std::arch::is_x86_feature_detected!("avx2") {
+        unsafe { l2_distance_f32_avx2(a, b) }
+    } else {
+        let sum_sq: f32 = a
+            .iter()
+            .zip(b.iter())
+            .map(|(&x, &y)| {
+                let diff = x - y;
+                diff * diff
+            })
+            .sum();
+        sum_sq.sqrt()
+    }
+}
+
+#[target_feature(enable = "avx2")]
+unsafe fn l2_distance_f32_avx2(a: &[f32], b: &[f32]) -> f32 {
+    use std::arch::x86_64::*;
+
+    let len = a.len().min(b.len());
+    let mut sum = _mm256_setzero_ps();
+    let mut i = 0;
+    while i + 8 <= len {
+        let va = _mm256_loadu_ps(a.as_ptr().add(i));
+        let vb = _mm256_loadu_ps(b.as_ptr().add(i));
+        let diff = _mm256_sub_ps(va, vb);
+        let sq = _mm256_mul_ps(diff, diff);
+        sum = _mm256_add_ps(sum, sq);
+        i += 8;
+    }
+
+    let mut tmp = [0f32; 8];
+    _mm256_storeu_ps(tmp.as_mut_ptr(), sum);
+    let mut total = tmp.iter().sum::<f32>();
+
+    for j in i..len {
+        let d = a[j] - b[j];
+        total += d * d;
+    }
+
+    total.sqrt()
 }

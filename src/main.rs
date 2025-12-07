@@ -195,7 +195,7 @@ fn main() -> anyhow::Result<()> {
         .ok()
         .and_then(|v| v.parse().ok())
         .unwrap_or_else(|| num_cpus::get().max(1));
-    let router_pool = ((satori_cores as f32) * 0.1).round() as usize;
+    let router_pool = ((satori_cores as f32) * 0.2).round() as usize;
     let router_pool = router_pool.max(1);
     let executor_shards = (satori_cores.saturating_sub(router_pool)).max(1);
     info!(
@@ -216,9 +216,10 @@ fn main() -> anyhow::Result<()> {
         let (sender, receiver) = async_channel::bounded(1000);
         senders.push(sender);
         let wal_clone = wal.clone();
+        let pin_cpu = i % num_cpus::get();
         let handle = thread::spawn(move || {
-            let builder =
-                LocalExecutorBuilder::new(Placement::Unbound).name(&format!("worker-{}", i));
+            let builder = LocalExecutorBuilder::new(Placement::Fixed(pin_cpu))
+                .name(&format!("worker-{}", i));
 
             let result = builder
                 .make()
