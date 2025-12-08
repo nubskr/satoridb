@@ -30,3 +30,21 @@ impl Router {
         Ok(ids)
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::quantizer::Quantizer;
+
+    #[test]
+    fn routes_to_nearest_centroid() {
+        let quantizer = Quantizer::new(0.0, 1.0);
+        let mut router = Router::new(10, quantizer);
+        router.add_centroid(42, &[0.0, 0.0]);
+        router.add_centroid(7, &[1.0, 1.0]);
+
+        let ids = router.query(&[0.1, 0.0], 1).unwrap();
+        assert_eq!(ids.len(), 1);
+        assert_eq!(ids[0], 42);
+    }
+}

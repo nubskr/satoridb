@@ -3,6 +3,7 @@ mod executor;
 mod fvecs;
 mod gnd;
 mod indexer;
+mod net;
 mod quantizer;
 mod router;
 mod storage;
@@ -21,6 +22,7 @@ use std::collections::hash_map::DefaultHasher;
 use std::collections::HashMap;
 use std::fs::{self, File};
 use std::hash::{Hash, Hasher};
+use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::thread;
@@ -30,6 +32,7 @@ use crate::bvecs::BvecsReader;
 use crate::fvecs::FvecsReader;
 use crate::gnd::GndReader;
 use crate::indexer::Indexer;
+use crate::net::spawn_network_server;
 use crate::quantizer::Quantizer;
 use crate::router::Router;
 use crate::storage::{Storage, Vector};
@@ -51,18 +54,19 @@ struct DatasetConfig {
     max_vectors: usize,
 }
 
-struct RouterTask {
-    query_vec: Vec<f32>,
-    top_k: usize,
-    respond_to: oneshot::Sender<anyhow::Result<Vec<u64>>>,
+pub struct RouterTask {
+    pub query_vec: Vec<f32>,
+    pub top_k: usize,
+    pub respond_to: oneshot::Sender<anyhow::Result<Vec<u64>>>,
 }
 
-struct ConsistentHashRing {
+#[derive(Clone)]
+pub struct ConsistentHashRing {
     ring: Vec<(u64, usize)>,
 }
 
 impl ConsistentHashRing {
-    fn new(nodes: usize, virtual_nodes: usize) -> Self {
+    pub fn new(nodes: usize, virtual_nodes: usize) -> Self {
         let mut ring = Vec::new();
         for node in 0..nodes {
             for v in 0..virtual_nodes.max(1) {
@@ -75,7 +79,7 @@ impl ConsistentHashRing {
         Self { ring }
     }
 
-    fn node_for(&self, key: u64) -> usize {
+    pub fn node_for(&self, key: u64) -> usize {
         if self.ring.is_empty() {
             return 0;
         }
@@ -256,17 +260,43 @@ fn main() -> anyhow::Result<()> {
         router_handles.push(handle);
     }
 
+    let listen_addr = std::env::var("SATORI_LISTEN_ADDR").ok();
+
     let run_benchmark = std::env::var("SATORI_RUN_BENCH").is_ok();
     if run_benchmark {
         block_on(run_benchmark_mode(
             wal.clone(),
             router_tx.clone(),
             router_shared.clone(),
-            ring,
+            ring.clone(),
             senders.clone(),
         ))?;
     } else {
         info!("Benchmark logic is disabled (set SATORI_RUN_BENCH=1 to enable).");
+    }
+
+    let net_handle = if let Some(addr_str) = listen_addr {
+        match addr_str.parse::<SocketAddr>() {
+            Ok(addr) => match spawn_network_server(addr, router_tx.clone(), ring.clone(), senders.clone()) {
+                Ok(handle) => Some(handle),
+                Err(e) => {
+                    log::error!("Failed to start network server on {}: {:?}", addr, e);
+                    None
+                }
+            },
+            Err(e) => {
+                log::error!("Invalid SATORI_LISTEN_ADDR ({}): {:?}", addr_str, e);
+                None
+            }
+        }
+    } else {
+        None
+    };
+
+    if let Some(handle) = net_handle {
+        info!("Network server running; press Ctrl+C to exit.");
+        let _ = handle.join();
+        return Ok(());
     }
 
     // Close router channel and worker channels for clean shutdown

@@ -58,3 +58,51 @@ impl BvecsReader {
         Ok(vectors)
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use flate2::write::GzEncoder;
+    use flate2::Compression;
+    use std::io::Write;
+    use tempfile::NamedTempFile;
+
+    #[test]
+    fn reads_multiple_vectors() {
+        let mut tmp = NamedTempFile::new().unwrap();
+        {
+            let mut encoder = GzEncoder::new(&mut tmp, Compression::default());
+            // Two vectors, dim = 3
+            for vec_vals in [[1u8, 2, 3], [4u8, 5, 6]] {
+                encoder.write_all(&(vec_vals.len() as u32).to_le_bytes()).unwrap();
+                encoder.write_all(&vec_vals).unwrap();
+            }
+            encoder.finish().unwrap();
+        }
+
+        let mut reader = BvecsReader::new(tmp.path()).unwrap();
+        let batch = reader.read_batch(10).unwrap();
+        assert_eq!(batch.len(), 2);
+        assert_eq!(batch[0].id, 0);
+        assert_eq!(batch[0].data, vec![1.0, 2.0, 3.0]);
+        assert_eq!(batch[1].id, 1);
+        assert_eq!(batch[1].data, vec![4.0, 5.0, 6.0]);
+    }
+
+    #[test]
+    fn stops_on_eof() {
+        let mut tmp = NamedTempFile::new().unwrap();
+        {
+            let mut encoder = GzEncoder::new(&mut tmp, Compression::default());
+            encoder.write_all(&1u32.to_le_bytes()).unwrap(); // dim = 1
+            encoder.write_all(&[9u8]).unwrap();
+            encoder.finish().unwrap();
+        }
+
+        let mut reader = BvecsReader::new(tmp.path()).unwrap();
+        let first = reader.read_batch(1).unwrap();
+        let second = reader.read_batch(1).unwrap();
+        assert_eq!(first.len(), 1);
+        assert!(second.is_empty());
+    }
+}

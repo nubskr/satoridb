@@ -48,3 +48,43 @@ impl FvecsReader {
         Ok(vectors)
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::io::Write;
+    use tempfile::NamedTempFile;
+
+    #[test]
+    fn reads_fvecs_records() {
+        let mut tmp = NamedTempFile::new().unwrap();
+        // Two vectors, dim=2
+        tmp.write_all(&2u32.to_le_bytes()).unwrap();
+        for f in [1.5f32, 2.5f32] {
+            tmp.write_all(&f.to_le_bytes()).unwrap();
+        }
+        tmp.write_all(&2u32.to_le_bytes()).unwrap();
+        for f in [3.5f32, 4.5f32] {
+            tmp.write_all(&f.to_le_bytes()).unwrap();
+        }
+        tmp.flush().unwrap();
+
+        let mut reader = FvecsReader::new(tmp.path()).unwrap();
+        let batch = reader.read_batch(10).unwrap();
+        assert_eq!(batch.len(), 2);
+        assert_eq!(batch[0].data, vec![1.5, 2.5]);
+        assert_eq!(batch[1].data, vec![3.5, 4.5]);
+    }
+
+    #[test]
+    fn empty_on_eof() {
+        let mut tmp = NamedTempFile::new().unwrap();
+        tmp.write_all(&1u32.to_le_bytes()).unwrap();
+        tmp.write_all(&0.0f32.to_le_bytes()).unwrap();
+        tmp.flush().unwrap();
+
+        let mut reader = FvecsReader::new(tmp.path()).unwrap();
+        assert_eq!(reader.read_batch(1).unwrap().len(), 1);
+        assert!(reader.read_batch(1).unwrap().is_empty());
+    }
+}

@@ -179,3 +179,29 @@ unsafe fn l2_dist_sq_avx2(a: &[f32], b: &[f32]) -> f32 {
     }
     total
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::storage::Vector;
+
+    #[test]
+    fn builds_reasonable_clusters() {
+        let vectors = vec![
+            Vector::new(0, vec![0.0, 0.0]),
+            Vector::new(1, vec![0.0, 1.0]),
+            Vector::new(2, vec![10.0, 10.0]),
+            Vector::new(3, vec![10.0, 11.0]),
+        ];
+        let buckets = Indexer::build_clusters(vectors, 2);
+        assert_eq!(buckets.len(), 2);
+        let total_vectors: usize = buckets.iter().map(|b| b.vectors.len()).sum();
+        assert_eq!(total_vectors, 4);
+    }
+
+    #[test]
+    fn handles_empty() {
+        let buckets = Indexer::build_clusters(Vec::new(), 2);
+        assert!(buckets.is_empty());
+    }
+}

@@ -62,3 +62,40 @@ impl GndReader {
         Ok(Self { ground_truth })
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use flate2::write::GzEncoder;
+    use flate2::Compression;
+    use std::io::Write;
+    use tar::Builder;
+    use tempfile::NamedTempFile;
+
+    #[test]
+    fn parses_ivecs_from_tar_gz() {
+        let mut tmp = NamedTempFile::new().unwrap();
+        {
+            let gz = GzEncoder::new(&mut tmp, Compression::default());
+            let mut tar_builder = Builder::new(gz);
+            let data = {
+                let mut buf = Vec::new();
+                buf.extend_from_slice(&2u32.to_le_bytes()); // dim=2
+                buf.extend_from_slice(&10u32.to_le_bytes());
+                buf.extend_from_slice(&20u32.to_le_bytes());
+                buf
+            };
+            let mut header = tar::Header::new_gnu();
+            header.set_size(data.len() as u64);
+            header.set_cksum();
+            tar_builder
+                .append_data(&mut header, "gt.ivecs", data.as_slice())
+                .unwrap();
+            tar_builder.finish().unwrap();
+        }
+
+        let reader = GndReader::new(tmp.path()).unwrap();
+        assert_eq!(reader.ground_truth.len(), 1);
+        assert_eq!(reader.ground_truth[0], vec![10u32, 20u32]);
+    }
+}
