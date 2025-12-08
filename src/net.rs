@@ -229,7 +229,10 @@ async fn handle_connection(
     Ok(())
 }
 
-async fn read_frame(stream: &mut glommio::net::TcpStream) -> Result<Option<Vec<u8>>> {
+async fn read_frame<R>(stream: &mut R) -> Result<Option<Vec<u8>>>
+where
+    R: AsyncReadExt + Unpin,
+{
     let mut len_buf = [0u8; 4];
     match stream.read_exact(&mut len_buf).await {
         Ok(()) => {}
@@ -245,10 +248,52 @@ async fn read_frame(stream: &mut glommio::net::TcpStream) -> Result<Option<Vec<u
     Ok(Some(buf))
 }
 
-async fn write_frame(stream: &mut glommio::net::TcpStream, resp: &NetResponse) -> Result<()> {
+async fn write_frame<W>(stream: &mut W, resp: &NetResponse) -> Result<()>
+where
+    W: AsyncWriteExt + Unpin,
+{
     let bytes = serde_json::to_vec(resp).context("serialize response")?;
     let len = bytes.len() as u32;
     stream.write_all(&len.to_le_bytes()).await?;
     stream.write_all(&bytes).await?;
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use futures::executor::block_on;
+    use futures_lite::io::Cursor;
+    use serde_json::Value;
+
+    #[test]
+    fn write_and_read_frame_round_trips() {
+        block_on(async {
+            let mut cursor = Cursor::new(Vec::new());
+            let resp = NetResponse::Ok {
+                results: vec![ResultItem {
+                    id: 1,
+                    distance: 0.5,
+                }],
+            };
+            write_frame(&mut cursor, &resp).await.unwrap();
+            cursor.set_position(0);
+            let frame = read_frame(&mut cursor).await.unwrap().unwrap();
+            let v: Value = serde_json::from_slice(&frame).unwrap();
+            assert_eq!(v["status"], "ok");
+            assert_eq!(v["results"][0]["id"], 1);
+        });
+    }
+
+    #[test]
+    fn read_frame_rejects_oversize() {
+        block_on(async {
+            let max = 10 * 1024 * 1024 + 1;
+            let mut data = Vec::new();
+            data.extend_from_slice(&(max as u32).to_le_bytes());
+            let mut cursor = Cursor::new(data);
+            let err = read_frame(&mut cursor).await.unwrap_err();
+            assert!(err.to_string().contains("frame too large"));
+        });
+    }
 }

@@ -171,3 +171,32 @@ unsafe fn l2_distance_f32_avx2(a: &[f32], b: &[f32]) -> f32 {
 
     total.sqrt()
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn l2_distance_matches_scalar() {
+        let a = vec![1.0f32, 2.0, 3.0, 4.0];
+        let b = vec![1.0f32, 1.0, 1.0, 1.0];
+        let expected: f32 = a
+            .iter()
+            .zip(b.iter())
+            .map(|(x, y)| (x - y).powi(2))
+            .sum::<f32>()
+            .sqrt();
+        let dist = l2_distance_f32(&a, &b);
+        assert!((dist - expected).abs() < 1e-5);
+    }
+
+    #[test]
+    fn l2_distance_handles_mismatched_lengths() {
+        let a = vec![1.0f32, 2.0, 3.0];
+        let b = vec![1.0f32, 2.0];
+        let dist = l2_distance_f32(&a, &b);
+        // Should only consider the min length (2 elements)
+        let expected = ((0.0f32).powi(2) + (0.0f32).powi(2)).sqrt();
+        assert!((dist - expected).abs() < 1e-5);
+    }
+}

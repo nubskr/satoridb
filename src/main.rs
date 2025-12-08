@@ -95,6 +95,27 @@ impl ConsistentHashRing {
     }
 }
 
+#[cfg(test)]
+mod tests {
+    use super::ConsistentHashRing;
+
+    #[test]
+    fn hash_ring_is_deterministic() {
+        let ring = ConsistentHashRing::new(4, 8);
+        assert_eq!(ring.node_for(42), ring.node_for(42));
+    }
+
+    #[test]
+    fn hash_ring_respects_node_bounds() {
+        let nodes = 3;
+        let ring = ConsistentHashRing::new(nodes, 4);
+        for key in 0..100 {
+            let node = ring.node_for(key);
+            assert!(node < nodes);
+        }
+    }
+}
+
 fn ensure_gist_files(tar_path: &Path) -> anyhow::Result<()> {
     let base_path = Path::new("gist/gist_base.fvecs");
     let query_path = Path::new("gist/gist_query.fvecs");
