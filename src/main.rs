@@ -6,11 +6,13 @@ mod indexer;
 mod ingest_counter;
 mod net;
 mod quantizer;
+mod router_hnsw;
 mod rebalancer;
 mod router;
 mod storage;
 mod wal;
 mod worker;
+mod flatbin;
 
 use anyhow::anyhow;
 use crossbeam_channel::{unbounded, Sender};
@@ -31,6 +33,7 @@ use std::thread;
 use tar::Archive;
 
 use crate::bvecs::BvecsReader;
+use crate::flatbin::FlatF32Reader;
 use crate::fvecs::FvecsReader;
 use crate::gnd::GndReader;
 use crate::indexer::Indexer;
@@ -56,6 +59,7 @@ struct DatasetConfig {
     query_path: PathBuf,
     gnd_path: Option<PathBuf>,
     max_vectors: usize,
+    base_is_prepared: bool,
 }
 
 pub struct RouterTask {
@@ -188,9 +192,15 @@ fn detect_dataset() -> anyhow::Result<Option<DatasetConfig>> {
         if (!gist_base.exists() || !gist_query.exists()) && gist_tar.exists() {
             ensure_gist_files(&gist_tar)?;
         }
+        let prepared_base = gist_base.with_extension("f32bin");
+        let base_path = if prepared_base.exists() {
+            prepared_base.clone()
+        } else {
+            gist_base.clone()
+        };
         return Ok(Some(DatasetConfig {
             kind: DatasetKind::Gist,
-            base_path: gist_base,
+            base_path,
             query_path: gist_query,
             gnd_path: if gist_tar.exists() {
                 Some(gist_tar)
@@ -198,17 +208,23 @@ fn detect_dataset() -> anyhow::Result<Option<DatasetConfig>> {
                 None
             },
             max_vectors: 1_000_000usize,
+            base_is_prepared: prepared_base.exists(),
         }));
     }
 
     let bigann_base = PathBuf::from("bigann_base.bvecs.gz");
     let bigann_query = PathBuf::from("bigann_query.bvecs.gz");
     let bigann_gnd = PathBuf::from("bigann_gnd.tar.gz");
+    let prepared_bigann = bigann_base.with_extension("f32bin");
 
     if bigann_base.exists() && bigann_query.exists() {
         return Ok(Some(DatasetConfig {
             kind: DatasetKind::Bigann,
-            base_path: bigann_base,
+            base_path: if prepared_bigann.exists() {
+                prepared_bigann.clone()
+            } else {
+                bigann_base.clone()
+            },
             query_path: bigann_query,
             gnd_path: if bigann_gnd.exists() {
                 Some(bigann_gnd)
@@ -216,6 +232,7 @@ fn detect_dataset() -> anyhow::Result<Option<DatasetConfig>> {
                 None
             },
             max_vectors: 100_000_000usize,
+            base_is_prepared: prepared_bigann.exists(),
         }));
     }
 
@@ -305,7 +322,7 @@ fn main() -> anyhow::Result<()> {
             let sizes = worker.snapshot_sizes();
             let mut sizes_vec: Vec<usize> = sizes.values().cloned().collect();
             sizes_vec.sort_unstable();
-            log::info!("rebalance: periodic tick sizes={:?}", sizes_vec);
+            log::debug!("rebalance: periodic tick sizes={:?}", sizes_vec);
 
             // Faster polling when any bucket is over the split threshold to avoid runaway growth.
             let fast_path = sizes.values().any(|sz| *sz > target_size * 2);
@@ -469,6 +486,7 @@ async fn run_benchmark_mode(
     enum Reader {
         Bvecs(BvecsReader),
         Fvecs(FvecsReader),
+        Flat(FlatF32Reader),
     }
 
     impl Reader {
@@ -476,6 +494,7 @@ async fn run_benchmark_mode(
             match self {
                 Reader::Bvecs(r) => r.read_batch(batch_size),
                 Reader::Fvecs(r) => r.read_batch(batch_size),
+                Reader::Flat(r) => r.read_batch(batch_size),
             }
         }
     }
@@ -489,8 +508,20 @@ async fn run_benchmark_mode(
 
     if dataset.base_path.exists() {
         let mut reader = match dataset.kind {
-            DatasetKind::Bigann => Reader::Bvecs(BvecsReader::new(&dataset.base_path)?),
-            DatasetKind::Gist => Reader::Fvecs(FvecsReader::new(&dataset.base_path)?),
+            DatasetKind::Bigann => {
+                if dataset.base_is_prepared {
+                    Reader::Flat(FlatF32Reader::new(&dataset.base_path)?)
+                } else {
+                    Reader::Bvecs(BvecsReader::new(&dataset.base_path)?)
+                }
+            }
+            DatasetKind::Gist => {
+                if dataset.base_is_prepared {
+                    Reader::Flat(FlatF32Reader::new(&dataset.base_path)?)
+                } else {
+                    Reader::Fvecs(FvecsReader::new(&dataset.base_path)?)
+                }
+            }
         };
 
         info!("Reading initial batch of {} vectors...", initial_batch_size);
@@ -536,7 +567,10 @@ async fn run_benchmark_mode(
                 for vec in batch {
                     if let Ok(ids) = snapshot.router.query(&vec.data, 1) {
                         if let Some(&id) = ids.first() {
-                            updates.entry(id).or_default().push(vec);
+                            updates
+                                .entry(id)
+                                .or_insert_with(|| Vec::with_capacity(64))
+                                .push(vec);
                         }
                     }
                 }

@@ -1,6 +1,7 @@
 use crate::storage::wal::block::Entry;
 use crate::storage::wal::runtime::Walrus;
 use anyhow::Result;
+use smallvec::SmallVec;
 use rkyv::{Archive, Deserialize, Serialize};
 use std::cell::RefCell;
 use std::sync::Arc;
@@ -50,7 +51,6 @@ pub struct Storage {
 thread_local! {
     static TL_BACKING: RefCell<Vec<u8>> = RefCell::new(Vec::new());
     static TL_RANGES: RefCell<Vec<(usize, usize)>> = RefCell::new(Vec::new());
-    static TL_SLICES: RefCell<Vec<*const [u8]>> = RefCell::new(Vec::new());
 }
 
 #[derive(Archive, Deserialize, Serialize, Debug, PartialEq, Clone)]
@@ -70,6 +70,27 @@ pub struct BucketMeta {
 impl Storage {
     pub fn new(wal: Arc<Walrus>) -> Self {
         Self { wal }
+    }
+
+    /// Pre-reserve thread-local buffers used during ingestion to avoid growth reallocations.
+    /// `max_entries` is the expected max batch size; `approx_f32_per_vector` is an estimate
+    /// of vector dimensionality to size the backing buffer conservatively.
+    pub fn prewarm_thread_locals(max_entries: usize, approx_f32_per_vector: usize) {
+        let backing_bytes = max_entries.saturating_mul(16 + approx_f32_per_vector.saturating_mul(4));
+        TL_BACKING.with(|b| {
+            let mut buf = b.borrow_mut();
+            let cap = buf.capacity();
+            if cap < backing_bytes {
+                buf.reserve(backing_bytes - cap);
+            }
+        });
+        TL_RANGES.with(|r| {
+            let mut ranges = r.borrow_mut();
+            let cap = ranges.capacity();
+            if cap < max_entries {
+                ranges.reserve(max_entries - cap);
+            }
+        });
     }
 
     pub(crate) fn topic_for(bucket_id: u64) -> String {
@@ -106,65 +127,50 @@ impl Storage {
             return Ok(());
         }
         TL_BACKING.with(|backing_cell| {
-            TL_RANGES.with(|ranges_cell| {
-                TL_SLICES.with(|slices_cell| -> Result<()> {
-                    let mut backing = backing_cell.borrow_mut();
-                    backing.clear();
-                    // Each entry: len prefix + id + count + data bytes.
-                    let est: usize = vectors.iter().map(|v| v.data.len() * 4 + 24).sum();
-                    backing.reserve(est);
+            TL_RANGES.with(|ranges_cell| -> Result<()> {
+                let mut backing = backing_cell.borrow_mut();
+                backing.clear();
+                // Each entry: len prefix + id + count + data bytes.
+                let est: usize = vectors.iter().map(|v| v.data.len() * 4 + 24).sum();
+                backing.reserve(est);
 
-                    let mut ranges = ranges_cell.borrow_mut();
-                    ranges.clear();
-                    ranges.reserve(vectors.len());
+                let mut ranges = ranges_cell.borrow_mut();
+                ranges.clear();
+                ranges.reserve(vectors.len());
 
-                    for v in vectors {
-                        let start = backing.len();
-                        // payload_len excludes the outer length prefix itself.
-                        let payload_len = 16 + v.data.len() * 4;
-                        backing.extend_from_slice(&(payload_len as u64).to_le_bytes());
-                        backing.extend_from_slice(&v.id.to_le_bytes());
-                        backing.extend_from_slice(&(v.data.len() as u64).to_le_bytes());
-                        let data_bytes = unsafe {
-                            std::slice::from_raw_parts(
-                                v.data.as_ptr() as *const u8,
-                                v.data.len() * 4,
+                for v in vectors {
+                    let start = backing.len();
+                    // payload_len excludes the outer length prefix itself.
+                    let payload_len = 16 + v.data.len() * 4;
+                    backing.extend_from_slice(&(payload_len as u64).to_le_bytes());
+                    backing.extend_from_slice(&v.id.to_le_bytes());
+                    backing.extend_from_slice(&(v.data.len() as u64).to_le_bytes());
+                    let data_bytes = unsafe {
+                        std::slice::from_raw_parts(
+                            v.data.as_ptr() as *const u8,
+                            v.data.len() * 4,
+                        )
+                    };
+                    backing.extend_from_slice(data_bytes);
+                    let end = backing.len();
+                    ranges.push((start, end));
+                }
+
+                for chunk in ranges.chunks(2000) {
+                    let mut slices: SmallVec<[&[u8]; 128]> =
+                        SmallVec::with_capacity(chunk.len());
+                    slices.extend(chunk.iter().map(|(s, e)| &backing[*s..*e]));
+                    self.wal
+                        .batch_append_for_topic(&topic, &slices)
+                        .map_err(|e| {
+                            anyhow::anyhow!(
+                                "Walrus batch append failed for bucket {}: {:?}",
+                                bucket_id,
+                                e
                             )
-                        };
-                        backing.extend_from_slice(data_bytes);
-                        let end = backing.len();
-                        ranges.push((start, end));
-                    }
-
-                    let mut slices = slices_cell.borrow_mut();
-                    let need = ranges.len().min(2000);
-                    let cap = slices.capacity();
-                    if cap < need {
-                        slices.reserve(need - cap);
-                    }
-                    for chunk in ranges.chunks(2000) {
-                        slices.clear();
-                        slices.extend(chunk.iter().map(|(s, e)| {
-                            // Store raw pointer to avoid lifetime issues; convert immediately.
-                            &backing[*s..*e] as *const [u8]
-                        }));
-                        // SAFETY: pointers come from `backing` which lives for this scope.
-                        let slice_refs: Vec<&[u8]> = slices
-                            .iter()
-                            .map(|ptr| unsafe { &**ptr })
-                            .collect();
-                        self.wal
-                            .batch_append_for_topic(&topic, &slice_refs)
-                            .map_err(|e| {
-                                anyhow::anyhow!(
-                                    "Walrus batch append failed for bucket {}: {:?}",
-                                    bucket_id,
-                                    e
-                                )
-                            })?;
-                    }
-                    Ok(())
-                })
+                        })?;
+                }
+                Ok(())
             })
         })
     }

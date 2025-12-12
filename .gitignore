@@ -1,3 +1,6 @@
+*.png
+*.svg
+perf.*
 wal_files/
 gist/
 satori_data/

@@ -12,13 +12,11 @@ pub struct Executor {
     last_changed: RefCell<std::sync::Arc<Vec<u64>>>,
 }
 
-#[derive(Clone)]
 struct CachedBucket {
     vectors: Vec<Vector>,
     byte_size: usize,
 }
 
-#[derive(Clone)]
 pub struct WorkerCache {
     buckets: LruCache<u64, CachedBucket>,
     bucket_max_bytes: usize,
@@ -33,8 +31,8 @@ impl WorkerCache {
         }
     }
 
-    fn get(&mut self, bucket_id: u64) -> Option<CachedBucket> {
-        self.buckets.get(&bucket_id).cloned()
+    fn get(&mut self, bucket_id: u64) -> Option<&CachedBucket> {
+        self.buckets.get(&bucket_id)
     }
 
     fn put(&mut self, bucket_id: u64, bucket: CachedBucket) {
@@ -131,26 +129,28 @@ impl Executor {
         let mut cache = self.cache.borrow_mut();
 
         for &id in bucket_ids {
-            if let Some(cached) = cache.get(id) {
-                for vector in &cached.vectors {
-                    if vector.data.len() != query_vec.len() {
-                        continue;
+            match cache.get(id) {
+                Some(cached) => {
+                    for vector in &cached.vectors {
+                        if vector.data.len() != query_vec.len() {
+                            continue;
+                        }
+                        let dist = l2_distance_f32(&vector.data, query_vec);
+                        candidates.push((vector.id, dist));
                     }
-                    let dist = l2_distance_f32(&vector.data, query_vec);
-                    candidates.push((vector.id, dist));
                 }
-                continue;
-            }
-
-            let loaded = self.load_bucket(id).await?;
-            for vector in &loaded.vectors {
-                if vector.data.len() != query_vec.len() {
-                    continue;
+                None => {
+                    let loaded = self.load_bucket(id).await?;
+                    for vector in &loaded.vectors {
+                        if vector.data.len() != query_vec.len() {
+                            continue;
+                        }
+                        let dist = l2_distance_f32(&vector.data, query_vec);
+                        candidates.push((vector.id, dist));
+                    }
+                    cache.put(id, loaded);
                 }
-                let dist = l2_distance_f32(&vector.data, query_vec);
-                candidates.push((vector.id, dist));
             }
-            cache.put(id, loaded);
         }
 
         // Sort by distance (ascending)
@@ -167,7 +167,12 @@ impl Executor {
 
 fn l2_distance_f32(a: &[f32], b: &[f32]) -> f32 {
     if cfg!(target_arch = "x86_64") && std::arch::is_x86_feature_detected!("avx2") {
-        unsafe { l2_distance_f32_avx2(a, b) }
+        // Prefer the FMA path when available; it gives a small bump on AVX2 hardware.
+        if std::arch::is_x86_feature_detected!("fma") {
+            unsafe { l2_distance_f32_avx2_fma(a, b) }
+        } else {
+            unsafe { l2_distance_f32_avx2(a, b) }
+        }
     } else {
         let sum_sq: f32 = a
             .iter()
@@ -186,14 +191,61 @@ unsafe fn l2_distance_f32_avx2(a: &[f32], b: &[f32]) -> f32 {
     use std::arch::x86_64::*;
 
     let len = a.len().min(b.len());
+    let mut sum0 = _mm256_setzero_ps();
+    let mut sum1 = _mm256_setzero_ps();
+    let mut i = 0;
+
+    // Unroll by 2x to reduce loop overhead.
+    while i + 16 <= len {
+        let va0 = _mm256_loadu_ps(a.as_ptr().add(i));
+        let vb0 = _mm256_loadu_ps(b.as_ptr().add(i));
+        let diff0 = _mm256_sub_ps(va0, vb0);
+        sum0 = _mm256_add_ps(sum0, _mm256_mul_ps(diff0, diff0));
+
+        let va1 = _mm256_loadu_ps(a.as_ptr().add(i + 8));
+        let vb1 = _mm256_loadu_ps(b.as_ptr().add(i + 8));
+        let diff1 = _mm256_sub_ps(va1, vb1);
+        sum1 = _mm256_add_ps(sum1, _mm256_mul_ps(diff1, diff1));
+
+        i += 16;
+    }
+
+    while i + 8 <= len {
+        let va = _mm256_loadu_ps(a.as_ptr().add(i));
+        let vb = _mm256_loadu_ps(b.as_ptr().add(i));
+        let diff = _mm256_sub_ps(va, vb);
+        sum0 = _mm256_add_ps(sum0, _mm256_mul_ps(diff, diff));
+        i += 8;
+    }
+
+    let mut tmp0 = [0f32; 8];
+    _mm256_storeu_ps(tmp0.as_mut_ptr(), sum0);
+    let mut total = tmp0.iter().sum::<f32>();
+
+    let mut tmp1 = [0f32; 8];
+    _mm256_storeu_ps(tmp1.as_mut_ptr(), sum1);
+    total += tmp1.iter().sum::<f32>();
+
+    for j in i..len {
+        let d = a[j] - b[j];
+        total += d * d;
+    }
+
+    total.sqrt()
+}
+
+#[target_feature(enable = "avx2,fma")]
+unsafe fn l2_distance_f32_avx2_fma(a: &[f32], b: &[f32]) -> f32 {
+    use std::arch::x86_64::*;
+
+    let len = a.len().min(b.len());
     let mut sum = _mm256_setzero_ps();
     let mut i = 0;
     while i + 8 <= len {
         let va = _mm256_loadu_ps(a.as_ptr().add(i));
         let vb = _mm256_loadu_ps(b.as_ptr().add(i));
         let diff = _mm256_sub_ps(va, vb);
-        let sq = _mm256_mul_ps(diff, diff);
-        sum = _mm256_add_ps(sum, sq);
+        sum = _mm256_fmadd_ps(diff, diff, sum);
         i += 8;
     }
 

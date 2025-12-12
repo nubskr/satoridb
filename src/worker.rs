@@ -34,6 +34,9 @@ pub async fn run_worker(id: usize, receiver: Receiver<WorkerMessage>, wal: Arc<W
     let cache = WorkerCache::new(512, 64 * 1024 * 1024); // Larger local cache: 512 buckets, 64MB each
     let executor = Executor::new(storage.clone(), cache);
     let mut topic_cache = std::collections::HashMap::new();
+    let mut scratch_batch: Vec<Vector> = Vec::with_capacity(2048);
+    // Prewarm ingestion thread-local buffers to avoid growth reallocs on the hot path.
+    Storage::prewarm_thread_locals(2048, 1024);
 
     while let Ok(msg) = receiver.recv().await {
         match msg {
@@ -52,14 +55,17 @@ pub async fn run_worker(id: usize, receiver: Receiver<WorkerMessage>, wal: Arc<W
                 }
             }
             WorkerMessage::Ingest { bucket_id, vectors } => {
+                scratch_batch.clear();
+                scratch_batch.reserve(vectors.len());
+                scratch_batch.extend(vectors.into_iter());
                 let topic = topic_cache
                     .entry(bucket_id)
                     .or_insert_with(|| Storage::topic_for(bucket_id));
                 match storage
-                    .put_chunk_raw_with_topic(bucket_id, topic.as_str(), &vectors)
+                    .put_chunk_raw_with_topic(bucket_id, topic.as_str(), &scratch_batch)
                     .await
                 {
-                    Ok(_) => ingest_counter::add(vectors.len() as u64),
+                    Ok(_) => ingest_counter::add(scratch_batch.len() as u64),
                     Err(e) => error!(
                         "Worker {} failed to persist chunk for bucket {}: {:?}",
                         id, bucket_id, e

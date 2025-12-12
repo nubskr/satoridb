@@ -1,25 +1,25 @@
 use crate::quantizer::Quantizer;
+use crate::router_hnsw::HnswIndex;
 use anyhow::Result;
-use hnsw_rs::prelude::*;
 use parking_lot::RwLock;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 
 pub struct Router {
-    index: Hnsw<'static, u8, DistL2>,
+    index: HnswIndex,
     quantizer: Quantizer,
 }
 
 impl Router {
     pub fn new(_max_elements: usize, quantizer: Quantizer) -> Self {
         // M=16, ef_construction=100 are standard defaults
-        let index = Hnsw::new(16, 10000, 16, 100, DistL2);
+        let index = HnswIndex::new(16, 100);
         Self { index, quantizer }
     }
 
     pub fn add_centroid(&mut self, id: u64, vector: &[f32]) {
         let q_vec = self.quantizer.quantize(vector);
-        self.index.insert((&q_vec, id as usize));
+        self.index.insert(id as usize, q_vec);
     }
 
     pub fn query(&self, vector: &[f32], top_k: usize) -> Result<Vec<u64>> {
@@ -28,7 +28,7 @@ impl Router {
         let ef_search = std::cmp::max(top_k * 20, 200);
         let neighbors = self.index.search(&q_vec, top_k, ef_search);
 
-        let ids = neighbors.iter().map(|n| n.d_id as u64).collect();
+        let ids = neighbors.into_iter().map(|id| id as u64).collect();
 
         Ok(ids)
     }

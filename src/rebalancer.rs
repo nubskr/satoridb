@@ -8,7 +8,7 @@ use anyhow::Result;
 use async_channel::{Receiver, Sender};
 use futures::executor::block_on;
 use glommio::{LocalExecutorBuilder, Placement};
-use log::{error, info, warn};
+use log::{debug, error, info, warn};
 use parking_lot::{Mutex, RwLock};
 use std::collections::{HashMap, HashSet};
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -187,7 +187,7 @@ impl RebalanceState {
             router.add_centroid(id, &centroid);
         }
         let version = self.routing.install(router, changed);
-        info!(
+        debug!(
             "rebalance: published router version {} (buckets={}, sizes={:?})",
             version, bucket_count, sizes
         );
