@@ -518,7 +518,8 @@ async fn run_benchmark_mode(
     // Dataset-specific knobs
     // Start with a larger number of buckets; background rebalance can adjust.
     let (initial_batch_size, stream_batch_size, k, router_top_k) = match dataset.kind {
-        DatasetKind::Bigann => (100_000, 100_000, 100, 50),
+        // For BigANN, route to fewer buckets to keep query latency down.
+        DatasetKind::Bigann => (100_000, 100_000, 100, 20),
         DatasetKind::Gist => (50_000, 100_000, 100, 400),
     };
 
