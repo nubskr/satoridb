@@ -229,12 +229,15 @@ fn main() -> anyhow::Result<()> {
         .ok()
         .and_then(|v| v.parse().ok())
         .unwrap_or_else(|| num_cpus::get().max(1));
-    let router_pool = ((satori_cores as f32) * 0.2).round() as usize;
+    // Reserve two cores for background threads (rebalance driver/worker, logging, etc.).
+    let usable_cores = satori_cores.saturating_sub(2).max(1);
+
+    let router_pool = ((usable_cores as f32) * 0.2).round() as usize;
     let router_pool = router_pool.max(1);
-    let executor_shards = (satori_cores.saturating_sub(router_pool)).max(1);
+    let executor_shards = (usable_cores.saturating_sub(router_pool)).max(1);
     info!(
-        "SATORI_CORES={}, router_pool={}, executor_shards={}",
-        satori_cores, router_pool, executor_shards
+        "SATORI_CORES={}, usable_cores={}, router_pool={}, executor_shards={}",
+        satori_cores, usable_cores, router_pool, executor_shards
     );
 
     let wal = Arc::new(Walrus::with_consistency_and_schedule(

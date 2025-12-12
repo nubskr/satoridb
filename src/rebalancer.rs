@@ -67,24 +67,26 @@ impl RebalanceState {
 
     fn refresh_sizes(&self) -> HashMap<u64, usize> {
         let ids: Vec<u64> = self.centroids.read().keys().cloned().collect();
+        let prev_sizes = self.bucket_sizes.read().clone();
         let mut fresh = HashMap::new();
         for id in ids {
             let topic = crate::storage::Storage::topic_for(id);
             let count = self.wal.get_topic_entry_count(&topic) as usize;
-            fresh.insert(id, count);
+            // Make counts monotonic per bucket to avoid temporary regressions when WAL lags.
+            let stabilized = count.max(prev_sizes.get(&id).cloned().unwrap_or(0));
+            fresh.insert(id, stabilized);
         }
         let mut sizes = self.bucket_sizes.write();
         sizes.clear();
         sizes.extend(fresh.iter().map(|(k, v)| (*k, *v)));
-        let mut sum: u64 = fresh.values().map(|v| *v as u64).sum();
+        let sum: u64 = fresh.values().map(|v| *v as u64).sum();
         let inserted = ingest_counter::get();
 
         if sum < inserted {
             warn!(
-                "rebalance: wal counts sum {} is less than total inserted {}; skipping update this tick",
+                "rebalance: wal counts sum {} is less than total inserted {}; proceeding with monotonic sizes",
                 sum, inserted
             );
-            return self.bucket_sizes.read().clone();
         }
         sizes.clone()
     }
