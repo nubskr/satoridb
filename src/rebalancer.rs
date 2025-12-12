@@ -396,11 +396,23 @@ async fn worker_loop_async(state: Arc<RebalanceState>, rx: Receiver<RebalanceTas
 }
 
 fn worker_loop_blocking(state: Arc<RebalanceState>, rx: Receiver<RebalanceTask>) {
+    // Splits are far more common; prefer them when both types are queued.
+    let mut backlog: Vec<RebalanceTask> = Vec::new();
     while let Ok(task) = rx.recv_blocking() {
-        match task {
-            RebalanceTask::Split(bucket) => state.handle_split(bucket),
-            RebalanceTask::Merge(a, b) => state.handle_merge(a, b),
-            RebalanceTask::Rebalance(bucket) => state.handle_rebalance(bucket),
+        // Push the incoming task into a small backlog so we can choose order.
+        backlog.push(task);
+        // Drain backlog preferring splits first.
+        while let Some(idx) = backlog
+            .iter()
+            .position(|t| matches!(t, RebalanceTask::Split(_)))
+            .or_else(|| (!backlog.is_empty()).then_some(0))
+        {
+            let task = backlog.swap_remove(idx);
+            match task {
+                RebalanceTask::Split(bucket) => state.handle_split(bucket),
+                RebalanceTask::Merge(a, b) => state.handle_merge(a, b),
+                RebalanceTask::Rebalance(bucket) => state.handle_rebalance(bucket),
+            }
         }
     }
 }
