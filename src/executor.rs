@@ -1,4 +1,4 @@
-use crate::storage::{Bucket, Storage, Vector};
+use crate::storage::{Storage, Vector};
 use anyhow::Result;
 use lru::LruCache;
 use std::cell::{Cell, RefCell};
@@ -77,19 +77,29 @@ impl Executor {
             let len_bytes: [u8; 8] = chunk[0..8].try_into().unwrap_or([0; 8]);
             let archive_len = u64::from_le_bytes(len_bytes) as usize;
 
-            if 8 + archive_len > chunk.len() {
+            if 8 + archive_len > chunk.len() || archive_len < 16 {
                 continue;
             }
             let data_slice = &chunk[8..8 + archive_len];
-
-            if let Ok(archived_bucket) = rkyv::check_archived_root::<Bucket>(data_slice) {
-                for vector in archived_bucket.vectors.iter() {
-                    vectors.push(Vector {
-                        id: vector.id,
-                        data: vector.data.to_vec(),
-                    });
-                }
+            // Format: [id: u64][len: u64][data: len * f32]
+            if data_slice.len() < 16 {
+                continue;
             }
+            let id = u64::from_le_bytes(data_slice[0..8].try_into().unwrap_or([0; 8]));
+            let count = u64::from_le_bytes(data_slice[8..16].try_into().unwrap_or([0; 8])) as usize;
+            if 16 + count * 4 > data_slice.len() {
+                continue;
+            }
+            let mut data = Vec::with_capacity(count);
+            let mut offset = 16;
+            for _ in 0..count {
+                let bytes: [u8; 4] = data_slice[offset..offset + 4]
+                    .try_into()
+                    .unwrap_or([0; 4]);
+                data.push(f32::from_bits(u32::from_le_bytes(bytes)));
+                offset += 4;
+            }
+            vectors.push(Vector { id, data });
         }
 
         Ok(CachedBucket {

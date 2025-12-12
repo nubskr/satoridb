@@ -4,9 +4,10 @@ use crate::quantizer::Quantizer;
 use crate::router::{Router, RoutingTable};
 use crate::storage::{Bucket, BucketMeta, BucketMetaStatus, Storage, Vector};
 use crate::wal::runtime::Walrus;
-use async_channel::{Receiver, Sender};
 use anyhow::Result;
+use async_channel::{Receiver, Sender};
 use futures::executor::block_on;
+use glommio::{LocalExecutorBuilder, Placement};
 use log::{error, info, warn};
 use parking_lot::{Mutex, RwLock};
 use std::collections::{HashMap, HashSet};
@@ -101,7 +102,6 @@ impl RebalanceState {
 
     fn load_bucket(&self, bucket_id: u64) -> Option<Bucket> {
         let chunks = block_on(self.storage.get_chunks(bucket_id)).ok()?;
-        let mut centroid: Option<Vec<f32>> = None;
         let mut vectors: Vec<Vector> = Vec::new();
         for chunk in chunks {
             if chunk.len() < 8 {
@@ -114,24 +114,20 @@ impl RebalanceState {
                 continue;
             }
             let data_slice = &chunk[8..8 + archive_len];
-            if let Ok(archived_bucket) = rkyv::check_archived_root::<Bucket>(data_slice) {
-                if centroid.is_none() {
-                    centroid = Some(archived_bucket.centroid.to_vec());
-                }
-                vectors.extend(
-                    archived_bucket
-                        .vectors
-                        .iter()
-                        .map(|v| Vector {
-                            id: v.id,
-                            data: v.data.to_vec(),
-                        }),
-                );
+            if let Ok(archived_vec) = rkyv::check_archived_root::<Vector>(data_slice) {
+                vectors.push(Vector {
+                    id: archived_vec.id,
+                    data: archived_vec.data.to_vec(),
+                });
             }
         }
-        centroid.map(|c| Bucket {
+        if vectors.is_empty() {
+            return None;
+        }
+        let centroid = compute_centroid(&vectors);
+        Some(Bucket {
             id: bucket_id,
-            centroid: c,
+            centroid,
             vectors,
         })
     }
@@ -140,10 +136,10 @@ impl RebalanceState {
         self.centroids.write().remove(&bucket_id);
         self.bucket_sizes.write().remove(&bucket_id);
         self.retired.write().insert(bucket_id);
-        let _ = block_on(
-            self.storage
-                .put_bucket_meta(&BucketMeta { bucket_id, status: BucketMetaStatus::Retired }),
-        );
+        let _ = block_on(self.storage.put_bucket_meta(&BucketMeta {
+            bucket_id,
+            status: BucketMetaStatus::Retired,
+        }));
         self.mark_bucket_checkpointed(bucket_id);
     }
 
@@ -152,10 +148,7 @@ impl RebalanceState {
         // Drain the topic with checkpoint=true to mark all blocks checkpointed.
         let max_bytes = 16 * 1024 * 1024; // read in chunks
         loop {
-            match self
-                .wal
-                .batch_read_for_topic(&topic, max_bytes, true, None)
-            {
+            match self.wal.batch_read_for_topic(&topic, max_bytes, true, None) {
                 Ok(entries) => {
                     if entries.is_empty() {
                         break;
@@ -227,10 +220,10 @@ impl RebalanceState {
                 );
                 continue;
             }
-            let _ = block_on(
-                self.storage
-                    .put_bucket_meta(&BucketMeta { bucket_id: new_id, status: BucketMetaStatus::Active }),
-            );
+            let _ = block_on(self.storage.put_bucket_meta(&BucketMeta {
+                bucket_id: new_id,
+                status: BucketMetaStatus::Active,
+            }));
             new_entries.push((new_id, nb.centroid.clone(), nb.vectors.len()));
         }
 
@@ -287,10 +280,10 @@ impl RebalanceState {
             );
             return;
         }
-        let _ = block_on(
-            self.storage
-                .put_bucket_meta(&BucketMeta { bucket_id: new_id, status: BucketMetaStatus::Active }),
-        );
+        let _ = block_on(self.storage.put_bucket_meta(&BucketMeta {
+            bucket_id: new_id,
+            status: BucketMetaStatus::Active,
+        }));
 
         self.retire_bucket(first);
         self.retire_bucket(second);
@@ -311,7 +304,10 @@ impl RebalanceState {
             Some(b) => b,
             None => {
                 // Bucket may have been retired or is empty; skip quietly to avoid log spam.
-                log::debug!("rebalance: rebalance skipped, bucket {} not found", bucket_id);
+                log::debug!(
+                    "rebalance: rebalance skipped, bucket {} not found",
+                    bucket_id
+                );
                 return;
             }
         };
@@ -334,14 +330,31 @@ pub struct RebalanceWorker {
 }
 
 impl RebalanceWorker {
-    pub fn spawn(storage: Storage, routing: Arc<RoutingTable>) -> Self {
+    pub fn spawn(storage: Storage, routing: Arc<RoutingTable>, pin_cpu: Option<usize>) -> Self {
         let state = Arc::new(RebalanceState::new(storage, routing));
         let (tx, rx) = async_channel::unbounded();
         let state_clone = state.clone();
-        thread::Builder::new()
-            .name("rebalance-worker".to_string())
-            .spawn(move || worker_loop(state_clone, rx))
-            .expect("rebalance worker");
+        let name = "rebalance-worker".to_string();
+
+        match pin_cpu {
+            Some(cpu) => {
+                // Run on a dedicated Glommio executor pinned to a reserved core.
+                let builder =
+                    glommio::LocalExecutorBuilder::new(glommio::Placement::Fixed(cpu)).name(&name);
+                std::thread::spawn(move || {
+                    builder
+                        .make()
+                        .expect("failed to create rebalance executor")
+                        .run(worker_loop_async(state_clone, rx));
+                });
+            }
+            None => {
+                thread::Builder::new()
+                    .name(name)
+                    .spawn(move || worker_loop_blocking(state_clone, rx))
+                    .expect("rebalance worker");
+            }
+        }
         Self { tx, state }
     }
 
@@ -351,7 +364,10 @@ impl RebalanceWorker {
         for b in buckets {
             self.state
                 .storage
-                .put_bucket_meta(&BucketMeta { bucket_id: b.id, status: BucketMetaStatus::Active })
+                .put_bucket_meta(&BucketMeta {
+                    bucket_id: b.id,
+                    status: BucketMetaStatus::Active,
+                })
                 .await?;
         }
         Ok(())
@@ -369,7 +385,17 @@ impl RebalanceWorker {
     }
 }
 
-fn worker_loop(state: Arc<RebalanceState>, rx: Receiver<RebalanceTask>) {
+async fn worker_loop_async(state: Arc<RebalanceState>, rx: Receiver<RebalanceTask>) {
+    while let Ok(task) = rx.recv().await {
+        match task {
+            RebalanceTask::Split(bucket) => state.handle_split(bucket),
+            RebalanceTask::Merge(a, b) => state.handle_merge(a, b),
+            RebalanceTask::Rebalance(bucket) => state.handle_rebalance(bucket),
+        }
+    }
+}
+
+fn worker_loop_blocking(state: Arc<RebalanceState>, rx: Receiver<RebalanceTask>) {
     while let Ok(task) = rx.recv_blocking() {
         match task {
             RebalanceTask::Split(bucket) => state.handle_split(bucket),

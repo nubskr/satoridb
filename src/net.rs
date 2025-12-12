@@ -5,10 +5,10 @@ use async_channel::Sender as AsyncSender;
 use crossbeam_channel::Sender as CrossbeamSender;
 use futures::channel::oneshot;
 use futures::future::join_all;
+use futures_lite::io::{AsyncReadExt, AsyncWriteExt};
 use glommio::net::TcpListener;
 use glommio::{LocalExecutorBuilder, Placement};
 use log::{error, info};
-use futures_lite::io::{AsyncReadExt, AsyncWriteExt};
 use serde::{Deserialize, Serialize};
 use std::net::SocketAddr;
 use std::thread;
@@ -206,7 +206,11 @@ async fn handle_connection(
                 affected_buckets: affected_buckets.clone(),
                 respond_to: tx,
             };
-            if worker_senders[shard].send(WorkerMessage::Query(req)).await.is_ok() {
+            if worker_senders[shard]
+                .send(WorkerMessage::Query(req))
+                .await
+                .is_ok()
+            {
                 pending.push(rx);
             }
         }

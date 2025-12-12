@@ -3,14 +3,14 @@ mod executor;
 mod fvecs;
 mod gnd;
 mod indexer;
+mod ingest_counter;
 mod net;
-mod rebalancer;
 mod quantizer;
+mod rebalancer;
 mod router;
 mod storage;
 mod wal;
 mod worker;
-mod ingest_counter;
 
 use anyhow::anyhow;
 use crossbeam_channel::{unbounded, Sender};
@@ -231,6 +231,10 @@ fn main() -> anyhow::Result<()> {
         .unwrap_or_else(|| num_cpus::get().max(1));
     // Reserve two cores for background threads (rebalance driver/worker, logging, etc.).
     let usable_cores = satori_cores.saturating_sub(2).max(1);
+    let total_cpus = num_cpus::get().max(1);
+    let reserved_start = usable_cores.min(total_cpus);
+    let mut reserved_cores: Vec<usize> = (reserved_start..total_cpus).collect();
+    let rebalance_core = reserved_cores.pop();
 
     let router_pool = ((usable_cores as f32) * 0.2).round() as usize;
     let router_pool = router_pool.max(1);
@@ -253,10 +257,10 @@ fn main() -> anyhow::Result<()> {
         let (sender, receiver) = async_channel::bounded(1000);
         senders.push(sender);
         let wal_clone = wal.clone();
-        let pin_cpu = i % num_cpus::get();
+        let pin_cpu = i % usable_cores;
         let handle = thread::spawn(move || {
-            let builder = LocalExecutorBuilder::new(Placement::Fixed(pin_cpu))
-                .name(&format!("worker-{}", i));
+            let builder =
+                LocalExecutorBuilder::new(Placement::Fixed(pin_cpu)).name(&format!("worker-{}", i));
 
             let result = builder
                 .make()
@@ -273,7 +277,16 @@ fn main() -> anyhow::Result<()> {
     // Router pool using crossbeam MPMC; router is installed after clustering.
     let (router_tx, router_rx) = unbounded::<RouterTask>();
     let router_shared = Arc::new(RoutingTable::new());
-    let rebalance_worker = RebalanceWorker::spawn(Storage::new(wal.clone()), router_shared.clone());
+    let rebalance_worker = RebalanceWorker::spawn(
+        Storage::new(wal.clone()),
+        router_shared.clone(),
+        rebalance_core,
+    );
+    if let Some(core) = rebalance_core {
+        info!("Rebalance worker pinned to reserved core {}", core);
+    } else {
+        info!("Rebalance worker running without dedicated core (only one CPU visible)");
+    }
 
     // Optional periodic rebalance driver.
     let secs = std::env::var("SATORI_REBALANCE_INTERVAL_SECS")
@@ -285,7 +298,9 @@ fn main() -> anyhow::Result<()> {
         .and_then(|v| v.parse::<usize>().ok())
         .unwrap_or(10_000);
     let worker = rebalance_worker.clone();
+    let merge_interval_ticks = secs.max(1) * 10;
     std::thread::spawn(move || {
+        let mut tick_ctr: u64 = 0;
         loop {
             let sizes = worker.snapshot_sizes();
             let mut sizes_vec: Vec<usize> = sizes.values().cloned().collect();
@@ -312,20 +327,23 @@ fn main() -> anyhow::Result<()> {
                 let _ = worker.enqueue_blocking(crate::rebalancer::RebalanceTask::Split(bid));
             }
 
-            // Merge smallest two buckets if they are under target/2.
-            let mut small: Vec<(u64, usize)> = sizes
-                .iter()
-                .filter(|(_, sz)| **sz < target_size / 2)
-                .map(|(k, v)| (*k, *v))
-                .collect();
-            small.sort_by_key(|(_, sz)| *sz);
-            if small.len() >= 2 {
-                let (a, _sa) = small[0];
-                let (b, _sb) = small[1];
-                let _ = worker.enqueue_blocking(crate::rebalancer::RebalanceTask::Merge(a, b));
+            // Merge smallest two buckets if they are under target/2, but only every N ticks.
+            if tick_ctr % merge_interval_ticks == 0 {
+                let mut small: Vec<(u64, usize)> = sizes
+                    .iter()
+                    .filter(|(_, sz)| **sz < target_size / 2)
+                    .map(|(k, v)| (*k, *v))
+                    .collect();
+                small.sort_by_key(|(_, sz)| *sz);
+                if small.len() >= 2 {
+                    let (a, _sa) = small[0];
+                    let (b, _sb) = small[1];
+                    let _ = worker.enqueue_blocking(crate::rebalancer::RebalanceTask::Merge(a, b));
+                }
             }
 
             std::thread::sleep(sleep_dur);
+            tick_ctr = tick_ctr.saturating_add(1);
         }
     });
     let mut router_handles = Vec::new();
@@ -385,13 +403,15 @@ fn main() -> anyhow::Result<()> {
 
     let net_handle = if let Some(addr_str) = listen_addr {
         match addr_str.parse::<SocketAddr>() {
-            Ok(addr) => match spawn_network_server(addr, router_tx.clone(), ring.clone(), senders.clone()) {
-                Ok(handle) => Some(handle),
-                Err(e) => {
-                    log::error!("Failed to start network server on {}: {:?}", addr, e);
-                    None
+            Ok(addr) => {
+                match spawn_network_server(addr, router_tx.clone(), ring.clone(), senders.clone()) {
+                    Ok(handle) => Some(handle),
+                    Err(e) => {
+                        log::error!("Failed to start network server on {}: {:?}", addr, e);
+                        None
+                    }
                 }
-            },
+            }
             Err(e) => {
                 log::error!("Invalid SATORI_LISTEN_ADDR ({}): {:?}", addr_str, e);
                 None
@@ -461,10 +481,10 @@ async fn run_benchmark_mode(
     }
 
     // Dataset-specific knobs
-    // Start with a moderate number of buckets; background rebalance can adjust.
+    // Start with a larger number of buckets; background rebalance can adjust.
     let (initial_batch_size, stream_batch_size, k, router_top_k) = match dataset.kind {
-        DatasetKind::Bigann => (100_000, 100_000, 20, 50),
-        DatasetKind::Gist => (50_000, 100_000, 20, 400),
+        DatasetKind::Bigann => (100_000, 100_000, 100, 50),
+        DatasetKind::Gist => (50_000, 100_000, 100, 400),
     };
 
     if dataset.base_path.exists() {
@@ -493,7 +513,10 @@ async fn run_benchmark_mode(
             storage.put_chunk(bucket).await?;
         }
         rebalance.prime_centroids(&buckets).await?;
-        info!("Initial indexing complete (router version {}).", router_shared.current_version());
+        info!(
+            "Initial indexing complete (router version {}).",
+            router_shared.current_version()
+        );
 
         // Streaming Ingestion
         let mut total_processed = initial_batch_size;
@@ -507,6 +530,7 @@ async fn run_benchmark_mode(
             info!("Ingesting batch (total: {})...", total_processed);
 
             let mut updates: HashMap<u64, Vec<Vector>> = HashMap::new();
+            updates.reserve(router_top_k);
 
             if let Some(snapshot) = router_shared.snapshot() {
                 for vec in batch {

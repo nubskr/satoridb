@@ -62,14 +62,11 @@ impl RoutingTable {
     /// Returns the current router and version, if one has been installed.
     pub fn snapshot(&self) -> Option<RoutingSnapshot> {
         let router_guard = self.router.read();
-        router_guard
-            .as_ref()
-            .cloned()
-            .map(|data| RoutingSnapshot {
-                router: data.router.clone(),
-                version: self.version.load(Ordering::Acquire),
-                changed: data.changed.clone(),
-            })
+        router_guard.as_ref().cloned().map(|data| RoutingSnapshot {
+            router: data.router.clone(),
+            version: self.version.load(Ordering::Acquire),
+            changed: data.changed.clone(),
+        })
     }
 
     pub fn current_version(&self) -> u64 {

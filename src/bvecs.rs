@@ -74,7 +74,9 @@ mod tests {
             let mut encoder = GzEncoder::new(&mut tmp, Compression::default());
             // Two vectors, dim = 3
             for vec_vals in [[1u8, 2, 3], [4u8, 5, 6]] {
-                encoder.write_all(&(vec_vals.len() as u32).to_le_bytes()).unwrap();
+                encoder
+                    .write_all(&(vec_vals.len() as u32).to_le_bytes())
+                    .unwrap();
                 encoder.write_all(&vec_vals).unwrap();
             }
             encoder.finish().unwrap();
