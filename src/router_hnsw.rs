@@ -423,11 +423,14 @@ impl SearchScratch {
         if self.visited.len() < n {
             self.visited.resize(n, 0);
         }
+        // Pre-reserve heaps to avoid per-query growth.
         if self.candidates.capacity() < reserve {
-            self.candidates.reserve(reserve - self.candidates.capacity());
+            self.candidates
+                .reserve(reserve.saturating_sub(self.candidates.capacity()));
         }
         if self.results.capacity() < reserve {
-            self.results.reserve(reserve - self.results.capacity());
+            self.results
+                .reserve(reserve.saturating_sub(self.results.capacity()));
         }
         self.candidates.clear();
         self.results.clear();

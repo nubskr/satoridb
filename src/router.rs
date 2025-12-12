@@ -10,7 +10,8 @@ use thread_local::ThreadLocal;
 pub struct Router {
     index: HnswIndex,
     scratch: parking_lot::Mutex<crate::router_hnsw::SearchScratch>,
-    flat_scratch: parking_lot::Mutex<Vec<(f32, usize)>>,
+    // Per-thread flat scratch for small-index scans.
+    flat_scratch: ThreadLocal<RefCell<Vec<(f32, usize)>>>,
     // Per-thread quant buffers to avoid contention on the hot path.
     quant_bufs: ThreadLocal<RefCell<Vec<u8>>>,
     quant_min: f32,
@@ -32,7 +33,7 @@ impl Router {
             quant_min: quantizer.min,
             quant_scale,
             scratch: parking_lot::Mutex::new(crate::router_hnsw::SearchScratch::new()),
-            flat_scratch: parking_lot::Mutex::new(Vec::new()),
+            flat_scratch: ThreadLocal::new(),
             quant_bufs: thread_local::ThreadLocal::new(),
         }
     }
@@ -54,7 +55,10 @@ impl Router {
 
             // For small centroid sets, flat scan is cheaper than graph traversal.
             if self.index.len() <= 512 {
-                let mut buf = self.flat_scratch.lock();
+                let local = self
+                    .flat_scratch
+                    .get_or(|| RefCell::new(Vec::new()));
+                let mut buf = local.borrow_mut();
                 self.index.flat_search_with_scratch(&q_buf, top_k, &mut buf)
             } else {
                 let ef_search = std::cmp::max(top_k * 10, 150);
