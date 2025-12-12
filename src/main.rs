@@ -217,6 +217,22 @@ fn detect_dataset() -> anyhow::Result<Option<DatasetConfig>> {
     let bigann_gnd = PathBuf::from("bigann_gnd.tar.gz");
     let prepared_bigann = bigann_base.with_extension("f32bin");
 
+    // Prefer already-prepared base even if the original archive was removed.
+    if prepared_bigann.exists() && bigann_query.exists() {
+        return Ok(Some(DatasetConfig {
+            kind: DatasetKind::Bigann,
+            base_path: prepared_bigann.clone(),
+            query_path: bigann_query.clone(),
+            gnd_path: if bigann_gnd.exists() {
+                Some(bigann_gnd)
+            } else {
+                None
+            },
+            max_vectors: 370_000_000usize,
+            base_is_prepared: true,
+        }));
+    }
+
     if bigann_base.exists() && bigann_query.exists() {
         return Ok(Some(DatasetConfig {
             kind: DatasetKind::Bigann,
@@ -231,7 +247,7 @@ fn detect_dataset() -> anyhow::Result<Option<DatasetConfig>> {
             } else {
                 None
             },
-            max_vectors: 100_000_000usize,
+            max_vectors: 370_000_000usize,
             base_is_prepared: prepared_bigann.exists(),
         }));
     }

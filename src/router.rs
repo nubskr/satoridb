@@ -7,30 +7,87 @@ use std::sync::Arc;
 
 pub struct Router {
     index: HnswIndex,
-    quantizer: Quantizer,
+    scratch: parking_lot::Mutex<crate::router_hnsw::SearchScratch>,
+    flat_scratch: parking_lot::Mutex<Vec<(f32, usize)>>,
+    quant_buf: parking_lot::Mutex<Vec<u8>>,
+    quant_min: f32,
+    quant_scale: f32,
 }
 
 impl Router {
     pub fn new(_max_elements: usize, quantizer: Quantizer) -> Self {
         // M=16, ef_construction=100 are standard defaults
         let index = HnswIndex::new(16, 100);
-        Self { index, quantizer }
+        let range = quantizer.max - quantizer.min;
+        let quant_scale = if range.abs() < f32::EPSILON {
+            0.0
+        } else {
+            255.0 / range
+        };
+        Self {
+            index,
+            quant_min: quantizer.min,
+            quant_scale,
+            scratch: parking_lot::Mutex::new(crate::router_hnsw::SearchScratch::new()),
+            flat_scratch: parking_lot::Mutex::new(Vec::new()),
+            quant_buf: parking_lot::Mutex::new(Vec::new()),
+        }
     }
 
     pub fn add_centroid(&mut self, id: u64, vector: &[f32]) {
-        let q_vec = self.quantizer.quantize(vector);
-        self.index.insert(id as usize, q_vec);
+        let mut buf = Vec::with_capacity(vector.len());
+        self.quantize_into(vector, &mut buf);
+        self.index.insert(id as usize, buf);
     }
 
     pub fn query(&self, vector: &[f32], top_k: usize) -> Result<Vec<u64>> {
-        // Quantize the incoming float vector to match centroid space.
-        let q_vec = self.quantizer.quantize(vector);
-        let ef_search = std::cmp::max(top_k * 20, 200);
-        let neighbors = self.index.search(&q_vec, top_k, ef_search);
+        let neighbors = {
+            let mut q_buf = self.quant_buf.lock();
+            self.quantize_into(vector, &mut q_buf);
+
+            // For small centroid sets, flat scan is cheaper than graph traversal.
+            if self.index.len() <= 512 {
+                let mut buf = self.flat_scratch.lock();
+                self.index.flat_search_with_scratch(&q_buf, top_k, &mut buf)
+            } else {
+                let ef_search = std::cmp::max(top_k * 10, 150);
+                // Reuse scratch to avoid per-query allocations.
+                let mut scratch = self.scratch.lock();
+                self.index
+                    .search_with_scratch(&q_buf, top_k, ef_search, &mut scratch)
+            }
+        };
 
         let ids = neighbors.into_iter().map(|id| id as u64).collect();
 
         Ok(ids)
+    }
+
+    #[inline(always)]
+    fn quantize_into(&self, src: &[f32], dst: &mut Vec<u8>) {
+        dst.clear();
+        dst.resize(src.len(), 0);
+        let min = self.quant_min;
+        let scale = self.quant_scale;
+        // Manually unroll in chunks of 4 to help auto-vectorization.
+        let len = src.len();
+        let mut i = 0;
+        while i + 4 <= len {
+            let v0 = (src[i] - min) * scale;
+            let v1 = (src[i + 1] - min) * scale;
+            let v2 = (src[i + 2] - min) * scale;
+            let v3 = (src[i + 3] - min) * scale;
+            dst[i] = v0.clamp(0.0, 255.0) as u8;
+            dst[i + 1] = v1.clamp(0.0, 255.0) as u8;
+            dst[i + 2] = v2.clamp(0.0, 255.0) as u8;
+            dst[i + 3] = v3.clamp(0.0, 255.0) as u8;
+            i += 4;
+        }
+        while i < len {
+            let v = (src[i] - min) * scale;
+            dst[i] = v.clamp(0.0, 255.0) as u8;
+            i += 1;
+        }
     }
 }
 
