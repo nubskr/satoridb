@@ -1,4 +1,4 @@
-use crate::wal::config::{checksum64, debug_print, PREFIX_META_SIZE};
+use crate::wal::config::{PREFIX_META_SIZE, checksum64, debug_print};
 use crate::wal::storage::SharedMmap;
 use rkyv::Deserialize as _;
 use rkyv_derive::{Archive, Deserialize, Serialize};

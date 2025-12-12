@@ -1,9 +1,11 @@
 use crate::indexer::Indexer;
+use crate::ingest_counter;
 use crate::quantizer::Quantizer;
 use crate::router::{Router, RoutingTable};
 use crate::storage::{Bucket, BucketMeta, BucketMetaStatus, Storage, Vector};
 use crate::wal::runtime::Walrus;
 use async_channel::{Receiver, Sender};
+use anyhow::Result;
 use futures::executor::block_on;
 use log::{error, info, warn};
 use parking_lot::{Mutex, RwLock};
@@ -63,6 +65,30 @@ impl RebalanceState {
         self.next_bucket_id.fetch_add(1, Ordering::AcqRel)
     }
 
+    fn refresh_sizes(&self) -> HashMap<u64, usize> {
+        let ids: Vec<u64> = self.centroids.read().keys().cloned().collect();
+        let mut fresh = HashMap::new();
+        for id in ids {
+            let topic = crate::storage::Storage::topic_for(id);
+            let count = self.wal.get_topic_entry_count(&topic) as usize;
+            fresh.insert(id, count);
+        }
+        let mut sizes = self.bucket_sizes.write();
+        sizes.clear();
+        sizes.extend(fresh.iter().map(|(k, v)| (*k, *v)));
+        let mut sum: u64 = fresh.values().map(|v| *v as u64).sum();
+        let inserted = ingest_counter::get();
+
+        if sum < inserted {
+            warn!(
+                "rebalance: wal counts sum {} is less than total inserted {}; skipping update this tick",
+                sum, inserted
+            );
+            return self.bucket_sizes.read().clone();
+        }
+        sizes.clone()
+    }
+
     fn lock_for(&self, bucket_id: u64) -> Arc<Mutex<()>> {
         let mut guard = self.locks.lock();
         guard
@@ -73,7 +99,8 @@ impl RebalanceState {
 
     fn load_bucket(&self, bucket_id: u64) -> Option<Bucket> {
         let chunks = block_on(self.storage.get_chunks(bucket_id)).ok()?;
-        let mut latest: Option<Bucket> = None;
+        let mut centroid: Option<Vec<f32>> = None;
+        let mut vectors: Vec<Vector> = Vec::new();
         for chunk in chunks {
             if chunk.len() < 8 {
                 continue;
@@ -86,19 +113,25 @@ impl RebalanceState {
             }
             let data_slice = &chunk[8..8 + archive_len];
             if let Ok(archived_bucket) = rkyv::check_archived_root::<Bucket>(data_slice) {
-                let mut bucket = Bucket::new(bucket_id, archived_bucket.centroid.to_vec());
-                bucket.vectors = archived_bucket
-                    .vectors
-                    .iter()
-                    .map(|v| Vector {
-                        id: v.id,
-                        data: v.data.to_vec(),
-                    })
-                    .collect();
-                latest = Some(bucket);
+                if centroid.is_none() {
+                    centroid = Some(archived_bucket.centroid.to_vec());
+                }
+                vectors.extend(
+                    archived_bucket
+                        .vectors
+                        .iter()
+                        .map(|v| Vector {
+                            id: v.id,
+                            data: v.data.to_vec(),
+                        }),
+                );
             }
         }
-        latest
+        centroid.map(|c| Bucket {
+            id: bucket_id,
+            centroid: c,
+            vectors,
+        })
     }
 
     fn retire_bucket(&self, bucket_id: u64) {
@@ -136,14 +169,19 @@ impl RebalanceState {
 
     fn rebuild_router(&self) {
         let centroids_map = self.centroids.read();
+        let bucket_count = centroids_map.len();
         if centroids_map.is_empty() {
             return;
         }
+        let sizes_map = self.bucket_sizes.read();
+        let mut sizes: Vec<usize> = sizes_map.values().cloned().collect();
+        sizes.sort_unstable();
         let centroids: Vec<(u64, Vec<f32>)> = centroids_map
             .iter()
             .map(|(id, c)| (*id, c.clone()))
             .collect();
         drop(centroids_map);
+        drop(sizes_map);
 
         let changed: Vec<u64> = centroids.iter().map(|(id, _)| *id).collect();
         let only_centroids: Vec<Vec<f32>> = centroids.iter().map(|(_, c)| c.clone()).collect();
@@ -154,7 +192,10 @@ impl RebalanceState {
             router.add_centroid(id, &centroid);
         }
         let version = self.routing.install(router, changed);
-        info!("rebalance: published router version {}", version);
+        info!(
+            "rebalance: published router version {} (buckets={}, sizes={:?})",
+            version, bucket_count, sizes
+        );
     }
 
     fn handle_split(&self, bucket_id: u64) {
@@ -163,7 +204,7 @@ impl RebalanceState {
         let bucket = match self.load_bucket(bucket_id) {
             Some(b) => b,
             None => {
-                warn!("rebalance: split skipped, bucket {} not found", bucket_id);
+                log::debug!("rebalance: split skipped, bucket {} not found", bucket_id);
                 return;
             }
         };
@@ -267,7 +308,8 @@ impl RebalanceState {
         let bucket = match self.load_bucket(bucket_id) {
             Some(b) => b,
             None => {
-                warn!("rebalance: rebalance skipped, bucket {} not found", bucket_id);
+                // Bucket may have been retired or is empty; skip quietly to avoid log spam.
+                log::debug!("rebalance: rebalance skipped, bucket {} not found", bucket_id);
                 return;
             }
         };
@@ -301,15 +343,16 @@ impl RebalanceWorker {
         Self { tx, state }
     }
 
-    pub fn prime_centroids(&self, buckets: &[Bucket]) {
+    pub async fn prime_centroids(&self, buckets: &[Bucket]) -> Result<()> {
         self.state.prime_centroids(buckets);
         self.state.rebuild_router();
         for b in buckets {
-            let _ = block_on(self.state.storage.put_bucket_meta(&BucketMeta {
-                bucket_id: b.id,
-                status: BucketMetaStatus::Active,
-            }));
+            self.state
+                .storage
+                .put_bucket_meta(&BucketMeta { bucket_id: b.id, status: BucketMetaStatus::Active })
+                .await?;
         }
+        Ok(())
     }
 
     #[allow(dead_code)]
@@ -320,7 +363,7 @@ impl RebalanceWorker {
     }
 
     pub fn snapshot_sizes(&self) -> HashMap<u64, usize> {
-        self.state.bucket_sizes.read().clone()
+        self.state.refresh_sizes()
     }
 }
 

@@ -3,12 +3,12 @@ use super::reader::Reader;
 use crate::wal::block::Block;
 #[cfg(target_os = "linux")]
 use crate::wal::block::Metadata;
-#[cfg(target_os = "linux")]
-use crate::wal::config::{checksum64, USE_FD_BACKEND};
 use crate::wal::config::{
-    debug_print, FsyncSchedule, DEFAULT_BLOCK_SIZE, MAX_BATCH_BYTES, MAX_BATCH_ENTRIES,
-    PREFIX_META_SIZE,
+    DEFAULT_BLOCK_SIZE, FsyncSchedule, MAX_BATCH_BYTES, MAX_BATCH_ENTRIES, PREFIX_META_SIZE,
+    debug_print,
 };
+#[cfg(target_os = "linux")]
+use crate::wal::config::{USE_FD_BACKEND, checksum64};
 use std::collections::HashSet;
 #[cfg(target_os = "linux")]
 use std::convert::TryFrom;
@@ -267,14 +267,28 @@ impl Writer {
         #[cfg(target_os = "linux")]
         {
             if USE_FD_BACKEND.load(Ordering::Relaxed) {
-                return self.submit_batch_via_io_uring(
+                // Prefer io_uring for FD backend, but fall back to the portable path if io_uring
+                // is unavailable (e.g. kernel/config restrictions) so behavior remains correct.
+                match self.submit_batch_via_io_uring(
                     &write_plan,
                     batch,
                     &mut revert_info,
                     &mut *cur_offset,
                     planning_offset,
                     total_bytes_usize,
-                );
+                ) {
+                    Ok(()) => return Ok(()),
+                    Err(e) => {
+                        if e.to_string().contains("io_uring init failed") {
+                            debug_print!(
+                                "[batch] io_uring unavailable; falling back: {}",
+                                e
+                            );
+                        } else {
+                            return Err(e);
+                        }
+                    }
+                }
             }
         }
 

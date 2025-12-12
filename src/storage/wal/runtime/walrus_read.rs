@@ -2,7 +2,7 @@ use super::allocator::BlockStateTracker;
 use super::reader::ColReaderInfo;
 use super::{ReadConsistency, Walrus};
 use crate::wal::block::{Block, Entry, Metadata};
-use crate::wal::config::{checksum64, debug_print, MAX_BATCH_ENTRIES, PREFIX_META_SIZE};
+use crate::wal::config::{MAX_BATCH_ENTRIES, PREFIX_META_SIZE, checksum64, debug_print};
 use std::io;
 use std::sync::{Arc, RwLock};
 
@@ -171,6 +171,9 @@ impl Walrus {
                             consumed,
                             new_off
                         );
+                        if checkpoint {
+                            self.decrement_topic_entry_count(col_name, 1);
+                        }
                         return Ok(Some(entry));
                     }
                     Err(_) => {
@@ -313,6 +316,9 @@ impl Walrus {
                             consumed,
                             new_off
                         );
+                        if checkpoint {
+                            self.decrement_topic_entry_count(col_name, 1);
+                        }
                         return Ok(Some(entry));
                     }
                     Err(_) => {
@@ -737,8 +743,8 @@ impl Walrus {
                                             };
                                             let meta2_res: Result<Metadata, _> =
                                                 archived2.deserialize(&mut rkyv::Infallible);
-                                            let meta2 =
-                                                meta2_res.expect("infallible metadata deserialize");
+                                            let meta2 = meta2_res
+                                                .expect("infallible metadata deserialize");
                                             let size2 = meta2.read_size;
                                             let required2 = (PREFIX_META_SIZE + size2) as u64;
                                             final_required = required1 + required2;
@@ -852,8 +858,10 @@ impl Walrus {
             return Ok(Vec::new());
         }
 
-        // Hold lock across IO/parse for StrictlyAtOnce to avoid duplicate consumption
-        let hold_lock_during_io = matches!(self.read_consistency, ReadConsistency::StrictlyAtOnce);
+        // Hold lock across IO/parse when the read is stateful+checkpointing, to avoid duplicate consumption
+        // (and to keep topic counts accurate) even in AtLeastOnce mode.
+        let hold_lock_during_io = matches!(self.read_consistency, ReadConsistency::StrictlyAtOnce)
+            || (checkpoint && start_offset.is_none());
         // Manage the guard explicitly to satisfy the borrow checker
         if !hold_lock_during_io && info_guard.is_some() {
             // Release lock for AtLeastOnce before IO
@@ -1180,6 +1188,10 @@ impl Walrus {
                     PersistTarget::None => {}
                 }
             }
+        }
+
+        if checkpoint && start_offset.is_none() {
+            self.decrement_topic_entry_count(col_name, entries_parsed as u64);
         }
 
         Ok(entries)

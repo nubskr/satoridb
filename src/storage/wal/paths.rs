@@ -1,4 +1,4 @@
-use crate::wal::config::{now_millis_str, sanitize_namespace, wal_data_dir, MAX_FILE_SIZE};
+use crate::wal::config::{MAX_FILE_SIZE, now_millis_str, sanitize_namespace, wal_data_dir};
 use std::cell::RefCell;
 use std::fs;
 use std::path::{Path, PathBuf};

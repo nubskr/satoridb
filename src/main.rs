@@ -10,6 +10,7 @@ mod router;
 mod storage;
 mod wal;
 mod worker;
+mod ingest_counter;
 
 use anyhow::anyhow;
 use crossbeam_channel::{unbounded, Sender};
@@ -46,6 +47,8 @@ enum DatasetKind {
     Bigann,
     Gist,
 }
+
+const DEFAULT_REBALANCE_INTERVAL_SECS: u64 = 1;
 
 struct DatasetConfig {
     kind: DatasetKind,
@@ -270,40 +273,58 @@ fn main() -> anyhow::Result<()> {
     let rebalance_worker = RebalanceWorker::spawn(Storage::new(wal.clone()), router_shared.clone());
 
     // Optional periodic rebalance driver.
-    if let Some(secs) = std::env::var("SATORI_REBALANCE_INTERVAL_SECS")
+    let secs = std::env::var("SATORI_REBALANCE_INTERVAL_SECS")
         .ok()
         .and_then(|v| v.parse::<u64>().ok())
-    {
-        let target_size = std::env::var("SATORI_BUCKET_TARGET_SIZE")
-            .ok()
-            .and_then(|v| v.parse::<usize>().ok())
-            .unwrap_or(200_000);
-        let worker = rebalance_worker.clone();
-        std::thread::spawn(move || {
-            let interval = std::time::Duration::from_secs(secs.max(1));
-            loop {
-                std::thread::sleep(interval);
-                let sizes = worker.snapshot_sizes();
-                for (bid, sz) in sizes.iter() {
-                    if *sz > target_size * 2 {
-                        let _ = worker.enqueue_blocking(crate::rebalancer::RebalanceTask::Split(*bid));
-                    }
-                }
-                // Merge smallest two buckets if they are under target/2.
-                let mut small: Vec<(u64, usize)> = sizes
-                    .iter()
-                    .filter(|(_, sz)| **sz < target_size / 2)
-                    .map(|(k, v)| (*k, *v))
-                    .collect();
-                small.sort_by_key(|(_, sz)| *sz);
-                if small.len() >= 2 {
-                    let (a, _sa) = small[0];
-                    let (b, _sb) = small[1];
-                    let _ = worker.enqueue_blocking(crate::rebalancer::RebalanceTask::Merge(a, b));
-                }
+        .unwrap_or(DEFAULT_REBALANCE_INTERVAL_SECS);
+    let target_size = std::env::var("SATORI_BUCKET_TARGET_SIZE")
+        .ok()
+        .and_then(|v| v.parse::<usize>().ok())
+        .unwrap_or(10_000);
+    let worker = rebalance_worker.clone();
+    std::thread::spawn(move || {
+        loop {
+            let sizes = worker.snapshot_sizes();
+            let mut sizes_vec: Vec<usize> = sizes.values().cloned().collect();
+            sizes_vec.sort_unstable();
+            log::info!("rebalance: periodic tick sizes={:?}", sizes_vec);
+
+            // Faster polling when any bucket is over the split threshold to avoid runaway growth.
+            let fast_path = sizes.values().any(|sz| *sz > target_size * 2);
+            let sleep_dur = if fast_path {
+                std::time::Duration::from_millis(200)
+            } else {
+                std::time::Duration::from_secs(secs.max(1))
+            };
+
+            // Schedule a limited number of heavy tasks per tick to avoid queue explosion.
+            // Split only the largest offenders first.
+            let mut big: Vec<(u64, usize)> = sizes
+                .iter()
+                .filter(|(_, sz)| **sz > target_size * 2)
+                .map(|(k, v)| (*k, *v))
+                .collect();
+            big.sort_by_key(|(_, sz)| std::cmp::Reverse(*sz));
+            for (bid, _) in big.into_iter().take(1) {
+                let _ = worker.enqueue_blocking(crate::rebalancer::RebalanceTask::Split(bid));
             }
-        });
-    }
+
+            // Merge smallest two buckets if they are under target/2.
+            let mut small: Vec<(u64, usize)> = sizes
+                .iter()
+                .filter(|(_, sz)| **sz < target_size / 2)
+                .map(|(k, v)| (*k, *v))
+                .collect();
+            small.sort_by_key(|(_, sz)| *sz);
+            if small.len() >= 2 {
+                let (a, _sa) = small[0];
+                let (b, _sb) = small[1];
+                let _ = worker.enqueue_blocking(crate::rebalancer::RebalanceTask::Merge(a, b));
+            }
+
+            std::thread::sleep(sleep_dur);
+        }
+    });
     let mut router_handles = Vec::new();
     for i in 0..router_pool {
         let rx = router_rx.clone();
@@ -437,10 +458,10 @@ async fn run_benchmark_mode(
     }
 
     // Dataset-specific knobs
+    // Start with a moderate number of buckets; background rebalance can adjust.
     let (initial_batch_size, stream_batch_size, k, router_top_k) = match dataset.kind {
-        DatasetKind::Bigann => (100_000, 100_000, 1000, 50),
-        // Keep GIST tractable: smaller initial batch and moderate k.
-        DatasetKind::Gist => (50_000, 100_000, 2_000, 400),
+        DatasetKind::Bigann => (100_000, 100_000, 20, 50),
+        DatasetKind::Gist => (50_000, 100_000, 20, 400),
     };
 
     if dataset.base_path.exists() {
@@ -460,13 +481,15 @@ async fn run_benchmark_mode(
             k
         );
 
+        let total_initial = vectors.len();
         let buckets = Indexer::build_clusters(vectors, k);
+        ingest_counter::add(total_initial as u64);
         info!("Indexer created {} buckets.", buckets.len());
 
         for bucket in &buckets {
             storage.put_chunk(bucket).await?;
         }
-        rebalance.prime_centroids(&buckets);
+        rebalance.prime_centroids(&buckets).await?;
         info!("Initial indexing complete (router version {}).", router_shared.current_version());
 
         // Streaming Ingestion

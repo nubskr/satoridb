@@ -1,5 +1,5 @@
 use crate::wal::block::Block;
-use crate::wal::config::{debug_print, DEFAULT_BLOCK_SIZE, MAX_ALLOC, MAX_FILE_SIZE};
+use crate::wal::config::{DEFAULT_BLOCK_SIZE, MAX_ALLOC, MAX_FILE_SIZE, debug_print};
 use crate::wal::paths::WalPathManager;
 use crate::wal::storage::{SharedMmap, SharedMmapKeeper};
 use std::cell::UnsafeCell;
