@@ -1,5 +1,5 @@
 use crate::worker::{QueryRequest, WorkerMessage};
-use crate::{ConsistentHashRing, RouterTask};
+use crate::{ConsistentHashRing, RouterResult, RouterTask};
 use anyhow::{anyhow, Context, Result};
 use async_channel::Sender as AsyncSender;
 use crossbeam_channel::Sender as CrossbeamSender;
@@ -153,8 +153,12 @@ async fn handle_connection(
             continue;
         }
 
-        let bucket_ids = match rx.await {
-            Ok(Ok(ids)) => ids,
+        let RouterResult {
+            bucket_ids,
+            routing_version,
+            affected_buckets,
+        } = match rx.await {
+            Ok(Ok(res)) => res,
             Ok(Err(e)) => {
                 write_frame(
                     &mut stream,
@@ -198,6 +202,8 @@ async fn handle_connection(
             let req = QueryRequest {
                 query_vec: req.vector.clone(),
                 bucket_ids: bids,
+                routing_version,
+                affected_buckets: affected_buckets.clone(),
                 respond_to: tx,
             };
             if worker_senders[shard].send(WorkerMessage::Query(req)).await.is_ok() {

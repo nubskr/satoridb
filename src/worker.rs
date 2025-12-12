@@ -5,12 +5,13 @@ use crate::storage::{Bucket, Vector};
 use async_channel::Receiver;
 use futures::channel::oneshot;
 use log::{error, info};
-use std::collections::HashMap;
 use std::sync::Arc;
 
 pub struct QueryRequest {
     pub query_vec: Vec<f32>,
     pub bucket_ids: Vec<u64>,
+    pub routing_version: u64,
+    pub affected_buckets: std::sync::Arc<Vec<u64>>,
     pub respond_to: oneshot::Sender<anyhow::Result<Vec<(u64, f32)>>>,
 }
 
@@ -35,7 +36,15 @@ pub async fn run_worker(id: usize, receiver: Receiver<WorkerMessage>, wal: Arc<W
     while let Ok(msg) = receiver.recv().await {
         match msg {
             WorkerMessage::Query(req) => {
-                let result = executor.query(&req.query_vec, &req.bucket_ids, 100).await;
+                let result = executor
+                    .query(
+                        &req.query_vec,
+                        &req.bucket_ids,
+                        100,
+                        req.routing_version,
+                        req.affected_buckets,
+                    )
+                    .await;
                 if let Err(_) = req.respond_to.send(result) {
                     error!("Worker {} failed to send response back.", id);
                 }

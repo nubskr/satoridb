@@ -1,13 +1,15 @@
 use crate::storage::{Bucket, Storage, Vector};
 use anyhow::Result;
 use lru::LruCache;
-use std::cell::RefCell;
+use std::cell::{Cell, RefCell};
 use std::convert::TryInto;
 use std::num::NonZeroUsize;
 
 pub struct Executor {
     storage: Storage,
     cache: RefCell<WorkerCache>,
+    cache_version: Cell<u64>,
+    last_changed: RefCell<std::sync::Arc<Vec<u64>>>,
 }
 
 #[derive(Clone)]
@@ -40,6 +42,16 @@ impl WorkerCache {
             self.buckets.put(bucket_id, bucket);
         }
     }
+
+    fn clear(&mut self) {
+        self.buckets.clear();
+    }
+
+    fn invalidate_many(&mut self, ids: &[u64]) {
+        for id in ids {
+            self.buckets.pop(id);
+        }
+    }
 }
 
 impl Executor {
@@ -47,6 +59,8 @@ impl Executor {
         Self {
             storage,
             cache: RefCell::new(cache),
+            cache_version: Cell::new(0),
+            last_changed: RefCell::new(std::sync::Arc::new(Vec::new())),
         }
     }
 
@@ -89,7 +103,20 @@ impl Executor {
         query_vec: &[f32],
         bucket_ids: &[u64],
         top_k: usize,
+        routing_version: u64,
+        changed_buckets: std::sync::Arc<Vec<u64>>,
     ) -> Result<Vec<(u64, f32)>> {
+        if self.cache_version.get() != routing_version {
+            let mut cache = self.cache.borrow_mut();
+            if changed_buckets.is_empty() {
+                cache.clear();
+            } else {
+                cache.invalidate_many(&changed_buckets);
+            }
+            self.cache_version.set(routing_version);
+            *self.last_changed.borrow_mut() = changed_buckets;
+        }
+
         let mut candidates = Vec::new();
         let mut cache = self.cache.borrow_mut();
 

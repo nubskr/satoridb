@@ -47,6 +47,20 @@ pub struct Storage {
     wal: Arc<Walrus>,
 }
 
+#[derive(Archive, Deserialize, Serialize, Debug, PartialEq, Clone)]
+#[archive(check_bytes)]
+pub enum BucketMetaStatus {
+    Active,
+    Retired,
+}
+
+#[derive(Archive, Deserialize, Serialize, Debug, PartialEq, Clone)]
+#[archive(check_bytes)]
+pub struct BucketMeta {
+    pub bucket_id: u64,
+    pub status: BucketMetaStatus,
+}
+
 impl Storage {
     pub fn new(wal: Arc<Walrus>) -> Self {
         Self { wal }
@@ -72,6 +86,18 @@ impl Storage {
         self.wal
             .append_for_topic(&Self::topic_for(bucket.id), &payload)
             .map_err(|e| anyhow::anyhow!("Walrus append failed ({}): {:?}", file_name, e))
+    }
+
+    /// Emits a bucket metadata record (active/retired) for housekeeping.
+    pub async fn put_bucket_meta(&self, meta: &BucketMeta) -> Result<()> {
+        let bytes = rkyv::to_bytes::<_, 256>(meta)
+            .map_err(|e| anyhow::anyhow!("Failed to serialize bucket meta: {}", e))?;
+        let mut payload = Vec::with_capacity(8 + bytes.len());
+        payload.extend_from_slice(&bytes.len().to_le_bytes());
+        payload.extend_from_slice(bytes.as_slice());
+        self.wal
+            .append_for_topic("bucket_meta", &payload)
+            .map_err(|e| anyhow::anyhow!("Walrus append failed (bucket_meta): {:?}", e))
     }
 
     /// Retrieves all chunks for a bucket.

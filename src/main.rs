@@ -4,6 +4,7 @@ mod fvecs;
 mod gnd;
 mod indexer;
 mod net;
+mod rebalancer;
 mod quantizer;
 mod router;
 mod storage;
@@ -33,8 +34,8 @@ use crate::fvecs::FvecsReader;
 use crate::gnd::GndReader;
 use crate::indexer::Indexer;
 use crate::net::spawn_network_server;
-use crate::quantizer::Quantizer;
-use crate::router::Router;
+use crate::rebalancer::RebalanceWorker;
+use crate::router::RoutingTable;
 use crate::storage::{Storage, Vector};
 use crate::wal::runtime::Walrus;
 use crate::wal::{FsyncSchedule, ReadConsistency};
@@ -57,7 +58,14 @@ struct DatasetConfig {
 pub struct RouterTask {
     pub query_vec: Vec<f32>,
     pub top_k: usize,
-    pub respond_to: oneshot::Sender<anyhow::Result<Vec<u64>>>,
+    pub respond_to: oneshot::Sender<anyhow::Result<RouterResult>>,
+}
+
+#[derive(Clone)]
+pub struct RouterResult {
+    pub bucket_ids: Vec<u64>,
+    pub routing_version: u64,
+    pub affected_buckets: std::sync::Arc<Vec<u64>>,
 }
 
 #[derive(Clone)]
@@ -157,10 +165,8 @@ fn ensure_gist_files(tar_path: &Path) -> anyhow::Result<()> {
     }
 }
 
-fn trigger_indexing(
-    router_shared: &Arc<parking_lot::RwLock<Option<Router>>>,
-) -> anyhow::Result<()> {
-    if router_shared.read().is_some() {
+fn trigger_indexing(router_shared: &Arc<RoutingTable>) -> anyhow::Result<()> {
+    if router_shared.snapshot().is_some() {
         info!("Router already built; indexing trigger is a no-op.");
         Ok(())
     } else {
@@ -260,19 +266,75 @@ fn main() -> anyhow::Result<()> {
 
     // Router pool using crossbeam MPMC; router is installed after clustering.
     let (router_tx, router_rx) = unbounded::<RouterTask>();
-    let router_shared: Arc<parking_lot::RwLock<Option<Router>>> =
-        Arc::new(parking_lot::RwLock::new(None));
+    let router_shared = Arc::new(RoutingTable::new());
+    let rebalance_worker = RebalanceWorker::spawn(Storage::new(wal.clone()), router_shared.clone());
+
+    // Optional periodic rebalance driver.
+    if let Some(secs) = std::env::var("SATORI_REBALANCE_INTERVAL_SECS")
+        .ok()
+        .and_then(|v| v.parse::<u64>().ok())
+    {
+        let target_size = std::env::var("SATORI_BUCKET_TARGET_SIZE")
+            .ok()
+            .and_then(|v| v.parse::<usize>().ok())
+            .unwrap_or(200_000);
+        let worker = rebalance_worker.clone();
+        std::thread::spawn(move || {
+            let interval = std::time::Duration::from_secs(secs.max(1));
+            loop {
+                std::thread::sleep(interval);
+                let sizes = worker.snapshot_sizes();
+                for (bid, sz) in sizes.iter() {
+                    if *sz > target_size * 2 {
+                        let _ = worker.enqueue_blocking(crate::rebalancer::RebalanceTask::Split(*bid));
+                    }
+                }
+                // Merge smallest two buckets if they are under target/2.
+                let mut small: Vec<(u64, usize)> = sizes
+                    .iter()
+                    .filter(|(_, sz)| **sz < target_size / 2)
+                    .map(|(k, v)| (*k, *v))
+                    .collect();
+                small.sort_by_key(|(_, sz)| *sz);
+                if small.len() >= 2 {
+                    let (a, _sa) = small[0];
+                    let (b, _sb) = small[1];
+                    let _ = worker.enqueue_blocking(crate::rebalancer::RebalanceTask::Merge(a, b));
+                }
+            }
+        });
+    }
     let mut router_handles = Vec::new();
     for i in 0..router_pool {
         let rx = router_rx.clone();
         let router_clone = router_shared.clone();
         let handle = thread::spawn(move || {
+            let mut local_snapshot: Option<crate::router::RoutingSnapshot> = None;
             for task in rx.iter() {
-                let res = router_clone
-                    .read()
+                if local_snapshot
                     .as_ref()
-                    .ok_or_else(|| anyhow!("router not initialized"))?
+                    .map(|s| s.version != router_clone.current_version())
+                    .unwrap_or(true)
+                {
+                    local_snapshot = router_clone.snapshot();
+                }
+
+                let snapshot = match &local_snapshot {
+                    Some(s) => s.clone(),
+                    None => {
+                        let _ = task.respond_to.send(Err(anyhow!("router not initialized")));
+                        continue;
+                    }
+                };
+
+                let res = snapshot
+                    .router
                     .query(&task.query_vec, task.top_k)
+                    .map(|bucket_ids| RouterResult {
+                        bucket_ids,
+                        routing_version: snapshot.version,
+                        affected_buckets: snapshot.changed.clone(),
+                    })
                     .map_err(|e| anyhow!("router {} query failed: {:?}", i, e));
                 let _ = task.respond_to.send(res);
             }
@@ -289,6 +351,7 @@ fn main() -> anyhow::Result<()> {
             wal.clone(),
             router_tx.clone(),
             router_shared.clone(),
+            rebalance_worker.clone(),
             ring.clone(),
             senders.clone(),
         ))?;
@@ -338,7 +401,8 @@ fn main() -> anyhow::Result<()> {
 async fn run_benchmark_mode(
     wal: Arc<Walrus>,
     router_tx: Sender<RouterTask>,
-    router_shared: Arc<parking_lot::RwLock<Option<Router>>>,
+    router_shared: Arc<RoutingTable>,
+    rebalance: RebalanceWorker,
     ring: ConsistentHashRing,
     senders: Vec<async_channel::Sender<WorkerMessage>>,
 ) -> anyhow::Result<()> {
@@ -399,17 +463,11 @@ async fn run_benchmark_mode(
         let buckets = Indexer::build_clusters(vectors, k);
         info!("Indexer created {} buckets.", buckets.len());
 
-        let centroids: Vec<Vec<f32>> = buckets.iter().map(|b| b.centroid.clone()).collect();
-        let (min, max) = Quantizer::compute_bounds(&centroids);
-        let quantizer = Quantizer::new(min, max);
-
-        let mut r = Router::new(100_000, quantizer.clone());
         for bucket in &buckets {
             storage.put_chunk(bucket).await?;
-            r.add_centroid(bucket.id, &bucket.centroid);
         }
-        *router_shared.write() = Some(r);
-        info!("Initial indexing complete.");
+        rebalance.prime_centroids(&buckets);
+        info!("Initial indexing complete (router version {}).", router_shared.current_version());
 
         // Streaming Ingestion
         let mut total_processed = initial_batch_size;
@@ -424,17 +482,16 @@ async fn run_benchmark_mode(
 
             let mut updates: HashMap<u64, Vec<Vector>> = HashMap::new();
 
-            for vec in batch {
-                let ids = {
-                    let guard = router_shared.read();
-                    let r_ref = guard.as_ref().ok_or_else(|| anyhow!("router missing"))?;
-                    r_ref.query(&vec.data, 1)
-                };
-                if let Ok(ids) = ids {
-                    if !ids.is_empty() {
-                        updates.entry(ids[0]).or_default().push(vec);
+            if let Some(snapshot) = router_shared.snapshot() {
+                for vec in batch {
+                    if let Ok(ids) = snapshot.router.query(&vec.data, 1) {
+                        if let Some(&id) = ids.first() {
+                            updates.entry(id).or_default().push(vec);
+                        }
                     }
                 }
+            } else {
+                return Err(anyhow!("router missing"));
             }
 
             for (bucket_id, new_vectors) in updates {
@@ -516,7 +573,12 @@ async fn run_benchmark_mode(
             router_tx
                 .send(task)
                 .map_err(|e| anyhow!("router send: {:?}", e))?;
-            let bucket_ids = rx.await.map_err(|e| anyhow!("router recv: {:?}", e))??;
+            let router_result = rx.await.map_err(|e| anyhow!("router recv: {:?}", e))??;
+            let RouterResult {
+                bucket_ids,
+                routing_version,
+                affected_buckets,
+            } = router_result;
 
             if i == 0 {
                 info!(
@@ -538,6 +600,8 @@ async fn run_benchmark_mode(
                 let req = QueryRequest {
                     query_vec: q.data.clone(),
                     bucket_ids: bids,
+                    routing_version,
+                    affected_buckets: affected_buckets.clone(),
                     respond_to: tx,
                 };
                 let msg = WorkerMessage::Query(req);
