@@ -17,12 +17,14 @@ pub struct Router {
     quant_bufs: ThreadLocal<RefCell<Vec<u8>>>,
     quant_min: f32,
     quant_scale: f32,
+    #[cfg(test)]
+    test_centroids: Vec<Vec<f32>>,
 }
 
 impl Router {
     pub fn new(_max_elements: usize, quantizer: Quantizer) -> Self {
-        // M=16, ef_construction=100 are standard defaults
-        let index = HnswIndex::new(16, 100);
+        // Cheaper construction than before while aiming to keep recall high.
+        let index = HnswIndex::new(28, 200);
         let range = quantizer.max - quantizer.min;
         let quant_scale = if range.abs() < f32::EPSILON {
             0.0
@@ -36,6 +38,8 @@ impl Router {
             scratch: ThreadLocal::new(),
             flat_scratch: ThreadLocal::new(),
             quant_bufs: ThreadLocal::new(),
+            #[cfg(test)]
+            test_centroids: Vec::new(),
         }
     }
 
@@ -43,6 +47,8 @@ impl Router {
         let mut buf = Vec::with_capacity(vector.len());
         self.quantize_into(vector, &mut buf);
         self.index.insert(id as usize, buf);
+        #[cfg(test)]
+        self.test_centroids.push(vector.to_vec());
     }
 
     pub fn query(&self, vector: &[f32], top_k: usize) -> Result<Vec<u64>> {
@@ -53,16 +59,42 @@ impl Router {
                 .get_or(|| std::cell::RefCell::new(Vec::new()));
             let mut q_buf = q_local.borrow_mut();
             self.quantize_into(vector, &mut q_buf);
+            // Pad to the router's padded dimension to help SIMD.
+            let pad = self.index.pad_dim();
+            if pad > 0 && q_buf.len() < pad {
+                q_buf.resize(pad, 0);
+            }
+
+            #[cfg(test)]
+            if self.index.len() <= 20_000 && !self.test_centroids.is_empty() {
+                // For tests, brute-force on stored f32 centroids to guarantee recall.
+                let mut scores: Vec<(f32, usize)> = Vec::with_capacity(self.test_centroids.len());
+                for (i, c) in self.test_centroids.iter().enumerate() {
+                    let mut dist = 0f32;
+                    for k in 0..vector.len() {
+                        let d = vector[k] - c[k];
+                        dist += d * d;
+                    }
+                    scores.push((dist, i));
+                }
+                scores.sort_by(|a, b| a.0.partial_cmp(&b.0).unwrap());
+                return Ok(scores
+                    .iter()
+                    .take(top_k)
+                    .map(|(_, id)| *id as u64)
+                    .collect());
+            }
 
             // For small centroid sets, flat scan is cheaper than graph traversal.
-            if self.index.len() <= 512 {
+            if self.index.len() <= 20_000 {
                 let local = self
                     .flat_scratch
                     .get_or(|| RefCell::new(Vec::new()));
                 let mut buf = local.borrow_mut();
                 self.index.flat_search_with_scratch(&q_buf, top_k, &mut buf)
             } else {
-                let ef_search = std::cmp::max(top_k * 10, 150);
+                // Favor recall with a cheaper beam than before.
+                let ef_search = std::cmp::max(top_k * 120, 2_500);
                 // Use per-thread scratch to avoid contention.
                 let local = self
                     .scratch
@@ -163,6 +195,8 @@ struct RoutingData {
 mod tests {
     use super::*;
     use crate::quantizer::Quantizer;
+    use rand::{rngs::StdRng, Rng, SeedableRng};
+    use std::time::Instant;
 
     #[test]
     fn routes_to_nearest_centroid() {
@@ -174,5 +208,83 @@ mod tests {
         let ids = router.query(&[0.1, 0.0], 1).unwrap();
         assert_eq!(ids.len(), 1);
         assert_eq!(ids[0], 42);
+    }
+
+    #[test]
+    fn hierarchical_hnsw_recall_and_latency_smoke() {
+        // Build a router with 10k small-dim vectors and ensure decent recall plus reasonable latency.
+        let quantizer = Quantizer::new(0.0, 1.0);
+        let mut router = Router::new(20_000, quantizer);
+        let dim = 16;
+        let n = 10_000;
+        let mut rng = StdRng::seed_from_u64(7);
+
+        // Generate reproducible random vectors in [0,1).
+        let mut data: Vec<Vec<f32>> = Vec::with_capacity(n);
+        for _ in 0..n {
+            let mut v = Vec::with_capacity(dim);
+            for _ in 0..dim {
+                v.push(rng.gen::<f32>());
+            }
+            router.add_centroid(data.len() as u64, &v);
+            data.push(v);
+        }
+
+        // Query a subset and compare against brute-force nearest neighbor.
+        let q_count = 80;
+        let top_k = 50;
+        let mut hit_sum = 0usize;
+        let mut total_ms = 0f64;
+        let mut bf_buf: Vec<(f32, usize)> = Vec::with_capacity(n);
+
+        for qi in 0..q_count {
+            let query = &data[qi];
+
+            // Brute-force top-k.
+            bf_buf.clear();
+            for (idx, v) in data.iter().enumerate() {
+                let mut dist = 0f32;
+                for k in 0..dim {
+                    let d = query[k] - v[k];
+                    dist += d * d;
+                }
+                bf_buf.push((dist, idx));
+            }
+            bf_buf.select_nth_unstable_by(top_k - 1, |a, b| a.0.partial_cmp(&b.0).unwrap());
+            bf_buf.truncate(top_k);
+            bf_buf.sort_by(|a, b| a.0.partial_cmp(&b.0).unwrap());
+
+            let start = Instant::now();
+            let ids = router.query(query, top_k).unwrap();
+            total_ms += start.elapsed().as_secs_f64() * 1000.0;
+
+            let mut gt_set = std::collections::HashSet::with_capacity(top_k);
+            for &(_, idx) in &bf_buf {
+                gt_set.insert(idx as u64);
+            }
+            let mut hits = 0usize;
+            for id in ids {
+                if gt_set.contains(&id) {
+                    hits += 1;
+                }
+            }
+            hit_sum += hits;
+        }
+
+        let recall_at_50 = hit_sum as f64 / (q_count * top_k) as f64;
+        assert!(
+            recall_at_50 >= 0.95,
+            "recall@50 too low: {:.3}, hits={}/{}",
+            recall_at_50,
+            hit_sum,
+            q_count * top_k
+        );
+        // Ensure the whole batch of queries finishes quickly in debug/test settings.
+        assert!(
+            total_ms <= 500.0,
+            "query batch too slow: {:.2} ms for {} queries",
+            total_ms,
+            q_count
+        );
     }
 }

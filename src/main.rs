@@ -338,7 +338,17 @@ fn main() -> anyhow::Result<()> {
             let sizes = worker.snapshot_sizes();
             let mut sizes_vec: Vec<usize> = sizes.values().cloned().collect();
             sizes_vec.sort_unstable();
-            log::debug!("rebalance: periodic tick sizes={:?}", sizes_vec);
+            // Log bucket sizes every 10 ticks at INFO for visibility.
+            if tick_ctr % 10 == 0 {
+                log::info!(
+                    "rebalance: periodic tick (tick={}) buckets={} sizes={:?}",
+                    tick_ctr,
+                    sizes_vec.len(),
+                    sizes_vec
+                );
+            } else {
+                log::debug!("rebalance: periodic tick sizes={:?}", sizes_vec);
+            }
 
             // Faster polling when any bucket is over the split threshold to avoid runaway growth.
             let fast_path = sizes.values().any(|sz| *sz > target_size * 2);
@@ -562,8 +572,9 @@ async fn run_benchmark_mode(
         }
         rebalance.prime_centroids(&buckets).await?;
         info!(
-            "Initial indexing complete (router version {}).",
-            router_shared.current_version()
+            "Initial indexing complete (router version {}, buckets={}).",
+            router_shared.current_version(),
+            buckets.len()
         );
 
         // Streaming Ingestion
