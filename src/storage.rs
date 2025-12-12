@@ -44,7 +44,7 @@ impl Bucket {
 
 #[derive(Clone)]
 pub struct Storage {
-    wal: Arc<Walrus>,
+    pub(crate) wal: Arc<Walrus>,
 }
 
 #[derive(Archive, Deserialize, Serialize, Debug, PartialEq, Clone)]
@@ -66,7 +66,7 @@ impl Storage {
         Self { wal }
     }
 
-    fn topic_for(bucket_id: u64) -> String {
+    pub(crate) fn topic_for(bucket_id: u64) -> String {
         format!("bucket_{}", bucket_id)
     }
 

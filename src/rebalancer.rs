@@ -2,6 +2,7 @@ use crate::indexer::Indexer;
 use crate::quantizer::Quantizer;
 use crate::router::{Router, RoutingTable};
 use crate::storage::{Bucket, BucketMeta, BucketMetaStatus, Storage, Vector};
+use crate::wal::runtime::Walrus;
 use async_channel::{Receiver, Sender};
 use futures::executor::block_on;
 use log::{error, info, warn};
@@ -21,6 +22,7 @@ pub enum RebalanceTask {
 
 struct RebalanceState {
     storage: Storage,
+    wal: Arc<Walrus>,
     routing: Arc<RoutingTable>,
     centroids: RwLock<HashMap<u64, Vec<f32>>>,
     bucket_sizes: RwLock<HashMap<u64, usize>>,
@@ -32,6 +34,7 @@ struct RebalanceState {
 impl RebalanceState {
     fn new(storage: Storage, routing: Arc<RoutingTable>) -> Self {
         Self {
+            wal: storage.wal.clone(),
             storage,
             routing,
             centroids: RwLock::new(HashMap::new()),
@@ -106,6 +109,29 @@ impl RebalanceState {
             self.storage
                 .put_bucket_meta(&BucketMeta { bucket_id, status: BucketMetaStatus::Retired }),
         );
+        self.mark_bucket_checkpointed(bucket_id);
+    }
+
+    fn mark_bucket_checkpointed(&self, bucket_id: u64) {
+        let topic = crate::storage::Storage::topic_for(bucket_id);
+        // Drain the topic with checkpoint=true to mark all blocks checkpointed.
+        let max_bytes = 16 * 1024 * 1024; // read in chunks
+        loop {
+            match self
+                .wal
+                .batch_read_for_topic(&topic, max_bytes, true, None)
+            {
+                Ok(entries) => {
+                    if entries.is_empty() {
+                        break;
+                    }
+                }
+                Err(e) => {
+                    warn!("rebalance: checkpoint drain failed for {}: {:?}", topic, e);
+                    break;
+                }
+            }
+        }
     }
 
     fn rebuild_router(&self) {
@@ -287,13 +313,6 @@ impl RebalanceWorker {
     }
 
     #[allow(dead_code)]
-    pub async fn enqueue(&self, task: RebalanceTask) -> anyhow::Result<()> {
-        self.tx
-            .send(task)
-            .await
-            .map_err(|e| anyhow::anyhow!("rebalance enqueue failed: {e:?}"))
-    }
-
     pub fn enqueue_blocking(&self, task: RebalanceTask) -> anyhow::Result<()> {
         self.tx
             .send_blocking(task)
