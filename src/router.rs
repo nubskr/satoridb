@@ -9,7 +9,8 @@ use thread_local::ThreadLocal;
 
 pub struct Router {
     index: HnswIndex,
-    scratch: parking_lot::Mutex<crate::router_hnsw::SearchScratch>,
+    // Per-thread scratch for HNSW search to avoid contention.
+    scratch: ThreadLocal<RefCell<crate::router_hnsw::SearchScratch>>,
     // Per-thread flat scratch for small-index scans.
     flat_scratch: ThreadLocal<RefCell<Vec<(f32, usize)>>>,
     // Per-thread quant buffers to avoid contention on the hot path.
@@ -32,9 +33,9 @@ impl Router {
             index,
             quant_min: quantizer.min,
             quant_scale,
-            scratch: parking_lot::Mutex::new(crate::router_hnsw::SearchScratch::new()),
+            scratch: ThreadLocal::new(),
             flat_scratch: ThreadLocal::new(),
-            quant_bufs: thread_local::ThreadLocal::new(),
+            quant_bufs: ThreadLocal::new(),
         }
     }
 
@@ -62,8 +63,11 @@ impl Router {
                 self.index.flat_search_with_scratch(&q_buf, top_k, &mut buf)
             } else {
                 let ef_search = std::cmp::max(top_k * 10, 150);
-                // Reuse scratch to avoid per-query allocations.
-                let mut scratch = self.scratch.lock();
+                // Use per-thread scratch to avoid contention.
+                let local = self
+                    .scratch
+                    .get_or(|| RefCell::new(crate::router_hnsw::SearchScratch::new()));
+                let mut scratch = local.borrow_mut();
                 self.index
                     .search_with_scratch(&q_buf, top_k, ef_search, &mut scratch)
             }
