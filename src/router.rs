@@ -2,14 +2,17 @@ use crate::quantizer::Quantizer;
 use crate::router_hnsw::HnswIndex;
 use anyhow::Result;
 use parking_lot::RwLock;
+use std::cell::RefCell;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
+use thread_local::ThreadLocal;
 
 pub struct Router {
     index: HnswIndex,
     scratch: parking_lot::Mutex<crate::router_hnsw::SearchScratch>,
     flat_scratch: parking_lot::Mutex<Vec<(f32, usize)>>,
-    quant_buf: parking_lot::Mutex<Vec<u8>>,
+    // Per-thread quant buffers to avoid contention on the hot path.
+    quant_bufs: ThreadLocal<RefCell<Vec<u8>>>,
     quant_min: f32,
     quant_scale: f32,
 }
@@ -30,7 +33,7 @@ impl Router {
             quant_scale,
             scratch: parking_lot::Mutex::new(crate::router_hnsw::SearchScratch::new()),
             flat_scratch: parking_lot::Mutex::new(Vec::new()),
-            quant_buf: parking_lot::Mutex::new(Vec::new()),
+            quant_bufs: thread_local::ThreadLocal::new(),
         }
     }
 
@@ -42,7 +45,11 @@ impl Router {
 
     pub fn query(&self, vector: &[f32], top_k: usize) -> Result<Vec<u64>> {
         let neighbors = {
-            let mut q_buf = self.quant_buf.lock();
+            // Get a per-thread buffer to avoid locking.
+            let q_local = self
+                .quant_bufs
+                .get_or(|| std::cell::RefCell::new(Vec::new()));
+            let mut q_buf = q_local.borrow_mut();
             self.quantize_into(vector, &mut q_buf);
 
             // For small centroid sets, flat scan is cheaper than graph traversal.
