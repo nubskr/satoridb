@@ -1,14 +1,62 @@
 use crate::storage::{Bucket, Vector};
-use log::info;
+use log::debug;
 use rand::prelude::*;
 use rand::seq::SliceRandom;
 
 pub struct Indexer;
 
+#[derive(Clone, Copy)]
+struct BuildOpts {
+    rebalance: bool,
+    reindex: bool,
+    max_iters: usize,
+    log_iters: bool,
+    init: InitMode,
+    force_two_buckets_k2: bool,
+}
+
+#[derive(Clone, Copy)]
+enum InitMode {
+    Random,
+    FarthestPairK2,
+}
+
 impl Indexer {
     /// basic k-means implementation
     /// consumes vectors and returns buckets
     pub fn build_clusters(vectors: Vec<Vector>, k: usize) -> Vec<Bucket> {
+        Self::build_clusters_with_opts(
+            vectors,
+            k,
+            BuildOpts {
+                rebalance: true,
+                reindex: true,
+                max_iters: 20,
+                log_iters: true,
+                init: InitMode::Random,
+                force_two_buckets_k2: false,
+            },
+        )
+    }
+
+    /// Split a bucket into exactly two buckets (no recursive rebalancing / reindexing).
+    /// Optimized for the rebalance path.
+    pub fn split_bucket_once(bucket: Bucket) -> Vec<Bucket> {
+        Self::build_clusters_with_opts(
+            bucket.vectors,
+            2,
+            BuildOpts {
+                rebalance: false,
+                reindex: false,
+                max_iters: 8,
+                log_iters: false,
+                init: InitMode::FarthestPairK2,
+                force_two_buckets_k2: true,
+            },
+        )
+    }
+
+    fn build_clusters_with_opts(vectors: Vec<Vector>, k: usize, opts: BuildOpts) -> Vec<Bucket> {
         if vectors.is_empty() || k == 0 {
             return vec![];
         }
@@ -19,96 +67,134 @@ impl Indexer {
             return vec![];
         }
 
-        // Optional: if your data can be ragged, this prevents UB in the AVX paths.
-        // If it's always fixed-dim, remove for speed.
+        // If ragged dims are possible in your pipeline, keep this.
+        // If you're guaranteed fixed-dim, remove for speed.
         if vectors.iter().any(|v| v.data.len() != dim) {
             return vec![];
         }
 
         let mut rng = rand::thread_rng();
 
-        // Runtime feature detection ONCE (do not do this per distance call).
-        let (use_avx2_fma, use_avx2) = detect_simd();
+        // Detect SIMD once. Never do is_x86_feature_detected!() inside the inner loops.
+        let simd = SimdCaps::detect();
 
-        // 1) Init centroids: contiguous (k * dim)
+        // Centroids: flat AoS layout, k * dim
         let mut centroids = vec![0.0f32; k * dim];
-        {
-            // pick k random vectors (with replacement-ish fallback)
-            let chosen: Vec<&Vector> = vectors.choose_multiple(&mut rng, k).collect();
-            let mut c = 0usize;
-
-            for v in chosen {
-                centroids[c * dim..(c + 1) * dim].copy_from_slice(&v.data);
-                c += 1;
-            }
-
-            while c < k {
-                // fallback: random centroid
-                let base = c * dim;
-                for d in 0..dim {
-                    centroids[base + d] = rng.gen::<f32>();
+        match opts.init {
+            InitMode::FarthestPairK2 if k == 2 && n >= 2 => {
+                let a0 = &vectors[0].data;
+                let mut b = 1usize;
+                let mut best = -1.0f32;
+                for i in 1..n {
+                    let d = l2_sq_scalar(a0, &vectors[i].data);
+                    if d > best {
+                        best = d;
+                        b = i;
+                    }
                 }
-                c += 1;
+
+                let ab = &vectors[b].data;
+                let mut a = 0usize;
+                best = -1.0f32;
+                for i in 0..n {
+                    let d = l2_sq_scalar(ab, &vectors[i].data);
+                    if d > best {
+                        best = d;
+                        a = i;
+                    }
+                }
+                if a == b {
+                    a = 0;
+                    if a == b {
+                        a = 1;
+                    }
+                }
+
+                centroids[0..dim].copy_from_slice(&vectors[a].data);
+                centroids[dim..2 * dim].copy_from_slice(&vectors[b].data);
+            }
+            _ => {
+                let chosen: Vec<&Vector> = vectors.choose_multiple(&mut rng, k).collect();
+                let mut c = 0usize;
+
+                for v in chosen {
+                    centroids[c * dim..(c + 1) * dim].copy_from_slice(&v.data);
+                    c += 1;
+                }
+
+                while c < k {
+                    // fallback: random centroid
+                    let base = c * dim;
+                    for d in 0..dim {
+                        centroids[base + d] = rng.gen::<f32>();
+                    }
+                    c += 1;
+                }
             }
         }
 
-        let max_iters = 20;
-        let mut assignments = vec![0usize; n];
+        // Force first iter to count as "changed" so we do at least one update.
+        let mut assignments = vec![usize::MAX; n];
 
-        // Reused buffers to avoid per-iter allocations.
+        // Reused accumulators
         let mut sums = vec![0.0f32; k * dim];
         let mut counts = vec![0u32; k];
 
-        // Only needed for the 8-centroid-at-a-time kernel.
+        // For k>=8 block kernel (SoA)
         let mut centroids_t = Vec::<f32>::new();
 
-        for iter in 0..max_iters {
-            info!("kmeans iter {}/{}", iter + 1, max_iters);
+        // Iter knobs
+        let max_iters = opts.max_iters.max(1);
 
-            // reset accumulators
+        for iter in 0..max_iters {
+            if opts.log_iters && log::log_enabled!(log::Level::Debug) {
+                debug!("kmeans iter {}/{}", iter + 1, max_iters);
+            }
+
             sums.fill(0.0);
             counts.fill(0);
 
-            // build transposed centroid matrix if we can benefit
-            let use_block8 = use_avx2_fma && k >= 8;
+            // Choose assignment kernel
+            let use_block8 = simd.avx2_fma && k >= 8;
+            let use_k2 = simd.avx2_fma && k == 2;
+
             if use_block8 {
                 transpose_centroids_aos_to_soa(&centroids, k, dim, &mut centroids_t);
             }
 
             let mut changed = false;
 
-            // Assign + accumulate
             for (i, v) in vectors.iter().enumerate() {
-                let vec_data = &v.data;
+                let x = &v.data;
 
-                let best_cluster = if use_block8 {
-                    // 8 centroids at a time: fast path
-                    unsafe { nearest_centroid_l2_sq_avx2_fma(vec_data, &centroids_t, k, dim) }
-                } else if use_avx2 {
-                    // fallback: per-centroid AVX2 kernel (still faster than scalar for decent dim)
-                    unsafe { nearest_centroid_l2_sq_avx2_pairwise(vec_data, &centroids, k, dim, use_avx2_fma) }
+                let best = if use_k2 {
+                    // Special-case k=2: compute both distances in one pass (point streamed once)
+                    unsafe { nearest_centroid_k2_avx2_fma(x, &centroids, dim) }
+                } else if use_block8 {
+                    // k>=8: 8 centroids at once (SoA transposed centroids)
+                    unsafe { nearest_centroid_block8_avx2_fma(x, &centroids_t, k, dim) }
+                } else if simd.avx2 {
+                    unsafe { nearest_centroid_pairwise_avx2(x, &centroids, k, dim, simd.avx2_fma) }
                 } else {
-                    nearest_centroid_l2_sq_scalar(vec_data, &centroids, k, dim)
+                    nearest_centroid_scalar(x, &centroids, k, dim)
                 };
 
-                if assignments[i] != best_cluster {
-                    assignments[i] = best_cluster;
+                if assignments[i] != best {
+                    assignments[i] = best;
                     changed = true;
                 }
 
-                // accumulate into sums
-                let base = best_cluster * dim;
+                // Accumulate sums
+                let base = best * dim;
+                // Tight loop, no iterators
                 for d in 0..dim {
-                    sums[base + d] += vec_data[d];
+                    sums[base + d] += x[d];
                 }
-                counts[best_cluster] += 1;
-            }
-
-            if !changed {
-                break;
+                counts[best] += 1;
             }
 
             // Update centroids
+            let mut reseeded = false;
             for j in 0..k {
                 if counts[j] > 0 {
                     let inv = 1.0 / counts[j] as f32;
@@ -117,21 +203,53 @@ impl Indexer {
                         centroids[base + d] = sums[base + d] * inv;
                     }
                 } else {
-                    // re-seed empty cluster with a random existing vector
+                    // Re-seed empty cluster
                     if let Some(v) = vectors.choose(&mut rng) {
                         centroids[j * dim..(j + 1) * dim].copy_from_slice(&v.data);
+                        reseeded = true;
                     }
                 }
             }
+
+            if !changed && !reseeded {
+                break;
+            }
         }
 
-        // Build Buckets (reserve using final counts to avoid realloc churn)
+        // Build Buckets (reserve exact sizes to avoid realloc churn)
         let mut final_counts = vec![0usize; k];
         for &a in &assignments {
             final_counts[a] += 1;
         }
 
-        let mut buckets_data: Vec<Vec<Vector>> = (0..k).map(|j| Vec::with_capacity(final_counts[j])).collect();
+        if opts.force_two_buckets_k2 && k == 2 && n >= 2 && (final_counts[0] == 0 || final_counts[1] == 0)
+        {
+            // Deterministic fallback: split in half to avoid returning a single bucket.
+            let mid = n / 2;
+            let mut b0 = Vec::with_capacity(mid);
+            let mut b1 = Vec::with_capacity(n - mid);
+            for (i, v) in vectors.into_iter().enumerate() {
+                if i < mid {
+                    b0.push(v);
+                } else {
+                    b1.push(v);
+                }
+            }
+            let c0 = centroid_of(&b0, dim);
+            let c1 = centroid_of(&b1, dim);
+            let mut out = Vec::with_capacity(2);
+            let mut bb0 = Bucket::new(0, c0);
+            bb0.vectors = b0;
+            out.push(bb0);
+            let mut bb1 = Bucket::new(1, c1);
+            bb1.vectors = b1;
+            out.push(bb1);
+            return out;
+        }
+
+        let mut buckets_data: Vec<Vec<Vector>> =
+            (0..k).map(|j| Vec::with_capacity(final_counts[j])).collect();
+
         for (i, vec) in vectors.into_iter().enumerate() {
             let cluster_idx = assignments[i];
             buckets_data[cluster_idx].push(vec);
@@ -147,17 +265,23 @@ impl Indexer {
             }
         }
 
-        let balanced = Self::rebalance_buckets(buckets);
-
-        // Reindex buckets to ensure unique, dense IDs after rebalancing/splitting.
-        let mut reindexed = Vec::with_capacity(balanced.len());
-        for (i, b) in balanced.into_iter().enumerate() {
-            let mut nb = Bucket::new(i as u64, b.centroid);
-            nb.vectors = b.vectors;
-            reindexed.push(nb);
+        let mut out = buckets;
+        if opts.rebalance {
+            out = Self::rebalance_buckets(out);
         }
 
-        reindexed
+        // Reindex buckets to ensure unique, dense IDs after rebalancing/splitting.
+        if opts.reindex {
+            let mut reindexed = Vec::with_capacity(out.len());
+            for (i, b) in out.into_iter().enumerate() {
+                let mut nb = Bucket::new(i as u64, b.centroid);
+                nb.vectors = b.vectors;
+                reindexed.push(nb);
+            }
+            return reindexed;
+        }
+
+        out
     }
 
     pub fn split_bucket(bucket: Bucket) -> Vec<Bucket> {
@@ -185,16 +309,57 @@ impl Indexer {
     }
 }
 
-fn detect_simd() -> (bool, bool) {
-    #[cfg(target_arch = "x86_64")]
-    {
-        let avx2 = std::arch::is_x86_feature_detected!("avx2");
-        let fma = std::arch::is_x86_feature_detected!("fma");
-        (avx2 && fma, avx2)
+fn centroid_of(vectors: &[Vector], dim: usize) -> Vec<f32> {
+    if vectors.is_empty() || dim == 0 {
+        return Vec::new();
     }
-    #[cfg(not(target_arch = "x86_64"))]
-    {
-        (false, false)
+    let mut sums = vec![0.0f32; dim];
+    for v in vectors {
+        for d in 0..dim {
+            sums[d] += v.data[d];
+        }
+    }
+    let inv = 1.0 / vectors.len() as f32;
+    for s in &mut sums {
+        *s *= inv;
+    }
+    sums
+}
+
+#[inline(always)]
+fn l2_sq_scalar(a: &[f32], b: &[f32]) -> f32 {
+    let mut acc = 0.0f32;
+    for i in 0..a.len() {
+        let diff = a[i] - b[i];
+        acc += diff * diff;
+    }
+    acc
+}
+
+#[derive(Copy, Clone)]
+struct SimdCaps {
+    avx2: bool,
+    avx2_fma: bool,
+}
+
+impl SimdCaps {
+    fn detect() -> Self {
+        #[cfg(target_arch = "x86_64")]
+        {
+            let avx2 = std::arch::is_x86_feature_detected!("avx2");
+            let fma = std::arch::is_x86_feature_detected!("fma");
+            Self {
+                avx2,
+                avx2_fma: avx2 && fma,
+            }
+        }
+        #[cfg(not(target_arch = "x86_64"))]
+        {
+            Self {
+                avx2: false,
+                avx2_fma: false,
+            }
+        }
     }
 }
 
@@ -209,14 +374,15 @@ fn transpose_centroids_aos_to_soa(centroids_aos: &[f32], k: usize, dim: usize, o
     }
 }
 
-fn nearest_centroid_l2_sq_scalar(point: &[f32], centroids: &[f32], k: usize, dim: usize) -> usize {
+fn nearest_centroid_scalar(x: &[f32], centroids: &[f32], k: usize, dim: usize) -> usize {
     let mut best = 0usize;
     let mut best_dist = f32::INFINITY;
+
     for c in 0..k {
         let base = c * dim;
         let mut acc = 0f32;
         for d in 0..dim {
-            let diff = point[d] - centroids[base + d];
+            let diff = x[d] - centroids[base + d];
             acc += diff * diff;
         }
         if acc < best_dist {
@@ -228,8 +394,8 @@ fn nearest_centroid_l2_sq_scalar(point: &[f32], centroids: &[f32], k: usize, dim
 }
 
 #[cfg(target_arch = "x86_64")]
-unsafe fn nearest_centroid_l2_sq_avx2_pairwise(
-    point: &[f32],
+unsafe fn nearest_centroid_pairwise_avx2(
+    x: &[f32],
     centroids: &[f32],
     k: usize,
     dim: usize,
@@ -238,18 +404,21 @@ unsafe fn nearest_centroid_l2_sq_avx2_pairwise(
     let mut best = 0usize;
     let mut best_dist = f32::INFINITY;
 
+    let xp = x.as_ptr();
+
     for c in 0..k {
-        let base = c * dim;
+        let cp = centroids.as_ptr().add(c * dim);
         let dist = if use_fma {
-            l2_dist_sq_avx2_fma_dim(point.as_ptr(), centroids.as_ptr().add(base), dim)
+            l2_dist_sq_avx2_fma_dim(xp, cp, dim)
         } else {
-            l2_dist_sq_avx2_dim(point.as_ptr(), centroids.as_ptr().add(base), dim)
+            l2_dist_sq_avx2_dim(xp, cp, dim)
         };
         if dist < best_dist {
             best_dist = dist;
             best = c;
         }
     }
+
     best
 }
 
@@ -279,6 +448,7 @@ unsafe fn l2_dist_sq_avx2_dim(a: *const f32, b: *const f32, dim: usize) -> f32 {
         total += d * d;
         i += 1;
     }
+
     total
 }
 
@@ -307,12 +477,60 @@ unsafe fn l2_dist_sq_avx2_fma_dim(a: *const f32, b: *const f32, dim: usize) -> f
         total += d * d;
         i += 1;
     }
+
     total
 }
 
 #[cfg(target_arch = "x86_64")]
 #[target_feature(enable = "avx2", enable = "fma")]
-unsafe fn nearest_centroid_l2_sq_avx2_fma(point: &[f32], centroids_t: &[f32], k: usize, dim: usize) -> usize {
+unsafe fn nearest_centroid_k2_avx2_fma(x: &[f32], centroids: &[f32], dim: usize) -> usize {
+    use std::arch::x86_64::*;
+
+    let c0 = centroids.as_ptr();
+    let c1 = centroids.as_ptr().add(dim);
+    let xp = x.as_ptr();
+
+    let mut acc0 = _mm256_setzero_ps();
+    let mut acc1 = _mm256_setzero_ps();
+
+    let mut i = 0usize;
+    while i + 8 <= dim {
+        let vx = _mm256_loadu_ps(xp.add(i));
+        let v0 = _mm256_loadu_ps(c0.add(i));
+        let v1 = _mm256_loadu_ps(c1.add(i));
+
+        let d0 = _mm256_sub_ps(vx, v0);
+        let d1 = _mm256_sub_ps(vx, v1);
+
+        acc0 = _mm256_fmadd_ps(d0, d0, acc0);
+        acc1 = _mm256_fmadd_ps(d1, d1, acc1);
+
+        i += 8;
+    }
+
+    let mut t0 = [0f32; 8];
+    let mut t1 = [0f32; 8];
+    _mm256_storeu_ps(t0.as_mut_ptr(), acc0);
+    _mm256_storeu_ps(t1.as_mut_ptr(), acc1);
+
+    let mut dist0 = t0.iter().sum::<f32>();
+    let mut dist1 = t1.iter().sum::<f32>();
+
+    while i < dim {
+        let xv = *xp.add(i);
+        let d0 = xv - *c0.add(i);
+        let d1 = xv - *c1.add(i);
+        dist0 += d0 * d0;
+        dist1 += d1 * d1;
+        i += 1;
+    }
+
+    if dist0 <= dist1 { 0 } else { 1 }
+}
+
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2", enable = "fma")]
+unsafe fn nearest_centroid_block8_avx2_fma(x: &[f32], centroids_t: &[f32], k: usize, dim: usize) -> usize {
     use std::arch::x86_64::*;
 
     let mut best_c = 0usize;
@@ -326,7 +544,7 @@ unsafe fn nearest_centroid_l2_sq_avx2_fma(point: &[f32], centroids_t: &[f32], k:
         let mut acc = _mm256_setzero_ps();
 
         for d in 0..dim {
-            let p = _mm256_set1_ps(*point.get_unchecked(d));
+            let p = _mm256_set1_ps(*x.get_unchecked(d));
             let cvals = _mm256_loadu_ps(centroids_t.as_ptr().add(d * k + base));
             let diff = _mm256_sub_ps(p, cvals);
             acc = _mm256_fmadd_ps(diff, diff, acc);
@@ -345,12 +563,11 @@ unsafe fn nearest_centroid_l2_sq_avx2_fma(point: &[f32], centroids_t: &[f32], k:
         c0 += 8;
     }
 
-    // tail centroids
     while c0 < k {
         let mut accs = 0f32;
         for d in 0..dim {
             let cd = *centroids_t.get_unchecked(d * k + c0);
-            let diff = *point.get_unchecked(d) - cd;
+            let diff = *x.get_unchecked(d) - cd;
             accs += diff * diff;
         }
         if accs < best_dist {
@@ -366,7 +583,6 @@ unsafe fn nearest_centroid_l2_sq_avx2_fma(point: &[f32], centroids_t: &[f32], k:
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::storage::Vector;
 
     #[test]
     fn builds_reasonable_clusters() {
@@ -387,5 +603,20 @@ mod tests {
         let buckets = Indexer::build_clusters(Vec::new(), 2);
         assert!(buckets.is_empty());
     }
-}
 
+    #[test]
+    fn split_bucket_once_returns_two_buckets() {
+        let mut b = Bucket::new(0, vec![]);
+        b.vectors = vec![
+            Vector::new(0, vec![1.0, 1.0]),
+            Vector::new(1, vec![1.0, 1.0]),
+            Vector::new(2, vec![1.0, 1.0]),
+            Vector::new(3, vec![1.0, 1.0]),
+        ];
+        let splits = Indexer::split_bucket_once(b);
+        assert_eq!(splits.len(), 2);
+        let total: usize = splits.iter().map(|s| s.vectors.len()).sum();
+        assert_eq!(total, 4);
+        assert!(splits.iter().all(|s| !s.vectors.is_empty()));
+    }
+}
