@@ -91,9 +91,7 @@ impl Executor {
             let mut data = Vec::with_capacity(count);
             let mut offset = 16;
             for _ in 0..count {
-                let bytes: [u8; 4] = data_slice[offset..offset + 4]
-                    .try_into()
-                    .unwrap_or([0; 4]);
+                let bytes: [u8; 4] = data_slice[offset..offset + 4].try_into().unwrap_or([0; 4]);
                 data.push(f32::from_bits(u32::from_le_bytes(bytes)));
                 offset += 4;
             }

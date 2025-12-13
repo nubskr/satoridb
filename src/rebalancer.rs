@@ -458,3 +458,24 @@ pub(crate) fn compute_centroid(vectors: &[Vector]) -> Vec<f32> {
     }
     sums
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn centroid_of_vectors_is_mean() {
+        let vectors = vec![
+            Vector::new(0, vec![1.0, 3.0]),
+            Vector::new(1, vec![3.0, 5.0]),
+        ];
+        let centroid = compute_centroid(&vectors);
+        assert_eq!(centroid, vec![2.0, 4.0]);
+    }
+
+    #[test]
+    fn centroid_of_empty_is_empty() {
+        let centroid = compute_centroid(&[]);
+        assert!(centroid.is_empty());
+    }
+}

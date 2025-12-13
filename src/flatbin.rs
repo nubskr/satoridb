@@ -6,6 +6,7 @@ use std::path::Path;
 
 /// Reader for flattened f32 blobs produced by prepare_dataset:
 /// [u32 dim][u64 count][f32 data...]
+#[derive(Debug)]
 pub struct FlatF32Reader {
     mmap: Mmap,
     dim: usize,
@@ -19,7 +20,10 @@ impl FlatF32Reader {
         let file = File::open(path_ref).with_context(|| format!("open {}", path_ref.display()))?;
         let mmap = unsafe { MmapOptions::new().map(&file)? };
         if mmap.len() < 12 {
-            return Err(anyhow!("file too small to contain header: {}", path_ref.display()));
+            return Err(anyhow!(
+                "file too small to contain header: {}",
+                path_ref.display()
+            ));
         }
         let dim = u32::from_le_bytes(mmap[0..4].try_into().unwrap()) as usize;
         let count = u64::from_le_bytes(mmap[4..12].try_into().unwrap()) as usize;
@@ -70,5 +74,53 @@ impl FlatF32Reader {
             self.index += 1;
         }
         Ok(vectors)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::io::Write;
+    use tempfile::NamedTempFile;
+
+    #[test]
+    fn reads_batches_from_flat_file() {
+        let mut file = NamedTempFile::new().unwrap();
+        // dim=2, count=3, payload = 3 * 2 f32 = 6 values.
+        file.write_all(&2u32.to_le_bytes()).unwrap();
+        file.write_all(&3u64.to_le_bytes()).unwrap();
+        for f in [1.0f32, 2.0, 3.0, 4.0, 5.0, 6.0] {
+            file.write_all(&f.to_le_bytes()).unwrap();
+        }
+        file.flush().unwrap();
+
+        let mut reader = FlatF32Reader::new(file.path()).unwrap();
+        let first = reader.read_batch(2).unwrap();
+        assert_eq!(first.len(), 2);
+        assert_eq!(first[0].data, vec![1.0, 2.0]);
+        assert_eq!(first[1].data, vec![3.0, 4.0]);
+
+        let second = reader.read_batch(2).unwrap();
+        assert_eq!(second.len(), 1);
+        assert_eq!(second[0].data, vec![5.0, 6.0]);
+
+        // EOF yields empty vector.
+        assert!(reader.read_batch(2).unwrap().is_empty());
+    }
+
+    #[test]
+    fn rejects_truncated_payload() {
+        let mut file = NamedTempFile::new().unwrap();
+        // dim=2, count=2, but only one vector worth of payload.
+        file.write_all(&2u32.to_le_bytes()).unwrap();
+        file.write_all(&2u64.to_le_bytes()).unwrap();
+        for f in [1.0f32, 2.0] {
+            file.write_all(&f.to_le_bytes()).unwrap();
+        }
+        file.flush().unwrap();
+
+        let err = FlatF32Reader::new(file.path()).unwrap_err();
+        let msg = format!("{err}");
+        assert!(msg.contains("payload truncated"), "unexpected error: {msg}");
     }
 }

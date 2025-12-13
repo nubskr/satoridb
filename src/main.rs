@@ -1,18 +1,18 @@
 mod bvecs;
 mod executor;
+mod flatbin;
 mod fvecs;
 mod gnd;
 mod indexer;
 mod ingest_counter;
 mod net;
 mod quantizer;
-mod router_hnsw;
 mod rebalancer;
 mod router;
+mod router_hnsw;
 mod storage;
 mod wal;
 mod worker;
-mod flatbin;
 
 use anyhow::anyhow;
 use crossbeam_channel::{unbounded, Sender};
@@ -372,7 +372,8 @@ fn main() -> anyhow::Result<()> {
                 .collect();
             big.sort_by_key(|(_, sz)| std::cmp::Reverse(*sz));
             for (bid, _) in big.into_iter().take(1) {
-                if let Err(e) = worker.enqueue_blocking(crate::rebalancer::RebalanceTask::Split(bid))
+                if let Err(e) =
+                    worker.enqueue_blocking(crate::rebalancer::RebalanceTask::Split(bid))
                 {
                     log::warn!("rebalance: failed to enqueue split for {}: {:?}", bid, e);
                 } else {

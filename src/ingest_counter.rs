@@ -13,3 +13,29 @@ pub fn add(count: u64) {
 pub fn get() -> u64 {
     TOTAL_VECTORS_INSERTED.load(Ordering::Relaxed)
 }
+
+#[cfg(test)]
+pub(crate) fn reset() {
+    TOTAL_VECTORS_INSERTED.store(0, Ordering::Relaxed);
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn accumulates_counts() {
+        reset();
+        assert_eq!(get(), 0);
+        add(5);
+        add(7);
+        assert_eq!(get(), 12);
+    }
+
+    #[test]
+    fn ignores_zero_adds() {
+        reset();
+        add(0);
+        assert_eq!(get(), 0);
+    }
+}

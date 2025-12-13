@@ -77,13 +77,25 @@ fn is_gz(path: &Path) -> bool {
 
 fn is_fvecs(path: &Path) -> bool {
     path.extension()
-        .map(|e| e.eq_ignore_ascii_case("fvecs") || (is_gz(path) && path.file_stem().map_or(false, |s| s.to_string_lossy().ends_with("fvecs"))))
+        .map(|e| {
+            e.eq_ignore_ascii_case("fvecs")
+                || (is_gz(path)
+                    && path
+                        .file_stem()
+                        .map_or(false, |s| s.to_string_lossy().ends_with("fvecs")))
+        })
         .unwrap_or(false)
 }
 
 fn is_bvecs(path: &Path) -> bool {
     path.extension()
-        .map(|e| e.eq_ignore_ascii_case("bvecs") || (is_gz(path) && path.file_stem().map_or(false, |s| s.to_string_lossy().ends_with("bvecs"))))
+        .map(|e| {
+            e.eq_ignore_ascii_case("bvecs")
+                || (is_gz(path)
+                    && path
+                        .file_stem()
+                        .map_or(false, |s| s.to_string_lossy().ends_with("bvecs")))
+        })
         .unwrap_or(false)
 }
 

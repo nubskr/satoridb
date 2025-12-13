@@ -1,10 +1,10 @@
+#[cfg(feature = "packed_simd_2")]
+use packed_simd_2::f32x16;
 use rand::rngs::StdRng;
 use rand::{Rng, SeedableRng};
 use smallvec::SmallVec;
 use std::cmp::Ordering;
 use std::collections::BinaryHeap;
-#[cfg(feature = "packed_simd_2")]
-use packed_simd_2::f32x16;
 
 /// Minimal hierarchical HNSW for routing centroids.
 /// Stores byte-quantized vectors and keeps up to `m0` neighbors on level 0 and
@@ -16,9 +16,9 @@ pub struct HnswIndex {
     ef_construction: usize,
     dim: usize,
     pad_dim: usize,
-    vectors: Vec<Vec<u8>>,        // original quantized bytes (kept for compatibility)
-    traversal: Vec<Vec<i8>>,      // centered i8 copy for fast dot/cosine
-    inv_norms: Vec<f32>,          // inv-norm for traversal (i8)
+    vectors: Vec<Vec<u8>>, // original quantized bytes (kept for compatibility)
+    traversal: Vec<Vec<i8>>, // centered i8 copy for fast dot/cosine
+    inv_norms: Vec<f32>,   // inv-norm for traversal (i8)
     level_of: Vec<i32>,
     neighbors: Vec<Vec<SmallVec<[usize; 16]>>>,
     entry: Option<usize>,
@@ -226,7 +226,12 @@ impl HnswIndex {
             for &nbr in self.neighbors_at(best, level) {
                 let nbr_usize = nbr as usize;
                 prefetch_vector_bytes(&self.vectors[nbr_usize]);
-                let d = cosine_i8(query, q_inv, &self.traversal[nbr_usize], self.inv_norms[nbr_usize]);
+                let d = cosine_i8(
+                    query,
+                    q_inv,
+                    &self.traversal[nbr_usize],
+                    self.inv_norms[nbr_usize],
+                );
                 if d < best_dist {
                     best_dist = d;
                     best = nbr_usize;
@@ -290,7 +295,12 @@ impl HnswIndex {
         res
     }
 
-    fn select_neighbors(&self, candidates: &mut [HeapItem], m: usize, diversity: bool) -> Vec<usize> {
+    fn select_neighbors(
+        &self,
+        candidates: &mut [HeapItem],
+        m: usize,
+        diversity: bool,
+    ) -> Vec<usize> {
         // Redis-inspired heuristic: keep a diverse set; if we can't fill, fall back to closest.
         candidates.sort_by(|a, b| a.dist.partial_cmp(&b.dist).unwrap_or(Ordering::Equal));
         let mut accepted: Vec<usize> = Vec::with_capacity(m);
@@ -350,8 +360,12 @@ impl HnswIndex {
     fn add_edge(&mut self, src: usize, dst: usize, level: i32) -> bool {
         self.ensure_level(src, level);
         let cap = self.m_for_level(level);
-        let dist_new =
-            cosine_i8(&self.traversal[src], self.inv_norms[src], &self.traversal[dst], self.inv_norms[dst]);
+        let dist_new = cosine_i8(
+            &self.traversal[src],
+            self.inv_norms[src],
+            &self.traversal[dst],
+            self.inv_norms[dst],
+        );
         // Immutable view to check duplicates and compute worst.
         {
             let list = &self.neighbors[src][level as usize];
@@ -365,7 +379,12 @@ impl HnswIndex {
                 let mut worst_idx = 0usize;
                 let mut worst_dist = dist_new;
                 for (i, &nid) in list.iter().enumerate() {
-                    let d = cosine_i8(&self.traversal[src], self.inv_norms[src], &self.traversal[nid], self.inv_norms[nid]);
+                    let d = cosine_i8(
+                        &self.traversal[src],
+                        self.inv_norms[src],
+                        &self.traversal[nid],
+                        self.inv_norms[nid],
+                    );
                     if i == 0 || d > worst_dist {
                         worst_idx = i;
                         worst_dist = d;
@@ -416,8 +435,18 @@ impl HnswIndex {
         let vec = std::mem::take(list);
         let mut vec: SmallVec<[usize; 16]> = vec;
         vec.sort_by(|&a, &b| {
-            let da = cosine_i8(&self.traversal[id], self.inv_norms[id], &self.traversal[a], self.inv_norms[a]);
-            let db = cosine_i8(&self.traversal[id], self.inv_norms[id], &self.traversal[b], self.inv_norms[b]);
+            let da = cosine_i8(
+                &self.traversal[id],
+                self.inv_norms[id],
+                &self.traversal[a],
+                self.inv_norms[a],
+            );
+            let db = cosine_i8(
+                &self.traversal[id],
+                self.inv_norms[id],
+                &self.traversal[b],
+                self.inv_norms[b],
+            );
             da.partial_cmp(&db).unwrap_or(Ordering::Equal)
         });
         vec.truncate(cap);
@@ -460,7 +489,11 @@ impl HnswIndex {
     }
 
     fn m_for_level(&self, level: i32) -> usize {
-        if level == 0 { self.m0 } else { self.m }
+        if level == 0 {
+            self.m0
+        } else {
+            self.m
+        }
     }
 
     fn sample_level(&mut self) -> i32 {
@@ -682,7 +715,12 @@ unsafe fn dot_i8_avx2(a: &[i8], b: &[i8]) -> f32 {
 }
 
 #[cfg(target_arch = "x86_64")]
-#[target_feature(enable = "avx512f", enable = "avx512bw", enable = "avx512dq", enable = "fma")]
+#[target_feature(
+    enable = "avx512f",
+    enable = "avx512bw",
+    enable = "avx512dq",
+    enable = "fma"
+)]
 unsafe fn dot_i8_avx512(a: &[i8], b: &[i8]) -> f32 {
     use std::arch::x86_64::*;
 
@@ -791,5 +829,58 @@ impl SearchScratch {
         }
         self.candidates.clear();
         self.results.clear();
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn pad_query(prefix: &[u8], len: usize) -> Vec<u8> {
+        let mut q = vec![0u8; len];
+        q[..prefix.len()].copy_from_slice(prefix);
+        q
+    }
+
+    #[test]
+    fn round_up_and_pad_dim() {
+        assert_eq!(round_up_32(1), 32);
+        assert_eq!(round_up_32(33), 64);
+    }
+
+    #[test]
+    fn centers_bytes_to_i8() {
+        let src = vec![0u8, 128, 255];
+        let mut dst = Vec::new();
+        center_bytes_to_i8(&src, &mut dst);
+        assert_eq!(dst, vec![-128, 0, 127]);
+    }
+
+    #[test]
+    fn search_prefers_closer_vector() {
+        let mut hnsw = HnswIndex::new(8, 32);
+        let a = vec![10u8, 10, 10, 10];
+        let b = vec![200u8, 200, 200, 200];
+        hnsw.insert(0, a.clone());
+        hnsw.insert(1, b.clone());
+        assert_eq!(hnsw.len(), 2);
+        assert_eq!(hnsw.pad_dim(), 32);
+
+        let query = pad_query(&b, hnsw.pad_dim());
+        let res = hnsw.search(&query, 1, 64);
+        assert_eq!(res, vec![1], "expected the closer centroid to win");
+
+        let mut scratch = Vec::new();
+        let flat = hnsw.flat_search_with_scratch(&query, 2, &mut scratch);
+        assert_eq!(flat[0], 1);
+    }
+
+    #[test]
+    fn search_returns_empty_on_dim_mismatch() {
+        let mut hnsw = HnswIndex::new(4, 8);
+        hnsw.insert(0, vec![1u8, 2, 3, 4]);
+        // Query is too short, so search should bail out.
+        let res = hnsw.search(&[0u8; 4], 1, 8);
+        assert!(res.is_empty());
     }
 }

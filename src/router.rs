@@ -97,9 +97,7 @@ impl Router {
             }
 
             if self.index.len() <= 20_000 {
-                let local = self
-                    .flat_scratch
-                    .get_or(|| RefCell::new(Vec::new()));
+                let local = self.flat_scratch.get_or(|| RefCell::new(Vec::new()));
                 let mut buf = local.borrow_mut();
                 self.index.flat_search_with_scratch(&q_buf, top_k, &mut buf)
             } else {

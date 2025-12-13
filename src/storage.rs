@@ -1,8 +1,8 @@
 use crate::storage::wal::block::Entry;
 use crate::storage::wal::runtime::Walrus;
 use anyhow::Result;
-use smallvec::SmallVec;
 use rkyv::{Archive, Deserialize, Serialize};
+use smallvec::SmallVec;
 use std::cell::RefCell;
 use std::sync::Arc;
 
@@ -76,7 +76,8 @@ impl Storage {
     /// `max_entries` is the expected max batch size; `approx_f32_per_vector` is an estimate
     /// of vector dimensionality to size the backing buffer conservatively.
     pub fn prewarm_thread_locals(max_entries: usize, approx_f32_per_vector: usize) {
-        let backing_bytes = max_entries.saturating_mul(16 + approx_f32_per_vector.saturating_mul(4));
+        let backing_bytes =
+            max_entries.saturating_mul(16 + approx_f32_per_vector.saturating_mul(4));
         TL_BACKING.with(|b| {
             let mut buf = b.borrow_mut();
             let cap = buf.capacity();
@@ -113,7 +114,8 @@ impl Storage {
     /// Fast path when only vectors are provided; avoids centroid clone.
     pub async fn put_chunk_raw(&self, bucket_id: u64, vectors: &[Vector]) -> Result<()> {
         let topic = Self::topic_for(bucket_id);
-        self.put_chunk_raw_with_topic(bucket_id, &topic, vectors).await
+        self.put_chunk_raw_with_topic(bucket_id, &topic, vectors)
+            .await
     }
 
     /// Same as `put_chunk_raw` but uses a precomputed topic string to avoid per-call formatting.
@@ -146,10 +148,7 @@ impl Storage {
                     backing.extend_from_slice(&v.id.to_le_bytes());
                     backing.extend_from_slice(&(v.data.len() as u64).to_le_bytes());
                     let data_bytes = unsafe {
-                        std::slice::from_raw_parts(
-                            v.data.as_ptr() as *const u8,
-                            v.data.len() * 4,
-                        )
+                        std::slice::from_raw_parts(v.data.as_ptr() as *const u8, v.data.len() * 4)
                     };
                     backing.extend_from_slice(data_bytes);
                     let end = backing.len();
@@ -157,8 +156,7 @@ impl Storage {
                 }
 
                 for chunk in ranges.chunks(2000) {
-                    let mut slices: SmallVec<[&[u8]; 128]> =
-                        SmallVec::with_capacity(chunk.len());
+                    let mut slices: SmallVec<[&[u8]; 128]> = SmallVec::with_capacity(chunk.len());
                     slices.extend(chunk.iter().map(|(s, e)| &backing[*s..*e]));
                     self.wal
                         .batch_append_for_topic(&topic, &slices)
