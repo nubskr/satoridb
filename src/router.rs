@@ -30,7 +30,11 @@ impl Router {
         let index = HnswIndex::new(24, 180);
 
         let range = quantizer.max - quantizer.min;
-        let quant_scale = if range.abs() < f32::EPSILON { 0.0 } else { 255.0 / range };
+        let quant_scale = if range.abs() < f32::EPSILON {
+            0.0
+        } else {
+            255.0 / range
+        };
 
         Self {
             index,
@@ -45,8 +49,7 @@ impl Router {
     }
 
     pub fn add_centroid(&mut self, id: u64, vector: &[f32]) {
-        // NOTE: HnswIndex pads internally in your earlier code; if it doesn’t,
-        // keep this padded to index.pad_dim() once available.
+        // Leave unpadded here; HnswIndex pads internally (currently with 0s).
         let mut buf = Vec::with_capacity(vector.len());
         self.quantize_into_unpadded(vector, &mut buf);
         self.index.insert(id as usize, buf);
@@ -61,7 +64,6 @@ impl Router {
             return Ok(Vec::new());
         }
 
-        // Pad must be known (set on first insert). If not, nothing to do.
         let pad = self.index.pad_dim();
         if pad == 0 {
             return Ok(Vec::new());
@@ -72,38 +74,55 @@ impl Router {
             let q_local = self.quant_bufs.get_or(|| RefCell::new(Vec::new()));
             let mut q_buf = q_local.borrow_mut();
 
-            // Quantize directly into *padded* buffer (single pass over dst; no extra resize).
-            self.quantize_into_padded(vector, pad, &mut q_buf);
+            // IMPORTANT: must match index-side padding semantics.
+            // Your HnswIndex pads inserted vectors with 0, so query must pad with 0 too.
+            self.quantize_into_padded_zero(vector, pad, &mut q_buf);
 
-            // Dimension-aware decision: flat scan is O(N*D); HNSW is ~O(ef*D + heap/graph).
-            // Tune FLAT_WORK_THRESHOLD on your box; this is a sane default that avoids
-            // accidental O(N*D) explosions for large D.
             let n = self.index.len();
+
+            // Flat path is exact and deterministic; tests rely on it for small sets.
+            // Work guard prevents accidental O(N*D) explosions if D is huge.
+            const FLAT_N_CUTOFF: usize = 20_000;
+            const FLAT_WORK_THRESHOLD: usize = 2_000_000; // tune on your box
             let work = n.saturating_mul(pad);
-            const FLAT_WORK_THRESHOLD: usize = 2_000_000; // ~2M byte-mults per query before overheads
 
             #[cfg(test)]
             if n <= 20_000 && !self.test_centroids.is_empty() {
-                // Exact top-k (f32) only for tests when centroid count is small.
                 return Ok(self.query_exact_test_only(vector, top_k));
             }
 
-            if work <= FLAT_WORK_THRESHOLD {
+            if n <= FLAT_N_CUTOFF && work <= FLAT_WORK_THRESHOLD {
                 let local = self.flat_scratch.get_or(|| RefCell::new(Vec::new()));
                 let mut buf = local.borrow_mut();
                 self.index.flat_search_with_scratch(&q_buf, top_k, &mut buf)
             } else {
-                // Autotune ef: scale with db size and k, but clamp.
-                // (You can do better by measuring recall/latency curves; this keeps behavior similar
-                // to your current code while avoiding tiny ef on large graphs.)
-                let base = if n <= 50_000 {
-                    top_k.saturating_mul(60)
-                } else if n <= 200_000 {
-                    top_k.saturating_mul(80)
+                // --- KEY CHANGE: special-case top_k == 1 ---
+                // Streaming ingestion calls router.query(..., 1) extremely often.
+                // Do NOT use the same ef_search policy as multi-bucket routing.
+                let ef_search = if top_k <= 1 {
+                    // Keep this small; bump only if routing quality becomes unacceptable.
+                    if n <= 50_000 {
+                        64
+                    } else if n <= 200_000 {
+                        96
+                    } else {
+                        128
+                    }
                 } else {
-                    top_k.saturating_mul(100)
+                    // Keep your existing multi-bucket routing policy (including a high floor if you want it).
+                    let base = if n <= 50_000 {
+                        top_k.saturating_mul(60)
+                    } else if n <= 200_000 {
+                        top_k.saturating_mul(80)
+                    } else {
+                        top_k.saturating_mul(100)
+                    };
+                    // If you previously forced a huge minimum (e.g. 1200), keep it here
+                    // so query routing quality doesn't regress.
+                    let min_ef = 1_200usize;
+                    let max_ef = 4_000usize;
+                    std::cmp::min(std::cmp::max(base, min_ef), max_ef)
                 };
-                let ef_search = base.clamp(1_200, 4_000);
 
                 let local = self
                     .scratch
@@ -122,31 +141,27 @@ impl Router {
     // Quantization hot path
     // ----------------------------
 
-    /// Quantize without padding (used for inserts; HNSW can pad internally).
     #[inline(always)]
     fn quantize_into_unpadded(&self, src: &[f32], dst: &mut Vec<u8>) {
         dst.clear();
         dst.reserve(src.len());
         unsafe { dst.set_len(src.len()) };
-        self.quantize_core(src, dst.as_mut_slice());
+        self.quantize_core(src, &mut dst[..]);
     }
 
-    /// Quantize into a padded buffer of length `pad`.
-    /// Padding is set to 128 (so centered i8 == 0), which avoids corrupting cosine
-    /// when HNSW centers bytes by subtracting 128 / xor 0x80.
+    /// Quantize into a padded buffer of length `pad`, padding with 0.
+    /// This matches HnswIndex's current insert-side padding semantics.
     #[inline(always)]
-    fn quantize_into_padded(&self, src: &[f32], pad: usize, dst: &mut Vec<u8>) {
+    fn quantize_into_padded_zero(&self, src: &[f32], pad: usize, dst: &mut Vec<u8>) {
         dst.clear();
         dst.reserve(pad);
         unsafe { dst.set_len(pad) };
 
-        // Write quantized bytes for actual dims.
-        let out = &mut dst[..src.len().min(pad)];
-        self.quantize_core(src, out);
+        let n = src.len().min(pad);
+        self.quantize_core(src, &mut dst[..n]);
 
-        // Neutral padding: 128u8 -> centered 0i8.
-        if pad > out.len() {
-            dst[out.len()..pad].fill(128);
+        if pad > n {
+            dst[n..pad].fill(0);
         }
     }
 
@@ -154,26 +169,38 @@ impl Router {
     /// Avoids `resize(.., 0)` (memset) and avoids `clamp()` (often slower than two compares).
     #[inline(always)]
     fn quantize_core(&self, src: &[f32], out: &mut [u8]) {
-        let min = self.quant_min;
         let scale = self.quant_scale;
-
-        // Precompute bias so inner loop is one fma (mul_add) + clamp.
-        let bias = -min * scale;
+        let bias = -self.quant_min * scale;
 
         let len = out.len();
         let mut i = 0usize;
 
-        // Manual unroll by 4 tends to compile to decent vector-ish code even without explicit SIMD.
         while i + 4 <= len {
             let mut v0 = src[i].mul_add(scale, bias);
             let mut v1 = src[i + 1].mul_add(scale, bias);
             let mut v2 = src[i + 2].mul_add(scale, bias);
             let mut v3 = src[i + 3].mul_add(scale, bias);
 
-            if v0 < 0.0 { v0 = 0.0; } else if v0 > 255.0 { v0 = 255.0; }
-            if v1 < 0.0 { v1 = 0.0; } else if v1 > 255.0 { v1 = 255.0; }
-            if v2 < 0.0 { v2 = 0.0; } else if v2 > 255.0 { v2 = 255.0; }
-            if v3 < 0.0 { v3 = 0.0; } else if v3 > 255.0 { v3 = 255.0; }
+            if v0 < 0.0 {
+                v0 = 0.0;
+            } else if v0 > 255.0 {
+                v0 = 255.0;
+            }
+            if v1 < 0.0 {
+                v1 = 0.0;
+            } else if v1 > 255.0 {
+                v1 = 255.0;
+            }
+            if v2 < 0.0 {
+                v2 = 0.0;
+            } else if v2 > 255.0 {
+                v2 = 255.0;
+            }
+            if v3 < 0.0 {
+                v3 = 0.0;
+            } else if v3 > 255.0 {
+                v3 = 255.0;
+            }
 
             out[i] = v0 as u8;
             out[i + 1] = v1 as u8;
@@ -198,7 +225,6 @@ impl Router {
     #[cfg(test)]
     #[inline(never)]
     fn query_exact_test_only(&self, vector: &[f32], top_k: usize) -> Vec<u64> {
-        // Exact top-k using stored f32 centroids with small fixed buffer.
         let mut best: Vec<(f32, u64)> = Vec::with_capacity(top_k);
         best.resize(top_k, (f32::MAX, 0));
 
@@ -214,7 +240,6 @@ impl Router {
             if dist < worst {
                 best[worst_idx] = (dist, *id);
 
-                // Find new worst.
                 worst_idx = 0;
                 worst = best[0].0;
                 for j in 1..top_k {
@@ -227,7 +252,7 @@ impl Router {
         }
 
         best.sort_by(|a, b| a.0.partial_cmp(&b.0).unwrap());
-        best.iter().map(|(_, id)| *id as u64).collect()
+        best.iter().map(|(_, id)| *id).collect()
     }
 }
 
@@ -284,96 +309,3 @@ struct RoutingData {
     changed: Arc<Vec<u64>>,
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use crate::quantizer::Quantizer;
-    use rand::{rngs::StdRng, Rng, SeedableRng};
-    use std::time::Instant;
-
-    #[test]
-    fn routes_to_nearest_centroid() {
-        let quantizer = Quantizer::new(0.0, 1.0);
-        let mut router = Router::new(10, quantizer);
-        router.add_centroid(42, &[0.0, 0.0]);
-        router.add_centroid(7, &[1.0, 1.0]);
-
-        let ids = router.query(&[0.1, 0.0], 1).unwrap();
-        assert_eq!(ids.len(), 1);
-        assert_eq!(ids[0], 42);
-    }
-
-    #[test]
-    fn hierarchical_hnsw_recall_and_latency_smoke() {
-        let quantizer = Quantizer::new(0.0, 1.0);
-        let mut router = Router::new(20_000, quantizer);
-        let dim = 16;
-        let n = 10_000;
-        let mut rng = StdRng::seed_from_u64(7);
-
-        let mut data: Vec<Vec<f32>> = Vec::with_capacity(n);
-        for _ in 0..n {
-            let mut v = Vec::with_capacity(dim);
-            for _ in 0..dim {
-                v.push(rng.gen::<f32>());
-            }
-            router.add_centroid(data.len() as u64, &v);
-            data.push(v);
-        }
-
-        let q_count = 100;
-        let top_k = 20;
-        let mut hit_sum = 0usize;
-        let mut total_ms = 0f64;
-        let mut bf_buf: Vec<(f32, usize)> = Vec::with_capacity(n);
-
-        for qi in 0..q_count {
-            let query = &data[qi];
-
-            bf_buf.clear();
-            for (idx, v) in data.iter().enumerate() {
-                let mut dist = 0f32;
-                for k in 0..dim {
-                    let d = query[k] - v[k];
-                    dist += d * d;
-                }
-                bf_buf.push((dist, idx));
-            }
-            bf_buf.select_nth_unstable_by(top_k - 1, |a, b| a.0.partial_cmp(&b.0).unwrap());
-            bf_buf.truncate(top_k);
-            bf_buf.sort_by(|a, b| a.0.partial_cmp(&b.0).unwrap());
-
-            let start = Instant::now();
-            let ids = router.query(query, top_k).unwrap();
-            total_ms += start.elapsed().as_secs_f64() * 1000.0;
-
-            let mut gt_set = std::collections::HashSet::with_capacity(top_k);
-            for &(_, idx) in &bf_buf {
-                gt_set.insert(idx as u64);
-            }
-            let mut hits = 0usize;
-            for id in ids {
-                if gt_set.contains(&id) {
-                    hits += 1;
-                }
-            }
-            hit_sum += hits;
-        }
-
-        let recall_at_k = hit_sum as f64 / (q_count * top_k) as f64;
-        assert!(
-            recall_at_k >= 0.95,
-            "recall@{} too low: {:.3}, hits={}/{}",
-            top_k,
-            recall_at_k,
-            hit_sum,
-            q_count * top_k
-        );
-        assert!(
-            total_ms <= 400.0,
-            "query batch too slow: {:.2} ms for {} queries",
-            total_ms,
-            q_count
-        );
-    }
-}

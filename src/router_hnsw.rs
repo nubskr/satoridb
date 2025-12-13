@@ -693,41 +693,57 @@ unsafe fn center_bytes_scalar_xor_0x80(src: *const u8, dst: *mut i8, len: usize)
 #[target_feature(enable = "avx2")]
 unsafe fn dot_i8_avx2_i32(a: &[i8], b: &[i8]) -> i32 {
     use std::arch::x86_64::*;
-
     let len = a.len().min(b.len());
     let mut i = 0usize;
 
-    let mut acc32 = _mm256_setzero_si256();
+    let mut acc0 = _mm256_setzero_si256();
+    let mut acc1 = _mm256_setzero_si256();
 
-    while i + 32 <= len {
-        let va = _mm256_loadu_si256(a.as_ptr().add(i) as *const __m256i);
-        let vb = _mm256_loadu_si256(b.as_ptr().add(i) as *const __m256i);
+    while i + 64 <= len {
+        // first 32
+        let va0 = _mm256_loadu_si256(a.as_ptr().add(i) as *const __m256i);
+        let vb0 = _mm256_loadu_si256(b.as_ptr().add(i) as *const __m256i);
 
-        let va_lo = _mm256_cvtepi8_epi16(_mm256_castsi256_si128(va));
-        let vb_lo = _mm256_cvtepi8_epi16(_mm256_castsi256_si128(vb));
-        let va_hi = _mm256_cvtepi8_epi16(_mm256_extracti128_si256::<1>(va));
-        let vb_hi = _mm256_cvtepi8_epi16(_mm256_extracti128_si256::<1>(vb));
+        let a0_lo = _mm256_cvtepi8_epi16(_mm256_castsi256_si128(va0));
+        let b0_lo = _mm256_cvtepi8_epi16(_mm256_castsi256_si128(vb0));
+        acc0 = _mm256_add_epi32(acc0, _mm256_madd_epi16(a0_lo, b0_lo));
 
-        let p0 = _mm256_madd_epi16(va_lo, vb_lo);
-        let p1 = _mm256_madd_epi16(va_hi, vb_hi);
+        let a0_hi = _mm256_cvtepi8_epi16(_mm256_extracti128_si256::<1>(va0));
+        let b0_hi = _mm256_cvtepi8_epi16(_mm256_extracti128_si256::<1>(vb0));
+        acc0 = _mm256_add_epi32(acc0, _mm256_madd_epi16(a0_hi, b0_hi));
 
-        acc32 = _mm256_add_epi32(acc32, p0);
-        acc32 = _mm256_add_epi32(acc32, p1);
+        // next 32
+        let va1 = _mm256_loadu_si256(a.as_ptr().add(i + 32) as *const __m256i);
+        let vb1 = _mm256_loadu_si256(b.as_ptr().add(i + 32) as *const __m256i);
 
-        i += 32;
+        let a1_lo = _mm256_cvtepi8_epi16(_mm256_castsi256_si128(va1));
+        let b1_lo = _mm256_cvtepi8_epi16(_mm256_castsi256_si128(vb1));
+        acc1 = _mm256_add_epi32(acc1, _mm256_madd_epi16(a1_lo, b1_lo));
+
+        let a1_hi = _mm256_cvtepi8_epi16(_mm256_extracti128_si256::<1>(va1));
+        let b1_hi = _mm256_cvtepi8_epi16(_mm256_extracti128_si256::<1>(vb1));
+        acc1 = _mm256_add_epi32(acc1, _mm256_madd_epi16(a1_hi, b1_hi));
+
+        i += 64;
     }
 
-    let mut tmp = [0i32; 8];
-    _mm256_storeu_si256(tmp.as_mut_ptr() as *mut __m256i, acc32);
-    let mut total: i32 = tmp.iter().sum();
+    acc0 = _mm256_add_epi32(acc0, acc1);
+
+    // reduce 8x i32 -> scalar
+    let hi = _mm256_extracti128_si256::<1>(acc0);
+    let lo = _mm256_castsi256_si128(acc0);
+    let mut s = _mm_add_epi32(lo, hi);
+    s = _mm_hadd_epi32(s, s);
+    s = _mm_hadd_epi32(s, s);
+    let mut total = _mm_cvtsi128_si32(s);
 
     while i < len {
         total += (a[i] as i32) * (b[i] as i32);
         i += 1;
     }
-
     total
 }
+
 
 #[cfg(target_arch = "x86_64")]
 #[target_feature(enable = "avx512f,avx512bw")]
