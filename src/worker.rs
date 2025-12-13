@@ -4,7 +4,6 @@ use crate::storage::wal::runtime::Walrus;
 use crate::storage::{Storage, StorageExecMode, Vector};
 use async_channel::Receiver;
 use futures::channel::oneshot;
-use glommio::sync::Semaphore;
 use log::{error, info};
 use std::rc::Rc;
 use std::sync::Arc;
@@ -41,15 +40,18 @@ pub async fn run_worker(id: usize, receiver: Receiver<WorkerMessage>, wal: Arc<W
     Storage::prewarm_thread_locals(2048, 1024);
 
     const MAX_CONCURRENCY: usize = 32;
-    let semaphore = Rc::new(Semaphore::new(MAX_CONCURRENCY as i64));
+    // Use channel as a semaphore. Capacity = max concurrency.
+    // Loop sends (acquires), Task receives (releases).
+    let (limit_tx, limit_rx) = async_channel::bounded(MAX_CONCURRENCY);
 
     while let Ok(msg) = receiver.recv().await {
         match msg {
             WorkerMessage::Query(req) => {
-                let permit = semaphore.acquire_permit(1).await.unwrap();
+                // Acquire permit (blocks if full)
+                limit_tx.send(()).await.unwrap();
+                let limit_rx = limit_rx.clone();
                 let executor = executor.clone();
                 glommio::spawn_local(async move {
-                    let _permit = permit;
                     let result = executor
                         .query(
                             &req.query_vec,
@@ -62,14 +64,16 @@ pub async fn run_worker(id: usize, receiver: Receiver<WorkerMessage>, wal: Arc<W
                     if let Err(_) = req.respond_to.send(result) {
                         error!("Worker {} failed to send response back.", id);
                     }
+                    // Release permit
+                    let _ = limit_rx.recv().await;
                 })
                 .detach();
             }
             WorkerMessage::Ingest { bucket_id, vectors } => {
-                let permit = semaphore.acquire_permit(1).await.unwrap();
+                limit_tx.send(()).await.unwrap();
+                let limit_rx = limit_rx.clone();
                 let storage = storage.clone();
                 glommio::spawn_local(async move {
-                    let _permit = permit;
                     let topic = Storage::topic_for(bucket_id);
                     loop {
                         match storage
@@ -81,14 +85,12 @@ pub async fn run_worker(id: usize, receiver: Receiver<WorkerMessage>, wal: Arc<W
                                 break;
                             }
                             Err(e) => {
-                                // Check for WouldBlock (batch write in progress)
                                 let is_would_block = e
                                     .downcast_ref::<std::io::Error>()
                                     .map(|io_err| io_err.kind() == std::io::ErrorKind::WouldBlock)
                                     .unwrap_or(false);
 
                                 if is_would_block {
-                                    // Backoff and retry
                                     glommio::timer::Timer::new(Duration::from_millis(5)).await;
                                     continue;
                                 }
@@ -101,17 +103,17 @@ pub async fn run_worker(id: usize, receiver: Receiver<WorkerMessage>, wal: Arc<W
                             }
                         }
                     }
+                    // Release permit
+                    let _ = limit_rx.recv().await;
                 })
                 .detach();
             }
             WorkerMessage::Flush { respond_to } => {
-                // Acquire all permits to ensure we drain pending work
-                let _all_permits = semaphore
-                    .acquire_permits(MAX_CONCURRENCY as i64)
-                    .await
-                    .unwrap();
+                // Wait for all active tasks to drain
+                while !limit_rx.is_empty() {
+                    glommio::timer::Timer::new(Duration::from_millis(10)).await;
+                }
                 let _ = respond_to.send(());
-                // permits released when _all_permits drops at end of scope
             }
         }
     }
