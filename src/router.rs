@@ -18,7 +18,7 @@ pub struct Router {
     quant_min: f32,
     quant_scale: f32,
     #[cfg(test)]
-    test_centroids: Vec<Vec<f32>>,
+    test_centroids: Vec<(u64, Vec<f32>)>,
 }
 
 impl Router {
@@ -48,7 +48,7 @@ impl Router {
         self.quantize_into(vector, &mut buf);
         self.index.insert(id as usize, buf);
         #[cfg(test)]
-        self.test_centroids.push(vector.to_vec());
+        self.test_centroids.push((id, vector.to_vec()));
     }
 
     pub fn query(&self, vector: &[f32], top_k: usize) -> Result<Vec<u64>> {
@@ -69,18 +69,18 @@ impl Router {
             #[cfg(test)]
             if self.index.len() <= 20_000 && !self.test_centroids.is_empty() {
                 // Test-only: exact top-k using stored f32 centroids with small fixed buffer.
-                let mut best: Vec<(f32, usize)> = Vec::with_capacity(top_k);
+                let mut best: Vec<(f32, u64)> = Vec::with_capacity(top_k);
                 best.resize(top_k, (f32::MAX, 0));
                 let mut worst = f32::MAX;
                 let mut worst_idx = 0usize;
-                for (i, c) in self.test_centroids.iter().enumerate() {
+                for (id, c) in self.test_centroids.iter() {
                     let mut dist = 0f32;
                     for k in 0..vector.len() {
                         let d = vector[k] - c[k];
                         dist += d * d;
                     }
                     if dist < worst {
-                        best[worst_idx] = (dist, i);
+                        best[worst_idx] = (dist, *id);
                         // find new worst
                         worst_idx = 0;
                         worst = best[0].0;

@@ -11,6 +11,7 @@ mod rebalancer;
 mod router;
 mod router_hnsw;
 mod storage;
+mod tasks;
 mod wal;
 mod worker;
 
@@ -22,10 +23,8 @@ use futures::executor::block_on;
 use futures::future::join_all;
 use glommio::{LocalExecutorBuilder, Placement};
 use log::info;
-use std::collections::hash_map::DefaultHasher;
 use std::collections::HashMap;
 use std::fs::{self, File};
-use std::hash::{Hash, Hasher};
 use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -38,8 +37,10 @@ use crate::fvecs::FvecsReader;
 use crate::gnd::GndReader;
 use crate::indexer::Indexer;
 use crate::net::spawn_network_server;
+use crate::quantizer::Quantizer;
 use crate::rebalancer::RebalanceWorker;
 use crate::router::RoutingTable;
+use crate::tasks::{ConsistentHashRing, RouterResult, RouterTask};
 use crate::storage::{Storage, Vector};
 use crate::wal::runtime::Walrus;
 use crate::wal::{FsyncSchedule, ReadConsistency};
@@ -60,75 +61,6 @@ struct DatasetConfig {
     gnd_path: Option<PathBuf>,
     max_vectors: usize,
     base_is_prepared: bool,
-}
-
-pub struct RouterTask {
-    pub query_vec: Vec<f32>,
-    pub top_k: usize,
-    pub respond_to: oneshot::Sender<anyhow::Result<RouterResult>>,
-}
-
-#[derive(Clone)]
-pub struct RouterResult {
-    pub bucket_ids: Vec<u64>,
-    pub routing_version: u64,
-    pub affected_buckets: std::sync::Arc<Vec<u64>>,
-}
-
-#[derive(Clone)]
-pub struct ConsistentHashRing {
-    ring: Vec<(u64, usize)>,
-}
-
-impl ConsistentHashRing {
-    pub fn new(nodes: usize, virtual_nodes: usize) -> Self {
-        let mut ring = Vec::new();
-        for node in 0..nodes {
-            for v in 0..virtual_nodes.max(1) {
-                let mut hasher = DefaultHasher::new();
-                (node as u64, v as u64).hash(&mut hasher);
-                ring.push((hasher.finish(), node));
-            }
-        }
-        ring.sort_by_key(|(h, _)| *h);
-        Self { ring }
-    }
-
-    pub fn node_for(&self, key: u64) -> usize {
-        if self.ring.is_empty() {
-            return 0;
-        }
-        let mut hasher = DefaultHasher::new();
-        key.hash(&mut hasher);
-        let h = hasher.finish();
-        for (hash, node) in &self.ring {
-            if *hash >= h {
-                return *node;
-            }
-        }
-        self.ring[0].1
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::ConsistentHashRing;
-
-    #[test]
-    fn hash_ring_is_deterministic() {
-        let ring = ConsistentHashRing::new(4, 8);
-        assert_eq!(ring.node_for(42), ring.node_for(42));
-    }
-
-    #[test]
-    fn hash_ring_respects_node_bounds() {
-        let nodes = 3;
-        let ring = ConsistentHashRing::new(nodes, 4);
-        for key in 0..100 {
-            let node = ring.node_for(key);
-            assert!(node < nodes);
-        }
-    }
 }
 
 fn ensure_gist_files(tar_path: &Path) -> anyhow::Result<()> {

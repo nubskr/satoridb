@@ -10,6 +10,12 @@ impl Walrus {
     }
 
     pub fn batch_append_for_topic(&self, col_name: &str, batch: &[&[u8]]) -> std::io::Result<()> {
+        if batch.len() > 2000 {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "batch exceeds 2000 entry limit",
+            ));
+        }
         self.mark_topic_dirty(col_name);
         let writer = self.get_or_create_writer(col_name)?;
         writer.batch_write(batch)?;
