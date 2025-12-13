@@ -1,5 +1,5 @@
-use crate::worker::{QueryRequest, WorkerMessage};
 use crate::tasks::{ConsistentHashRing, RouterResult, RouterTask};
+use crate::worker::{QueryRequest, WorkerMessage};
 use anyhow::{anyhow, Context, Result};
 use async_channel::Sender as AsyncSender;
 use crossbeam_channel::Sender as CrossbeamSender;

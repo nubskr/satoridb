@@ -1,16 +1,16 @@
 use anyhow::Result;
-use futures::executor::block_on;
-use std::io::Write;
-use std::sync::Arc;
-use satoridb::executor::{Executor, WorkerCache};
-use satoridb::bvecs::BvecsReader;
-use satoridb::fvecs::FvecsReader;
-use satoridb::flatbin::FlatF32Reader;
-use satoridb::storage::Storage;
-use satoridb::wal::runtime::Walrus;
-use tempfile::{tempdir, NamedTempFile, TempDir};
 use flate2::write::GzEncoder;
 use flate2::Compression;
+use futures::executor::block_on;
+use satoridb::bvecs::BvecsReader;
+use satoridb::executor::{Executor, WorkerCache};
+use satoridb::flatbin::FlatF32Reader;
+use satoridb::fvecs::FvecsReader;
+use satoridb::storage::Storage;
+use satoridb::wal::runtime::Walrus;
+use std::io::Write;
+use std::sync::Arc;
+use tempfile::{tempdir, NamedTempFile, TempDir};
 
 fn init_wal(tempdir: &TempDir) -> Arc<Walrus> {
     std::env::set_var("WALRUS_DATA_DIR", tempdir.path());
@@ -23,7 +23,7 @@ fn flat_reader_round_trips_through_storage_and_executor() -> Result<()> {
     let mut file = NamedTempFile::new()?;
     file.write_all(&3u32.to_le_bytes())?; // dim
     file.write_all(&3u64.to_le_bytes())?; // count
-    // Three vectors.
+                                          // Three vectors.
     for vals in [[1.0f32, 2.0, 3.0], [4.0, 5.0, 6.0], [7.0, 8.0, 9.0]] {
         for v in vals {
             file.write_all(&v.to_le_bytes())?;
@@ -47,13 +47,7 @@ fn flat_reader_round_trips_through_storage_and_executor() -> Result<()> {
 
     // Query through executor to ensure decode path returns the same IDs.
     let executor = Executor::new(storage.clone(), WorkerCache::new(4, usize::MAX));
-    let res = block_on(executor.query(
-        &[0.0f32; 3],
-        &[0],
-        10,
-        0,
-        Arc::new(Vec::new()),
-    ))?;
+    let res = block_on(executor.query(&[0.0f32; 3], &[0], 10, 0, Arc::new(Vec::new())))?;
     let ids: Vec<u64> = res.iter().map(|(id, _)| *id).collect();
     assert_eq!(ids.len(), vectors.len());
     for v in &vectors {

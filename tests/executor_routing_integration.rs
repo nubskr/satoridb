@@ -26,13 +26,7 @@ fn executor_respects_routing_versions_and_cache_invalidation() -> Result<()> {
     block_on(storage.put_chunk_raw(0, &[v1]))?;
 
     let query = vec![100.0, 100.0];
-    let res = block_on(executor.query(
-        &query,
-        &[0],
-        1,
-        0,
-        Arc::new(Vec::new()),
-    ))?;
+    let res = block_on(executor.query(&query, &[0], 1, 0, Arc::new(Vec::new())))?;
     assert_eq!(res.len(), 1);
     assert_eq!(res[0].0, 1, "cached bucket should return original vector");
 
@@ -40,13 +34,7 @@ fn executor_respects_routing_versions_and_cache_invalidation() -> Result<()> {
     // the executor should continue serving from the cached content.
     let v2 = Vector::new(2, vec![100.0, 100.0]);
     block_on(storage.put_chunk_raw(0, &[v2]))?;
-    let res_stale = block_on(executor.query(
-        &query,
-        &[0],
-        1,
-        0,
-        Arc::new(Vec::new()),
-    ))?;
+    let res_stale = block_on(executor.query(&query, &[0], 1, 0, Arc::new(Vec::new())))?;
     assert_eq!(
         res_stale[0].0, 1,
         "without routing bump, cache should still serve old contents"
@@ -54,13 +42,7 @@ fn executor_respects_routing_versions_and_cache_invalidation() -> Result<()> {
 
     // Bump the routing version and include the changed bucket id: the cache
     // must be invalidated and the fresher vector should now win.
-    let res_refreshed = block_on(executor.query(
-        &query,
-        &[0],
-        1,
-        1,
-        Arc::new(vec![0]),
-    ))?;
+    let res_refreshed = block_on(executor.query(&query, &[0], 1, 1, Arc::new(vec![0])))?;
     assert_eq!(
         res_refreshed[0].0, 2,
         "after routing bump, executor should reload bucket 0"

@@ -1,20 +1,37 @@
 use crate::storage::{Storage, Vector};
 use anyhow::Result;
 use lru::LruCache;
-use std::cell::{Cell, RefCell};
+use parking_lot::Mutex;
 use std::convert::TryInto;
 use std::num::NonZeroUsize;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::Arc;
+use std::sync::Mutex as StdMutex;
 
 pub struct Executor {
     storage: Storage,
-    cache: RefCell<WorkerCache>,
-    cache_version: Cell<u64>,
-    last_changed: RefCell<std::sync::Arc<Vec<u64>>>,
+    cache: Mutex<WorkerCache>,
+    cache_version: AtomicU64,
+    last_changed: Mutex<Arc<Vec<u64>>>,
 }
 
 struct CachedBucket {
     vectors: Vec<Vector>,
     byte_size: usize,
+}
+
+static FAIL_LOAD_HOOK: StdMutex<Option<Arc<dyn Fn(u64) -> bool + Send + Sync>>> =
+    StdMutex::new(None);
+
+pub fn set_executor_fail_load_hook<F>(hook: F)
+where
+    F: Fn(u64) -> bool + Send + Sync + 'static,
+{
+    *FAIL_LOAD_HOOK.lock().expect("fail hook poisoned") = Some(Arc::new(hook));
+}
+
+pub fn clear_executor_fail_load_hook() {
+    *FAIL_LOAD_HOOK.lock().expect("fail hook poisoned") = None;
 }
 
 pub struct WorkerCache {
@@ -56,13 +73,22 @@ impl Executor {
     pub fn new(storage: Storage, cache: WorkerCache) -> Self {
         Self {
             storage,
-            cache: RefCell::new(cache),
-            cache_version: Cell::new(0),
-            last_changed: RefCell::new(std::sync::Arc::new(Vec::new())),
+            cache: Mutex::new(cache),
+            cache_version: AtomicU64::new(0),
+            last_changed: Mutex::new(Arc::new(Vec::new())),
         }
     }
 
+    pub fn cache_version(&self) -> u64 {
+        self.cache_version.load(Ordering::Relaxed)
+    }
+
     async fn load_bucket(&self, bucket_id: u64) -> Result<CachedBucket> {
+        if let Some(h) = FAIL_LOAD_HOOK.lock().expect("fail hook poisoned").as_ref() {
+            if h(bucket_id) {
+                anyhow::bail!("executor load hook injected failure");
+            }
+        }
         let chunks = self.storage.get_chunks(bucket_id).await.unwrap_or_default();
         let mut vectors = Vec::new();
         let mut total_bytes = 0usize;
@@ -110,35 +136,42 @@ impl Executor {
         bucket_ids: &[u64],
         top_k: usize,
         routing_version: u64,
-        changed_buckets: std::sync::Arc<Vec<u64>>,
+        changed_buckets: Arc<Vec<u64>>,
     ) -> Result<Vec<(u64, f32)>> {
-        if self.cache_version.get() != routing_version {
-            let mut cache = self.cache.borrow_mut();
+        if self.cache_version.load(Ordering::Relaxed) != routing_version {
+            let mut cache = self.cache.lock();
             if changed_buckets.is_empty() {
                 cache.clear();
             } else {
                 cache.invalidate_many(&changed_buckets);
             }
-            self.cache_version.set(routing_version);
-            *self.last_changed.borrow_mut() = changed_buckets;
+            self.cache_version.store(routing_version, Ordering::Relaxed);
+            *self.last_changed.lock() = changed_buckets;
         }
 
         let mut candidates = Vec::new();
-        let mut cache = self.cache.borrow_mut();
 
         for &id in bucket_ids {
-            match cache.get(id) {
-                Some(cached) => {
-                    for vector in &cached.vectors {
-                        if vector.data.len() != query_vec.len() {
-                            continue;
-                        }
-                        let dist = l2_distance_f32(&vector.data, query_vec);
-                        candidates.push((vector.id, dist));
+            // First try cache under a short lock.
+            let cached_vectors = {
+                let mut cache = self.cache.lock();
+                cache.get(id).map(|c| c.vectors.clone())
+            };
+
+            if let Some(vectors) = cached_vectors {
+                for vector in &vectors {
+                    if vector.data.len() != query_vec.len() {
+                        continue;
                     }
+                    let dist = l2_distance_f32(&vector.data, query_vec);
+                    candidates.push((vector.id, dist));
                 }
-                None => {
-                    let loaded = self.load_bucket(id).await?;
+                continue;
+            }
+
+            // Cache miss: load from storage without holding the lock.
+            match self.load_bucket(id).await {
+                Ok(loaded) => {
                     for vector in &loaded.vectors {
                         if vector.data.len() != query_vec.len() {
                             continue;
@@ -146,7 +179,13 @@ impl Executor {
                         let dist = l2_distance_f32(&vector.data, query_vec);
                         candidates.push((vector.id, dist));
                     }
+                    // Insert into cache after use.
+                    let mut cache = self.cache.lock();
                     cache.put(id, loaded);
+                }
+                Err(e) => {
+                    log::debug!("executor: load failed for bucket {}: {:?}", id, e);
+                    continue;
                 }
             }
         }

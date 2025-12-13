@@ -66,6 +66,10 @@ fn split_updates_routing_and_executor_results() -> Result<()> {
     // Use executor to query near cluster A and ensure we get the small ids.
     let executor = Executor::new(storage.clone(), WorkerCache::new(8, usize::MAX));
     let bucket_ids = snap.router.query(&[0.0, 0.0], 2)?;
+    let sizes = worker.snapshot_sizes();
+    let total_after: usize = sizes.values().sum();
+    assert_eq!(total_after, 8, "split should preserve total vector count");
+
     let results = block_on(executor.query(
         &[0.0, 0.0],
         &bucket_ids,
@@ -128,6 +132,11 @@ fn merge_rebuilds_router_and_executor_reads_combined_bucket() -> Result<()> {
         8,
         "expected all vectors from both source buckets after merge"
     );
+
+    let sizes = worker.snapshot_sizes();
+    assert_eq!(sizes.len(), 1, "only one bucket should remain after merge");
+    let total_after: usize = sizes.values().sum();
+    assert_eq!(total_after, 8, "merge should preserve total vector count");
 
     Ok(())
 }

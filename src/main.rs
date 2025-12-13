@@ -40,8 +40,8 @@ use crate::net::spawn_network_server;
 use crate::quantizer::Quantizer;
 use crate::rebalancer::RebalanceWorker;
 use crate::router::RoutingTable;
-use crate::tasks::{ConsistentHashRing, RouterResult, RouterTask};
 use crate::storage::{Storage, Vector};
+use crate::tasks::{ConsistentHashRing, RouterResult, RouterTask};
 use crate::wal::runtime::Walrus;
 use crate::wal::{FsyncSchedule, ReadConsistency};
 use crate::worker::{run_worker, QueryRequest, WorkerMessage};
@@ -426,6 +426,87 @@ fn main() -> anyhow::Result<()> {
         let _ = h.join();
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod driver_tests {
+    use super::*;
+    use std::collections::HashMap;
+
+    // Helper mirroring the driver logic for splits/merges.
+    fn decide_rebalance_actions(
+        sizes: &HashMap<u64, usize>,
+        target_size: usize,
+        tick: u64,
+        merge_interval_ticks: u64,
+    ) -> (Vec<u64>, Option<(u64, u64)>) {
+        let mut big: Vec<(u64, usize)> = sizes
+            .iter()
+            .filter(|(_, sz)| **sz > target_size * 2)
+            .map(|(k, v)| (*k, *v))
+            .collect();
+        big.sort_by_key(|(_, sz)| std::cmp::Reverse(*sz));
+        let splits: Vec<u64> = big.into_iter().take(1).map(|(id, _)| id).collect();
+
+        let merge = if tick % merge_interval_ticks == 0 {
+            let mut small: Vec<(u64, usize)> = sizes
+                .iter()
+                .filter(|(_, sz)| **sz < target_size / 2)
+                .map(|(k, v)| (*k, *v))
+                .collect();
+            small.sort_by_key(|(_, sz)| *sz);
+            if small.len() >= 2 {
+                Some((small[0].0, small[1].0))
+            } else {
+                None
+            }
+        } else {
+            None
+        };
+
+        (splits, merge)
+    }
+
+    #[test]
+    fn driver_schedules_split_when_over_threshold() {
+        let mut sizes = HashMap::new();
+        sizes.insert(1, 30);
+        sizes.insert(2, 5);
+        let (splits, merge) = decide_rebalance_actions(&sizes, 10, 1, 10);
+        assert_eq!(
+            splits,
+            vec![1],
+            "largest bucket over 2x target should split"
+        );
+        assert!(merge.is_none(), "merge should not run on non-merge ticks");
+    }
+
+    #[test]
+    fn driver_schedules_merge_every_interval() {
+        let mut sizes = HashMap::new();
+        sizes.insert(1, 3);
+        sizes.insert(2, 4);
+        sizes.insert(3, 50);
+        let (_splits, merge) = decide_rebalance_actions(&sizes, 10, 20, 10);
+        assert_eq!(
+            merge,
+            Some((1, 2)),
+            "smallest two should merge on merge tick"
+        );
+    }
+
+    #[test]
+    fn driver_skips_merge_when_interval_not_met() {
+        let mut sizes = HashMap::new();
+        sizes.insert(1, 3);
+        sizes.insert(2, 4);
+        sizes.insert(3, 50);
+        let (_splits, merge) = decide_rebalance_actions(&sizes, 10, 5, 10);
+        assert!(
+            merge.is_none(),
+            "merge should wait for the scheduled interval"
+        );
+    }
 }
 
 async fn run_benchmark_mode(

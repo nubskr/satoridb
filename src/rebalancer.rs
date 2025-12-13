@@ -13,7 +13,37 @@ use parking_lot::{Mutex, RwLock};
 use std::collections::{HashMap, HashSet};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
+use std::sync::Mutex as StdMutex;
 use std::thread;
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum RebalanceTaskKind {
+    Split,
+    Merge,
+    Rebalance,
+}
+
+static FAIL_HOOK: StdMutex<Option<Arc<dyn Fn(RebalanceTaskKind) -> bool + Send + Sync>>> =
+    StdMutex::new(None);
+
+pub fn set_rebalance_fail_hook<F>(hook: F)
+where
+    F: Fn(RebalanceTaskKind) -> bool + Send + Sync + 'static,
+{
+    *FAIL_HOOK.lock().expect("fail hook poisoned") = Some(Arc::new(hook));
+}
+
+pub fn clear_rebalance_fail_hook() {
+    *FAIL_HOOK.lock().expect("fail hook poisoned") = None;
+}
+
+fn should_fail(kind: RebalanceTaskKind) -> bool {
+    if let Some(h) = FAIL_HOOK.lock().expect("fail hook poisoned").as_ref() {
+        return h(kind);
+    }
+    let _ = kind;
+    false
+}
 
 #[derive(Debug, Clone)]
 #[allow(dead_code)]
@@ -23,7 +53,7 @@ pub enum RebalanceTask {
     Rebalance(u64),
 }
 
-struct RebalanceState {
+pub(crate) struct RebalanceState {
     storage: Storage,
     wal: Arc<Walrus>,
     routing: Arc<RoutingTable>,
@@ -100,7 +130,7 @@ impl RebalanceState {
             .clone()
     }
 
-    fn load_bucket(&self, bucket_id: u64) -> Option<Bucket> {
+    pub(crate) fn load_bucket(&self, bucket_id: u64) -> Option<Bucket> {
         let chunks = block_on(self.storage.get_chunks(bucket_id)).ok()?;
         let mut vectors: Vec<Vector> = Vec::new();
         for chunk in chunks {
@@ -211,6 +241,13 @@ impl RebalanceState {
     }
 
     fn handle_split(&self, bucket_id: u64) {
+        if should_fail(RebalanceTaskKind::Split) {
+            debug!(
+                "rebalance: injected failure for split on bucket {}",
+                bucket_id
+            );
+            return;
+        }
         let lock = self.lock_for(bucket_id);
         let _guard = lock.lock();
         let bucket = match self.load_bucket(bucket_id) {
@@ -268,6 +305,13 @@ impl RebalanceState {
     }
 
     fn handle_merge(&self, a: u64, b: u64) {
+        if should_fail(RebalanceTaskKind::Merge) {
+            debug!(
+                "rebalance: injected failure for merge on buckets {} and {}",
+                a, b
+            );
+            return;
+        }
         let (first, second) = if a <= b { (a, b) } else { (b, a) };
         let lock_first = self.lock_for(first);
         let lock_second = self.lock_for(second);
@@ -321,6 +365,13 @@ impl RebalanceState {
     }
 
     fn handle_rebalance(&self, bucket_id: u64) {
+        if should_fail(RebalanceTaskKind::Rebalance) {
+            debug!(
+                "rebalance: injected failure for rebalance on bucket {}",
+                bucket_id
+            );
+            return;
+        }
         // For now, just recompute centroid from storage and republish routing.
         let lock = self.lock_for(bucket_id);
         let _guard = lock.lock();
@@ -406,6 +457,11 @@ impl RebalanceWorker {
 
     pub fn snapshot_sizes(&self) -> HashMap<u64, usize> {
         self.state.refresh_sizes()
+    }
+
+    /// Close the task channel to allow the background worker to exit.
+    pub fn close(&self) {
+        self.tx.close();
     }
 }
 

@@ -94,13 +94,7 @@ fn storage_put_and_read_keeps_all_vectors() -> Result<()> {
 
     // Re-read via executor, which exercises the decoding path used in production.
     let executor = Executor::new(storage.clone(), WorkerCache::new(4, usize::MAX));
-    let res = block_on(executor.query(
-        &[0.0, 0.0],
-        &[bucket.id],
-        10,
-        0,
-        Arc::new(Vec::new()),
-    ))?;
+    let res = block_on(executor.query(&[0.0, 0.0], &[bucket.id], 10, 0, Arc::new(Vec::new())))?;
     let ids: Vec<u64> = res.iter().map(|(id, _)| *id).collect();
     assert_eq!(
         ids.len(),

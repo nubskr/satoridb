@@ -28,9 +28,9 @@ fn executor_across_buckets_returns_global_topk() -> Result<()> {
 
     // Near bucket: these should dominate the ranking.
     let near = vec![
-        Vector::new(10, vec![1.0, 1.0]),   // distance 0.0
-        Vector::new(11, vec![2.0, 2.0]),   // larger distance
-        Vector::new(12, vec![0.5, 0.5]),   // distance 0.5
+        Vector::new(10, vec![1.0, 1.0]), // distance 0.0
+        Vector::new(11, vec![2.0, 2.0]), // larger distance
+        Vector::new(12, vec![0.5, 0.5]), // distance 0.5
     ];
     block_on(storage.put_chunk_raw(1, &near))?;
 
@@ -47,5 +47,24 @@ fn executor_across_buckets_returns_global_topk() -> Result<()> {
         "executor should merge per-bucket heaps and return global top-k ordering"
     );
 
+    Ok(())
+}
+
+/// Querying a non-existent bucket should be harmless and return no results.
+#[test]
+fn executor_handles_missing_bucket_gracefully() -> Result<()> {
+    let tmp = tempfile::tempdir()?;
+    let wal = init_wal(&tmp);
+    let storage = Storage::new(wal);
+
+    let cache = WorkerCache::new(2, 8 * 1024);
+    let executor = Executor::new(storage.clone(), cache);
+
+    let query = vec![0.0f32, 0.0f32];
+    let res = block_on(executor.query(&query, &[42], 5, 0, Arc::new(Vec::new())))?;
+    assert!(
+        res.is_empty(),
+        "missing buckets should not cause errors and return empty results"
+    );
     Ok(())
 }

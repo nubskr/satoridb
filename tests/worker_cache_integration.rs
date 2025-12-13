@@ -79,8 +79,7 @@ fn small_bucket_stays_cached_until_version_bump() -> Result<()> {
     );
 
     // Now bump routing and mark bucket 1 changed; the executor should reload and see both vectors.
-    let refreshed =
-        block_on(executor.query(&q, &[1], 10, 1, Arc::new(vec![1])))?;
+    let refreshed = block_on(executor.query(&q, &[1], 10, 1, Arc::new(vec![1])))?;
     assert_eq!(
         refreshed.len(),
         2,
