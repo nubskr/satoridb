@@ -43,9 +43,16 @@ impl Bucket {
     }
 }
 
+#[derive(Clone, Copy, Debug)]
+pub enum StorageExecMode {
+    Direct,
+    Offload,
+}
+
 #[derive(Clone)]
 pub struct Storage {
     pub(crate) wal: Arc<Walrus>,
+    pub(crate) mode: StorageExecMode,
 }
 
 thread_local! {
@@ -69,7 +76,15 @@ pub struct BucketMeta {
 
 impl Storage {
     pub fn new(wal: Arc<Walrus>) -> Self {
-        Self { wal }
+        Self {
+            wal,
+            mode: StorageExecMode::Direct,
+        }
+    }
+
+    pub fn with_mode(mut self, mode: StorageExecMode) -> Self {
+        self.mode = mode;
+        self
     }
 
     /// Pre-reserve thread-local buffers used during ingestion to avoid growth reallocations.
@@ -128,6 +143,30 @@ impl Storage {
         if vectors.is_empty() {
             return Ok(());
         }
+
+        match self.mode {
+            StorageExecMode::Direct => {
+                Self::put_chunk_raw_sync(self.wal.clone(), bucket_id, topic, vectors)
+            }
+            StorageExecMode::Offload => {
+                let wal = self.wal.clone();
+                let vectors = vectors.to_vec();
+                let topic = topic.to_string();
+                glommio::executor()
+                    .spawn_blocking(move || {
+                        Self::put_chunk_raw_sync(wal, bucket_id, &topic, &vectors)
+                    })
+                    .await
+            }
+        }
+    }
+
+    fn put_chunk_raw_sync(
+        wal: Arc<Walrus>,
+        bucket_id: u64,
+        topic: &str,
+        vectors: &[Vector],
+    ) -> Result<()> {
         TL_BACKING.with(|backing_cell| {
             TL_RANGES.with(|ranges_cell| -> Result<()> {
                 let mut backing = backing_cell.borrow_mut();
@@ -158,15 +197,13 @@ impl Storage {
                 for chunk in ranges.chunks(2000) {
                     let mut slices: SmallVec<[&[u8]; 128]> = SmallVec::with_capacity(chunk.len());
                     slices.extend(chunk.iter().map(|(s, e)| &backing[*s..*e]));
-                    self.wal
-                        .batch_append_for_topic(&topic, &slices)
-                        .map_err(|e| {
-                            anyhow::anyhow!(
-                                "Walrus batch append failed for bucket {}: {:?}",
-                                bucket_id,
-                                e
-                            )
-                        })?;
+                    wal.batch_append_for_topic(topic, &slices).map_err(|e| {
+                        anyhow::anyhow!(
+                            "Walrus batch append failed for bucket {}: {:?}",
+                            bucket_id,
+                            e
+                        )
+                    })?;
                 }
                 Ok(())
             })
@@ -175,28 +212,51 @@ impl Storage {
 
     /// Emits a bucket metadata record (active/retired) for housekeeping.
     pub async fn put_bucket_meta(&self, meta: &BucketMeta) -> Result<()> {
+        match self.mode {
+            StorageExecMode::Direct => Self::put_bucket_meta_sync(self.wal.clone(), meta),
+            StorageExecMode::Offload => {
+                let wal = self.wal.clone();
+                let meta = meta.clone();
+                glommio::executor()
+                    .spawn_blocking(move || Self::put_bucket_meta_sync(wal, &meta))
+                    .await
+            }
+        }
+    }
+
+    fn put_bucket_meta_sync(wal: Arc<Walrus>, meta: &BucketMeta) -> Result<()> {
         let bytes = rkyv::to_bytes::<_, 256>(meta)
             .map_err(|e| anyhow::anyhow!("Failed to serialize bucket meta: {}", e))?;
         let mut payload = Vec::with_capacity(8 + bytes.len());
         payload.extend_from_slice(&bytes.len().to_le_bytes());
         payload.extend_from_slice(bytes.as_slice());
-        self.wal
-            .append_for_topic("bucket_meta", &payload)
+        wal.append_for_topic("bucket_meta", &payload)
             .map_err(|e| anyhow::anyhow!("Walrus append failed (bucket_meta): {:?}", e))
     }
 
     /// Retrieves all chunks for a bucket.
     pub async fn get_chunks(&self, bucket_id: u64) -> Result<Vec<Vec<u8>>> {
+        match self.mode {
+            StorageExecMode::Direct => Self::get_chunks_sync(self.wal.clone(), bucket_id),
+            StorageExecMode::Offload => {
+                let wal = self.wal.clone();
+                glommio::executor()
+                    .spawn_blocking(move || Self::get_chunks_sync(wal, bucket_id))
+                    .await
+            }
+        }
+    }
+
+    fn get_chunks_sync(wal: Arc<Walrus>, bucket_id: u64) -> Result<Vec<Vec<u8>>> {
         let topic = Self::topic_for(bucket_id);
-        let topic_size = self.wal.get_topic_size(&topic) as usize;
+        let topic_size = wal.get_topic_size(&topic) as usize;
         if topic_size == 0 {
             return Ok(Vec::new());
         }
 
         // Use stateful read (start_offset=None) so the active writer block is also included.
         // Stateless reads with start_offset=Some(0) can miss in-flight data still in the writer.
-        let entries: Vec<Entry> = self
-            .wal
+        let entries: Vec<Entry> = wal
             .batch_read_for_topic(&topic, topic_size + 1024, false, None)
             .map_err(|e| anyhow::anyhow!("Walrus read failed for {}: {:?}", topic, e))?;
 

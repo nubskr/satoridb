@@ -31,7 +31,7 @@ impl BlockAllocator {
                 offset: 0,
                 limit: DEFAULT_BLOCK_SIZE,
                 file_path: file1,
-                mmap,
+                file: mmap,
                 used: 0,
             }),
             lock: AtomicBool::new(false),
@@ -54,7 +54,8 @@ impl BlockAllocator {
             // mark previous file as fully allocated before switching
             FileStateTracker::set_fully_allocated(prev_block_file_path);
             data.file_path = self.paths.create_new_file()?;
-            data.mmap = SharedMmapKeeper::get_mmap_arc(&data.file_path)?;
+            let mmap: Arc<SharedMmap> = SharedMmapKeeper::get_mmap_arc(&data.file_path)?;
+            data.file = mmap;
             data.offset = 0;
             data.used = 0;
             debug_print!("[alloc] rolled over to new file: {}", data.file_path);
@@ -105,7 +106,8 @@ impl BlockAllocator {
         if data.offset + alloc_size > MAX_FILE_SIZE {
             let prev_block_file_path = data.file_path.clone();
             data.file_path = self.paths.create_new_file()?;
-            data.mmap = SharedMmapKeeper::get_mmap_arc(&data.file_path)?;
+            let mmap: Arc<SharedMmap> = SharedMmapKeeper::get_mmap_arc(&data.file_path)?;
+            data.file = mmap;
             data.offset = 0;
             // mark the previous file fully allocated now
             FileStateTracker::set_fully_allocated(prev_block_file_path);
@@ -119,7 +121,7 @@ impl BlockAllocator {
             file_path: data.file_path.clone(),
             offset: data.offset,
             limit: alloc_size,
-            mmap: data.mmap.clone(),
+            file: data.file.clone(),
             used: 0,
         };
         // register the new block before handing it out

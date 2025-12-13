@@ -80,7 +80,7 @@ impl Writer {
             FileStateTracker::set_block_unlocked(block.id as usize);
             let mut sealed = block.clone();
             sealed.used = *cur;
-            sealed.mmap.flush()?;
+            pollster::block_on(sealed.file.sync_all())?;
             let _ = self.reader.append_block_to_chain(&self.col, sealed);
             debug_print!("[writer] appended sealed block to chain: col={}", self.col);
             // switch to new block
@@ -97,7 +97,12 @@ impl Writer {
             *cur = 0;
         }
         let next_block_start = block.offset + block.limit; // simplistic for now
-        block.write(*cur, data, &self.col, next_block_start)?;
+        pollster::block_on(block.write(
+            *cur,
+            data,
+            &self.col,
+            next_block_start,
+        ))?;
         debug_print!(
             "[writer] wrote: col={}, block_id={}, offset_before={}, bytes={}, offset_after={}",
             self.col,
@@ -112,7 +117,7 @@ impl Writer {
         match self.fsync_schedule {
             FsyncSchedule::SyncEach => {
                 // Immediate mmap flush, skip background flusher
-                block.mmap.flush()?;
+                pollster::block_on(block.file.sync_all())?;
                 debug_print!(
                     "[writer] immediate fsync: col={}, block_id={}",
                     self.col,
@@ -234,7 +239,7 @@ impl Writer {
                 FileStateTracker::set_block_unlocked(block.id as usize);
                 let mut sealed = block.clone();
                 sealed.used = planning_offset;
-                sealed.mmap.flush()?;
+                pollster::block_on(sealed.file.sync_all())?;
                 let _ = self.reader.append_block_to_chain(&self.col, sealed);
 
                 // Allocate new block
@@ -255,56 +260,30 @@ impl Writer {
             revert_info.allocated_block_ids.len() + 1
         );
 
-        // Phase 2 & 3: io_uring preparation and submission (FD backend only)
-        #[cfg(target_os = "linux")]
-        let total_bytes_usize = usize::try_from(total_bytes).map_err(|_| {
-            std::io::Error::new(
-                std::io::ErrorKind::InvalidInput,
-                "batch is too large to fit into addressable memory",
-            )
-        })?;
-
-        #[cfg(target_os = "linux")]
-        {
-            if USE_FD_BACKEND.load(Ordering::Relaxed) {
-                // Prefer io_uring for FD backend, but fall back to the portable path if io_uring
-                // is unavailable (e.g. kernel/config restrictions) so behavior remains correct.
-                match self.submit_batch_via_io_uring(
-                    &write_plan,
-                    batch,
-                    &mut revert_info,
-                    &mut *cur_offset,
-                    planning_offset,
-                    total_bytes_usize,
-                ) {
-                    Ok(()) => return Ok(()),
-                    Err(e) => {
-                        if e.to_string().contains("io_uring init failed") {
-                            debug_print!("[batch] io_uring unavailable; falling back: {}", e);
-                        } else {
-                            return Err(e);
-                        }
-                    }
-                }
-            }
-        }
-
         // Fallback: use regular block.write() in a loop (mmap backend or non-Linux builds)
         for (blk, offset, data_idx) in write_plan.iter() {
             let data = batch[*data_idx];
             let next_block_start = blk.offset + blk.limit;
 
-            if let Err(e) = blk.write(*offset, data, &self.col, next_block_start) {
+            if let Err(e) = pollster::block_on(blk.write(
+                *offset,
+                data,
+                &self.col,
+                next_block_start,
+            )) {
                 // Clean up any partially written headers up to and including the failed index
                 for (w_blk, w_off, _) in write_plan[0..=(*data_idx)].iter() {
-                    let _ = w_blk.zero_range(*w_off, PREFIX_META_SIZE as u64);
+                    let _ = pollster::block_on(w_blk.zero_range(
+                        *w_off,
+                        PREFIX_META_SIZE as u64,
+                    ));
                 }
 
                 // Flush zeros and rollback
                 let mut fsynced = HashSet::new();
                 for (w_blk, _, _) in write_plan[0..=(*data_idx)].iter() {
                     if fsynced.insert(w_blk.file_path.clone()) {
-                        let _ = w_blk.mmap.flush();
+                        let _ = pollster::block_on(w_blk.file.sync_all());
                     }
                 }
 
@@ -320,7 +299,7 @@ impl Writer {
         let mut fsynced = HashSet::new();
         for (blk, _, _) in write_plan.iter() {
             if !fsynced.contains(&blk.file_path) {
-                blk.mmap.flush()?;
+                pollster::block_on(blk.file.sync_all())?;
                 fsynced.insert(blk.file_path.clone());
             }
         }
@@ -335,193 +314,6 @@ impl Writer {
             self.col
         );
         Ok(())
-    }
-
-    #[cfg(target_os = "linux")]
-    fn submit_batch_via_io_uring(
-        &self,
-        write_plan: &[(Block, u64, usize)],
-        batch: &[&[u8]],
-        revert_info: &mut BatchRevertInfo,
-        cur_offset: &mut u64,
-        planning_offset: u64,
-        total_bytes: usize,
-    ) -> std::io::Result<()> {
-        let ring_size = (write_plan.len() + 64).min(4096) as u32; // Cap at 4096, convert to u32
-        let mut ring = io_uring::IoUring::new(ring_size).map_err(|e| {
-            std::io::Error::new(
-                std::io::ErrorKind::Other,
-                format!("io_uring init failed: {}", e),
-            )
-        })?;
-        let mut buffers: Vec<Vec<u8>> = Vec::new();
-
-        for (blk, offset, data_idx) in write_plan.iter() {
-            let data = batch[*data_idx];
-            let next_block_start = blk.offset + blk.limit;
-
-            // Prepare metadata
-            let new_meta = Metadata {
-                read_size: data.len(),
-                owned_by: self.col.to_string(),
-                next_block_start,
-                checksum: checksum64(data),
-            };
-
-            let meta_bytes = rkyv::to_bytes::<_, 256>(&new_meta).map_err(|e| {
-                std::io::Error::new(
-                    std::io::ErrorKind::Other,
-                    format!("serialize metadata failed: {:?}", e),
-                )
-            })?;
-
-            let mut meta_buffer = vec![0u8; PREFIX_META_SIZE];
-            meta_buffer[0] = (meta_bytes.len() & 0xFF) as u8;
-            meta_buffer[1] = ((meta_bytes.len() >> 8) & 0xFF) as u8;
-            meta_buffer[2..2 + meta_bytes.len()].copy_from_slice(&meta_bytes);
-
-            let mut combined = Vec::with_capacity(PREFIX_META_SIZE + data.len());
-            combined.extend_from_slice(&meta_buffer);
-            combined.extend_from_slice(data);
-
-            let file_offset = blk.offset + offset;
-
-            // Get raw FD
-            let fd = if let Some(fd_backend) = blk.mmap.storage().as_fd() {
-                io_uring::types::Fd(fd_backend.file().as_raw_fd())
-            } else {
-                // Rollback and fail
-                *cur_offset = revert_info.original_offset;
-                for block_id in revert_info.allocated_block_ids.iter() {
-                    FileStateTracker::set_block_unlocked(*block_id as usize);
-                }
-                return Err(std::io::Error::new(
-                    std::io::ErrorKind::Unsupported,
-                    "batch writes require FD backend",
-                ));
-            };
-
-            let write_op =
-                io_uring::opcode::Write::new(fd, combined.as_ptr(), combined.len() as u32)
-                    .offset(file_offset)
-                    .build()
-                    .user_data(*data_idx as u64);
-
-            buffers.push(combined);
-
-            unsafe {
-                ring.submission().push(&write_op).map_err(|e| {
-                    std::io::Error::new(
-                        std::io::ErrorKind::Other,
-                        format!("io_uring push failed: {}", e),
-                    )
-                })?;
-            }
-        }
-
-        debug_print!(
-            "[batch] submitting {} operations via io_uring",
-            write_plan.len()
-        );
-
-        // Phase 3: Atomic submission
-        match ring.submit_and_wait(write_plan.len()) {
-            Ok(_) => {
-                let mut all_success = true;
-                for _ in 0..write_plan.len() {
-                    if let Some(cqe) = ring.completion().next() {
-                        let data_idx = cqe.user_data() as usize;
-                        let expected_bytes = buffers.get(data_idx).map(|b| b.len()).unwrap_or(0);
-                        let result = cqe.result();
-
-                        if result < 0 {
-                            all_success = false;
-                            debug_print!(
-                                "[batch] write failed for entry {}: error {}",
-                                data_idx,
-                                result
-                            );
-                            break;
-                        } else if (result as usize) != expected_bytes {
-                            all_success = false;
-                            debug_print!(
-                                "[batch] short write for entry {}: wrote {} bytes, expected {}",
-                                data_idx,
-                                result,
-                                expected_bytes
-                            );
-                            break;
-                        }
-                    }
-                }
-
-                if !all_success {
-                    // Clean up garbage before rollback: zero headers for all planned entries
-                    for (blk, offset, _idx) in write_plan.iter() {
-                        let _ = blk.zero_range(*offset, PREFIX_META_SIZE as u64);
-                    }
-
-                    // Ensure zeros are persisted
-                    let mut fsynced = HashSet::new();
-                    for (blk, _, _) in write_plan.iter() {
-                        if fsynced.insert(blk.file_path.clone()) {
-                            let _ = blk.mmap.flush();
-                        }
-                    }
-
-                    // Rollback
-                    *cur_offset = revert_info.original_offset;
-                    for block_id in revert_info.allocated_block_ids.iter() {
-                        FileStateTracker::set_block_unlocked(*block_id as usize);
-                    }
-                    return Err(std::io::Error::new(
-                        std::io::ErrorKind::Other,
-                        "batch write failed, rolled back",
-                    ));
-                }
-
-                // Success - fsync all touched files
-                let mut fsynced = HashSet::new();
-                for (blk, _, _) in write_plan.iter() {
-                    if !fsynced.contains(&blk.file_path) {
-                        blk.mmap.flush()?;
-                        fsynced.insert(blk.file_path.clone());
-                    }
-                }
-
-                // NOW update the writer's offset to make data visible to readers
-                *cur_offset = planning_offset;
-
-                debug_print!(
-                    "[batch] SUCCESS: wrote {} entries, {} bytes to topic={}",
-                    batch.len(),
-                    total_bytes,
-                    self.col
-                );
-                Ok(())
-            }
-            Err(e) => {
-                // Clean up garbage before rollback: zero headers for all planned entries
-                for (blk, offset, _idx) in write_plan.iter() {
-                    let _ = blk.zero_range(*offset, PREFIX_META_SIZE as u64);
-                }
-
-                // Ensure zeros are persisted
-                let mut fsynced = HashSet::new();
-                for (blk, _, _) in write_plan.iter() {
-                    if fsynced.insert(blk.file_path.clone()) {
-                        let _ = blk.mmap.flush();
-                    }
-                }
-
-                // Rollback
-                *cur_offset = revert_info.original_offset;
-                for block_id in revert_info.allocated_block_ids.iter() {
-                    FileStateTracker::set_block_unlocked(*block_id as usize);
-                }
-                Err(e)
-            }
-        }
     }
 }
 

@@ -317,12 +317,12 @@ impl Walrus {
                     file_path: file_path.clone(),
                     offset: block_offset,
                     limit: DEFAULT_BLOCK_SIZE,
-                    mmap: mmap.clone(),
+                    file: mmap.clone(),
                     used: 0,
                 };
                 let mut in_block_off: u64 = 0;
                 loop {
-                    match block_stub.read(in_block_off) {
+                    match pollster::block_on(block_stub.read(in_block_off)) {
                         Ok((_entry, consumed)) => {
                             used += consumed as u64;
                             in_block_off += consumed as u64;
@@ -343,7 +343,7 @@ impl Walrus {
                     file_path: file_path.clone(),
                     offset: block_offset,
                     limit: DEFAULT_BLOCK_SIZE,
-                    mmap: mmap.clone(),
+                    file: mmap.clone(),
                     used,
                 };
                 // register and append
@@ -427,7 +427,7 @@ impl Walrus {
             let mut off: u64 = 0;
             let mut count: u64 = 0;
             while off < limit {
-                match block.read(off) {
+                match pollster::block_on(block.read(off)) {
                     Ok((_entry, consumed)) => {
                         let next = off.saturating_add(consumed as u64);
                         if next > limit {

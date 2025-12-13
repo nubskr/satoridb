@@ -1,4 +1,6 @@
-use crate::wal::config::{FsyncSchedule, USE_FD_BACKEND};
+use crate::storage::wal::config::{FsyncSchedule, USE_FD_BACKEND};
+use crate::storage::wal::io::WalrusFile;
+use async_trait::async_trait;
 use memmap2::MmapMut;
 use std::collections::HashMap;
 use std::fs::OpenOptions;
@@ -32,16 +34,16 @@ impl FdBackend {
         Ok(Self { file, len })
     }
 
-    pub(crate) fn write(&self, offset: usize, data: &[u8]) {
+    pub(crate) fn write(&self, offset: usize, data: &[u8]) -> std::io::Result<usize> {
         use std::os::unix::fs::FileExt;
         // pwrite doesn't move the file cursor
-        let _ = self.file.write_at(data, offset as u64);
+        self.file.write_at(data, offset as u64)
     }
 
-    pub(crate) fn read(&self, offset: usize, dest: &mut [u8]) {
+    pub(crate) fn read(&self, offset: usize, dest: &mut [u8]) -> std::io::Result<usize> {
         use std::os::unix::fs::FileExt;
         // pread doesn't move the file cursor
-        let _ = self.file.read_at(dest, offset as u64);
+        self.file.read_at(dest, offset as u64)
     }
 
     pub(crate) fn flush(&self) -> std::io::Result<()> {
@@ -64,6 +66,65 @@ pub(crate) enum StorageImpl {
     Fd(FdBackend),
 }
 
+#[async_trait(?Send)]
+impl WalrusFile for StorageImpl {
+    async fn read_at(&self, offset: u64, len: usize) -> std::io::Result<Vec<u8>> {
+        let mut buf = vec![0u8; len];
+        match self {
+            StorageImpl::Mmap(mmap) => {
+                let off = offset as usize;
+                if off + len > mmap.len() {
+                    return Err(std::io::Error::new(
+                        std::io::ErrorKind::UnexpectedEof,
+                        "read beyond mmap bound",
+                    ));
+                }
+                buf.copy_from_slice(&mmap[off..off + len]);
+                Ok(buf)
+            }
+            StorageImpl::Fd(fd) => {
+                fd.read(offset as usize, &mut buf)?;
+                Ok(buf)
+            }
+        }
+    }
+
+    async fn write_at(&self, offset: u64, buf: &[u8]) -> std::io::Result<usize> {
+        match self {
+            StorageImpl::Mmap(mmap) => {
+                let off = offset as usize;
+                let len = buf.len();
+                if off + len > mmap.len() {
+                    return Err(std::io::Error::new(
+                        std::io::ErrorKind::Other,
+                        "write beyond mmap bound",
+                    ));
+                }
+                unsafe {
+                    let ptr = mmap.as_ptr() as *mut u8;
+                    std::ptr::copy_nonoverlapping(buf.as_ptr(), ptr.add(off), len);
+                }
+                Ok(len)
+            }
+            StorageImpl::Fd(fd) => fd.write(offset as usize, buf),
+        }
+    }
+
+    async fn sync_all(&self) -> std::io::Result<()> {
+        match self {
+            StorageImpl::Mmap(mmap) => mmap.flush(),
+            StorageImpl::Fd(fd) => fd.flush(),
+        }
+    }
+
+    async fn len(&self) -> std::io::Result<u64> {
+        match self {
+            StorageImpl::Mmap(mmap) => Ok(mmap.len() as u64),
+            StorageImpl::Fd(fd) => Ok(fd.len() as u64),
+        }
+    }
+}
+
 impl StorageImpl {
     pub(crate) fn write(&self, offset: usize, data: &[u8]) {
         match self {
@@ -75,7 +136,9 @@ impl StorageImpl {
                     std::ptr::copy_nonoverlapping(data.as_ptr(), ptr.add(offset), data.len());
                 }
             }
-            StorageImpl::Fd(fd) => fd.write(offset, data),
+            StorageImpl::Fd(fd) => {
+                let _ = fd.write(offset, data);
+            }
         }
     }
 
@@ -86,7 +149,9 @@ impl StorageImpl {
                 let src = &mmap[offset..offset + dest.len()];
                 dest.copy_from_slice(src);
             }
-            StorageImpl::Fd(fd) => fd.read(offset, dest),
+            StorageImpl::Fd(fd) => {
+                let _ = fd.read(offset, dest);
+            }
         }
     }
 
@@ -149,6 +214,33 @@ unsafe impl Sync for SharedMmap {}
 // SAFETY: The struct holds storage that is safe to move between threads;
 // timestamps are atomics, so sending is sound.
 unsafe impl Send for SharedMmap {}
+
+#[async_trait(?Send)]
+impl WalrusFile for SharedMmap {
+    async fn read_at(&self, offset: u64, len: usize) -> std::io::Result<Vec<u8>> {
+        self.storage.read_at(offset, len).await
+    }
+
+    async fn write_at(&self, offset: u64, buf: &[u8]) -> std::io::Result<usize> {
+        let res = self.storage.write_at(offset, buf).await;
+        if res.is_ok() {
+            let now_ms = SystemTime::now()
+                .duration_since(SystemTime::UNIX_EPOCH)
+                .unwrap_or_else(|_| std::time::Duration::from_secs(0))
+                .as_millis() as u64;
+            self.last_touched_at.store(now_ms, Ordering::Relaxed);
+        }
+        res
+    }
+
+    async fn sync_all(&self) -> std::io::Result<()> {
+        self.storage.sync_all().await
+    }
+
+    async fn len(&self) -> std::io::Result<u64> {
+        WalrusFile::len(&self.storage).await
+    }
+}
 
 impl SharedMmap {
     pub(crate) fn new(path: &str) -> std::io::Result<Arc<Self>> {

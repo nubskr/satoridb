@@ -1,5 +1,6 @@
 pub mod block;
 pub mod config;
+pub mod io;
 pub mod paths;
 pub mod runtime;
 pub mod storage;

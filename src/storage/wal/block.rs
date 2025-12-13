@@ -1,5 +1,5 @@
-use crate::wal::config::{checksum64, debug_print, PREFIX_META_SIZE};
-use crate::wal::storage::SharedMmap;
+use crate::storage::wal::config::{checksum64, debug_print, PREFIX_META_SIZE};
+use crate::storage::wal::io::WalrusFile;
 use rkyv::Deserialize as _;
 use rkyv_derive::{Archive, Deserialize, Serialize};
 use std::sync::Arc;
@@ -24,12 +24,12 @@ pub struct Block {
     pub(crate) file_path: String,
     pub(crate) offset: u64,
     pub(crate) limit: u64,
-    pub(crate) mmap: Arc<SharedMmap>,
+    pub(crate) file: Arc<dyn WalrusFile + Send + Sync>,
     pub(crate) used: u64,
 }
 
 impl Block {
-    pub(crate) fn write(
+    pub(crate) async fn write(
         &self,
         in_block_offset: u64,
         data: &[u8],
@@ -73,14 +73,16 @@ impl Block {
         combined.extend_from_slice(data);
 
         let file_offset = self.offset + in_block_offset;
-        self.mmap.write(file_offset as usize, &combined);
+        self.file.write_at(file_offset, &combined).await?;
         Ok(())
     }
 
-    pub(crate) fn read(&self, in_block_offset: u64) -> std::io::Result<(Entry, usize)> {
-        let mut meta_buffer = vec![0; PREFIX_META_SIZE];
+    pub(crate) async fn read(&self, in_block_offset: u64) -> std::io::Result<(Entry, usize)> {
         let file_offset = self.offset + in_block_offset;
-        self.mmap.read(file_offset as usize, &mut meta_buffer);
+        let meta_buffer = self
+            .file
+            .read_at(file_offset, PREFIX_META_SIZE)
+            .await?;
 
         // Read the actual metadata length from first 2 bytes
         let meta_len = (meta_buffer[0] as usize) | ((meta_buffer[1] as usize) << 8);
@@ -110,8 +112,7 @@ impl Block {
 
         // Read the actual data
         let new_offset = file_offset + PREFIX_META_SIZE as u64;
-        let mut ret_buffer = vec![0; actual_entry_size];
-        self.mmap.read(new_offset as usize, &mut ret_buffer);
+        let ret_buffer = self.file.read_at(new_offset, actual_entry_size).await?;
 
         // Verify checksum
         let expected = meta.checksum;
@@ -132,7 +133,7 @@ impl Block {
         Ok((Entry { data: ret_buffer }, consumed))
     }
 
-    pub(crate) fn zero_range(&self, in_block_offset: u64, size: u64) -> std::io::Result<()> {
+    pub(crate) async fn zero_range(&self, in_block_offset: u64, size: u64) -> std::io::Result<()> {
         // Zero a small region within this block; used to invalidate headers on rollback
         // Caller ensures size is reasonable (typically PREFIX_META_SIZE)
         let len = size as usize;
@@ -141,7 +142,7 @@ impl Block {
         }
         let zeros = vec![0u8; len];
         let file_offset = self.offset + in_block_offset;
-        self.mmap.write(file_offset as usize, &zeros);
+        self.file.write_at(file_offset, &zeros).await?;
         Ok(())
     }
 }
