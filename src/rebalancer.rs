@@ -84,7 +84,7 @@ impl RebalanceState {
         let inserted = ingest_counter::get();
 
         if sum < inserted {
-            warn!(
+            debug!(
                 "rebalance: wal counts sum {} is less than total inserted {}; proceeding with monotonic sizes",
                 sum, inserted
             );
@@ -110,16 +110,33 @@ impl RebalanceState {
             let mut len_bytes = [0u8; 8];
             len_bytes.copy_from_slice(&chunk[0..8]);
             let archive_len = u64::from_le_bytes(len_bytes) as usize;
-            if 8 + archive_len > chunk.len() {
+            if 8 + archive_len > chunk.len() || archive_len < 16 {
                 continue;
             }
-            let data_slice = &chunk[8..8 + archive_len];
-            if let Ok(archived_vec) = rkyv::check_archived_root::<Vector>(data_slice) {
-                vectors.push(Vector {
-                    id: archived_vec.id,
-                    data: archived_vec.data.to_vec(),
-                });
+            // Current WAL format: len prefix, then id (u64), dim (u64), then dim*f32 bytes.
+            let mut off = 8;
+            let mut id_bytes = [0u8; 8];
+            id_bytes.copy_from_slice(&chunk[off..off + 8]);
+            off += 8;
+            let mut dim_bytes = [0u8; 8];
+            dim_bytes.copy_from_slice(&chunk[off..off + 8]);
+            off += 8;
+            let dim = u64::from_le_bytes(dim_bytes) as usize;
+            let Some(expected_bytes) = dim.checked_mul(4) else {
+                continue;
+            };
+            if off + expected_bytes > chunk.len() {
+                continue;
             }
+            let mut data = Vec::with_capacity(dim);
+            let data_bytes = &chunk[off..off + expected_bytes];
+            for chunked in data_bytes.chunks_exact(4) {
+                let mut fb = [0u8; 4];
+                fb.copy_from_slice(chunked);
+                data.push(f32::from_le_bytes(fb));
+            }
+            let id = u64::from_le_bytes(id_bytes);
+            vectors.push(Vector { id, data });
         }
         if vectors.is_empty() {
             return None;
@@ -234,6 +251,7 @@ impl RebalanceState {
         self.retire_bucket(bucket_id);
         let mut centroids = self.centroids.write();
         let mut sizes = self.bucket_sizes.write();
+        let new_count = new_entries.len();
         for (id, centroid, size) in new_entries {
             centroids.insert(id, centroid);
             sizes.insert(id, size);
@@ -241,6 +259,12 @@ impl RebalanceState {
         drop(sizes);
         drop(centroids);
         self.rebuild_router();
+        log::info!(
+            "rebalance: split {} into {} buckets (new_total={})",
+            bucket_id,
+            new_count,
+            self.centroids.read().len()
+        );
     }
 
     fn handle_merge(&self, a: u64, b: u64) {

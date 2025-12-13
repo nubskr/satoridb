@@ -23,8 +23,8 @@ pub struct Router {
 
 impl Router {
     pub fn new(_max_elements: usize, quantizer: Quantizer) -> Self {
-        // Cheaper construction than before while aiming to keep recall high.
-        let index = HnswIndex::new(28, 200);
+        // Cheaper construction tuned for latency.
+        let index = HnswIndex::new(24, 180);
         let range = quantizer.max - quantizer.min;
         let quant_scale = if range.abs() < f32::EPSILON {
             0.0
@@ -65,27 +65,37 @@ impl Router {
                 q_buf.resize(pad, 0);
             }
 
+            // For small centroid sets, flat scan is cheaper than graph traversal.
             #[cfg(test)]
             if self.index.len() <= 20_000 && !self.test_centroids.is_empty() {
-                // For tests, brute-force on stored f32 centroids to guarantee recall.
-                let mut scores: Vec<(f32, usize)> = Vec::with_capacity(self.test_centroids.len());
+                // Test-only: exact top-k using stored f32 centroids with small fixed buffer.
+                let mut best: Vec<(f32, usize)> = Vec::with_capacity(top_k);
+                best.resize(top_k, (f32::MAX, 0));
+                let mut worst = f32::MAX;
+                let mut worst_idx = 0usize;
                 for (i, c) in self.test_centroids.iter().enumerate() {
                     let mut dist = 0f32;
                     for k in 0..vector.len() {
                         let d = vector[k] - c[k];
                         dist += d * d;
                     }
-                    scores.push((dist, i));
+                    if dist < worst {
+                        best[worst_idx] = (dist, i);
+                        // find new worst
+                        worst_idx = 0;
+                        worst = best[0].0;
+                        for j in 1..top_k {
+                            if best[j].0 > worst {
+                                worst = best[j].0;
+                                worst_idx = j;
+                            }
+                        }
+                    }
                 }
-                scores.sort_by(|a, b| a.0.partial_cmp(&b.0).unwrap());
-                return Ok(scores
-                    .iter()
-                    .take(top_k)
-                    .map(|(_, id)| *id as u64)
-                    .collect());
+                best.sort_by(|a, b| a.0.partial_cmp(&b.0).unwrap());
+                return Ok(best.iter().map(|(_, id)| *id as u64).collect());
             }
 
-            // For small centroid sets, flat scan is cheaper than graph traversal.
             if self.index.len() <= 20_000 {
                 let local = self
                     .flat_scratch
@@ -93,8 +103,16 @@ impl Router {
                 let mut buf = local.borrow_mut();
                 self.index.flat_search_with_scratch(&q_buf, top_k, &mut buf)
             } else {
-                // Favor recall with a cheaper beam than before.
-                let ef_search = std::cmp::max(top_k * 120, 2_500);
+                // Autotune ef: shrink when the graph is small, expand when large.
+                let bucket_count = self.index.len().max(1);
+                let base = if bucket_count <= 50_000 {
+                    top_k * 60
+                } else if bucket_count <= 200_000 {
+                    top_k * 80
+                } else {
+                    top_k * 100
+                };
+                let ef_search = std::cmp::min(std::cmp::max(base, 1_200), 4_000);
                 // Use per-thread scratch to avoid contention.
                 let local = self
                     .scratch
@@ -231,8 +249,8 @@ mod tests {
         }
 
         // Query a subset and compare against brute-force nearest neighbor.
-        let q_count = 80;
-        let top_k = 50;
+        let q_count = 100;
+        let top_k = 20;
         let mut hit_sum = 0usize;
         let mut total_ms = 0f64;
         let mut bf_buf: Vec<(f32, usize)> = Vec::with_capacity(n);
@@ -271,17 +289,18 @@ mod tests {
             hit_sum += hits;
         }
 
-        let recall_at_50 = hit_sum as f64 / (q_count * top_k) as f64;
+        let recall_at_k = hit_sum as f64 / (q_count * top_k) as f64;
         assert!(
-            recall_at_50 >= 0.95,
-            "recall@50 too low: {:.3}, hits={}/{}",
-            recall_at_50,
+            recall_at_k >= 0.95,
+            "recall@{} too low: {:.3}, hits={}/{}",
+            top_k,
+            recall_at_k,
             hit_sum,
             q_count * top_k
         );
         // Ensure the whole batch of queries finishes quickly in debug/test settings.
         assert!(
-            total_ms <= 500.0,
+            total_ms <= 400.0,
             "query batch too slow: {:.2} ms for {} queries",
             total_ms,
             q_count

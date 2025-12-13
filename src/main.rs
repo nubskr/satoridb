@@ -228,7 +228,7 @@ fn detect_dataset() -> anyhow::Result<Option<DatasetConfig>> {
             } else {
                 None
             },
-            max_vectors: 370_000_000usize,
+            max_vectors: 300_000_000usize,
             base_is_prepared: true,
         }));
     }
@@ -247,7 +247,7 @@ fn detect_dataset() -> anyhow::Result<Option<DatasetConfig>> {
             } else {
                 None
             },
-            max_vectors: 370_000_000usize,
+            max_vectors: 300_000_000usize,
             base_is_prepared: prepared_bigann.exists(),
         }));
     }
@@ -338,8 +338,8 @@ fn main() -> anyhow::Result<()> {
             let sizes = worker.snapshot_sizes();
             let mut sizes_vec: Vec<usize> = sizes.values().cloned().collect();
             sizes_vec.sort_unstable();
-            // Log bucket sizes every 10 ticks at INFO for visibility.
-            if tick_ctr % 10 == 0 {
+            // Log bucket sizes every 50 ticks at INFO for visibility.
+            if tick_ctr % 50 == 0 {
                 log::info!(
                     "rebalance: periodic tick (tick={}) buckets={} sizes={:?}",
                     tick_ctr,
@@ -347,7 +347,12 @@ fn main() -> anyhow::Result<()> {
                     sizes_vec
                 );
             } else {
-                log::debug!("rebalance: periodic tick sizes={:?}", sizes_vec);
+                log::debug!(
+                    "rebalance: periodic tick (tick={}) buckets={} sizes={:?}",
+                    tick_ctr,
+                    sizes_vec.len(),
+                    sizes_vec
+                );
             }
 
             // Faster polling when any bucket is over the split threshold to avoid runaway growth.
@@ -367,7 +372,12 @@ fn main() -> anyhow::Result<()> {
                 .collect();
             big.sort_by_key(|(_, sz)| std::cmp::Reverse(*sz));
             for (bid, _) in big.into_iter().take(1) {
-                let _ = worker.enqueue_blocking(crate::rebalancer::RebalanceTask::Split(bid));
+                if let Err(e) = worker.enqueue_blocking(crate::rebalancer::RebalanceTask::Split(bid))
+                {
+                    log::warn!("rebalance: failed to enqueue split for {}: {:?}", bid, e);
+                } else {
+                    log::debug!("rebalance: enqueued split for bucket {}", bid);
+                }
             }
 
             // Merge smallest two buckets if they are under target/2, but only every N ticks.
