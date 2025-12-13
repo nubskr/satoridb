@@ -721,71 +721,51 @@ unsafe fn dot_i8_avx2(a: &[i8], b: &[i8]) -> f32 {
     enable = "avx512dq",
     enable = "fma"
 )]
+#[target_feature(enable = "avx512f,avx512bw")]
 unsafe fn dot_i8_avx512(a: &[i8], b: &[i8]) -> f32 {
     use std::arch::x86_64::*;
 
     let len = a.len().min(b.len());
-    let mut acc = _mm512_setzero_ps();
-    let mut i = 0;
-    // Process 64 bytes per iteration.
+    let mut i = 0usize;
+
+    // 16 lanes of i32
+    let mut acc32 = _mm512_setzero_si512();
+
     while i + 64 <= len {
-        let va = _mm512_loadu_si512(a.as_ptr().add(i) as *const __m512i);
-        let vb = _mm512_loadu_si512(b.as_ptr().add(i) as *const __m512i);
+        // load 2x32 bytes (because cvtepi8_epi16 takes __m256i)
+        let a0 = _mm256_loadu_si256(a.as_ptr().add(i) as *const __m256i);
+        let b0 = _mm256_loadu_si256(b.as_ptr().add(i) as *const __m256i);
+        let a1 = _mm256_loadu_si256(a.as_ptr().add(i + 32) as *const __m256i);
+        let b1 = _mm256_loadu_si256(b.as_ptr().add(i + 32) as *const __m256i);
 
-        // Lower 32 bytes.
-        let va_lo_bytes = _mm512_castsi512_si256(va);
-        let vb_lo_bytes = _mm512_castsi512_si256(vb);
-        let va_lo_16 = _mm512_cvtepi8_epi16(va_lo_bytes);
-        let vb_lo_16 = _mm512_cvtepi8_epi16(vb_lo_bytes);
+        let a0_16 = _mm512_cvtepi8_epi16(a0);
+        let b0_16 = _mm512_cvtepi8_epi16(b0);
+        let a1_16 = _mm512_cvtepi8_epi16(a1);
+        let b1_16 = _mm512_cvtepi8_epi16(b1);
 
-        // lower 16 lanes of lower half
-        let va_lo16_lo = _mm512_castsi512_si256(va_lo_16);
-        let vb_lo16_lo = _mm512_castsi512_si256(vb_lo_16);
-        let va_lo_lo_ps = _mm512_cvtepi32_ps(_mm512_cvtepi16_epi32(va_lo16_lo));
-        let vb_lo_lo_ps = _mm512_cvtepi32_ps(_mm512_cvtepi16_epi32(vb_lo16_lo));
-        let diff_lo_lo = _mm512_sub_ps(va_lo_lo_ps, vb_lo_lo_ps);
-        acc = _mm512_fmadd_ps(diff_lo_lo, diff_lo_lo, acc);
+        // (a0*b0)[0]+(a0*b0)[1] etc -> 16x i32 partial sums
+        let p0 = _mm512_madd_epi16(a0_16, b0_16);
+        let p1 = _mm512_madd_epi16(a1_16, b1_16);
 
-        // upper 16 lanes of lower half
-        let va_lo16_hi = _mm512_extracti64x4_epi64::<1>(va_lo_16);
-        let vb_lo16_hi = _mm512_extracti64x4_epi64::<1>(vb_lo_16);
-        let va_lo_hi_ps = _mm512_cvtepi32_ps(_mm512_cvtepi16_epi32(va_lo16_hi));
-        let vb_lo_hi_ps = _mm512_cvtepi32_ps(_mm512_cvtepi16_epi32(vb_lo16_hi));
-        acc = _mm512_fmadd_ps(va_lo_hi_ps, vb_lo_hi_ps, acc);
-
-        // Upper 32 bytes.
-        let va_hi_bytes = _mm512_extracti64x4_epi64::<1>(va);
-        let vb_hi_bytes = _mm512_extracti64x4_epi64::<1>(vb);
-        let va_hi_16 = _mm512_cvtepi8_epi16(va_hi_bytes);
-        let vb_hi_16 = _mm512_cvtepi8_epi16(vb_hi_bytes);
-
-        let va_hi16_lo = _mm512_castsi512_si256(va_hi_16);
-        let vb_hi16_lo = _mm512_castsi512_si256(vb_hi_16);
-        let va_hi_lo_ps = _mm512_cvtepi32_ps(_mm512_cvtepi16_epi32(va_hi16_lo));
-        let vb_hi_lo_ps = _mm512_cvtepi32_ps(_mm512_cvtepi16_epi32(vb_hi16_lo));
-        acc = _mm512_fmadd_ps(va_hi_lo_ps, vb_hi_lo_ps, acc);
-
-        let va_hi16_hi = _mm512_extracti64x4_epi64::<1>(va_hi_16);
-        let vb_hi16_hi = _mm512_extracti64x4_epi64::<1>(vb_hi_16);
-        let va_hi_hi_ps = _mm512_cvtepi32_ps(_mm512_cvtepi16_epi32(va_hi16_hi));
-        let vb_hi_hi_ps = _mm512_cvtepi32_ps(_mm512_cvtepi16_epi32(vb_hi16_hi));
-        acc = _mm512_fmadd_ps(va_hi_hi_ps, vb_hi_hi_ps, acc);
+        acc32 = _mm512_add_epi32(acc32, p0);
+        acc32 = _mm512_add_epi32(acc32, p1);
 
         i += 64;
     }
 
-    let mut tmp = [0f32; 16];
-    _mm512_storeu_ps(tmp.as_mut_ptr(), acc);
-    let mut total: f32 = tmp.iter().sum();
+    // horizontal reduce i32
+    let mut tmp = [0i32; 16];
+    _mm512_storeu_si512(tmp.as_mut_ptr() as *mut __m512i, acc32);
+    let mut total: i32 = tmp.iter().sum();
 
-    // Tail
     while i < len {
-        total += (a[i] as f32) * (b[i] as f32);
+        total += (a[i] as i32) * (b[i] as i32);
         i += 1;
     }
 
-    total
+    total as f32
 }
+
 
 #[derive(Default)]
 pub struct SearchScratch {
