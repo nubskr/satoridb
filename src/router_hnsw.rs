@@ -1,41 +1,48 @@
-#[cfg(feature = "packed_simd_2")]
-use packed_simd_2::f32x16;
 use rand::rngs::StdRng;
 use rand::{Rng, SeedableRng};
 use smallvec::SmallVec;
 use std::cmp::Ordering;
 use std::collections::BinaryHeap;
 
+type DotFn = unsafe fn(&[i8], &[i8]) -> i32;
+type CenterFn = unsafe fn(src: *const u8, dst: *mut i8, len: usize);
+
 /// Minimal hierarchical HNSW for routing centroids.
-/// Stores byte-quantized vectors and keeps up to `m0` neighbors on level 0 and
-/// `m` neighbors on upper layers. Distances are cosine over quantized bytes;
-/// we cache 1/norm per vector to avoid repeated normalization in the hot path.
+/// Stores centered i8 vectors in a contiguous slab and caches 1/norm per vector.
+/// Distances are cosine over centered i8: d = 1 - dot(a,b) * invnorm(a) * invnorm(b).
 pub struct HnswIndex {
     m: usize,
     m0: usize,
     ef_construction: usize,
     dim: usize,
     pad_dim: usize,
-    vectors: Vec<Vec<u8>>, // original quantized bytes (kept for compatibility)
-    traversal: Vec<Vec<i8>>, // centered i8 copy for fast dot/cosine
-    inv_norms: Vec<f32>,   // inv-norm for traversal (i8)
+
+    // Contiguous storage: traversal[id * pad_dim .. (id+1)*pad_dim]
+    traversal: Vec<i8>,
+    inv_norms: Vec<f32>,
     level_of: Vec<i32>,
     neighbors: Vec<Vec<SmallVec<[usize; 16]>>>,
+
     entry: Option<usize>,
     max_level: i32,
     rng: StdRng,
+
+    // Dispatch chosen once per index to avoid per-call CPUID branching.
+    dot_fn: DotFn,
+    center_fn: CenterFn,
+
     insert_scratch: SearchScratch,
 }
 
 impl HnswIndex {
     pub fn new(m: usize, ef_construction: usize) -> Self {
+        let (dot_fn, center_fn) = pick_kernels();
         Self {
             m: m.max(1),
             m0: (m * 2).max(2),
             ef_construction: ef_construction.max(1),
             dim: 0,
             pad_dim: 0,
-            vectors: Vec::new(),
             traversal: Vec::new(),
             inv_norms: Vec::new(),
             level_of: Vec::new(),
@@ -43,14 +50,18 @@ impl HnswIndex {
             entry: None,
             max_level: -1,
             rng: StdRng::seed_from_u64(0xBAD5_EED),
+            dot_fn,
+            center_fn,
             insert_scratch: SearchScratch::new(),
         }
     }
 
+    #[inline(always)]
     pub fn len(&self) -> usize {
-        self.vectors.len()
+        self.inv_norms.len()
     }
 
+    #[inline(always)]
     pub fn pad_dim(&self) -> usize {
         self.pad_dim
     }
@@ -66,22 +77,25 @@ impl HnswIndex {
         if self.dim == 0 || query.len() != self.pad_dim {
             return Vec::new();
         }
-        let mut q_i8 = Vec::with_capacity(query.len());
-        center_bytes_to_i8(query, &mut q_i8);
-        let q_inv = inv_norm_i8(&q_i8);
-        scratch.clear();
-        if scratch.capacity() < self.vectors.len() {
-            scratch.reserve(self.vectors.len() - scratch.capacity());
-        }
-        if self.vectors.is_empty() {
+        if self.len() == 0 {
             return Vec::new();
         }
 
-        for (id, v) in self.traversal.iter().enumerate() {
-            if v.is_empty() || v.len() != q_i8.len() {
+        let mut q_i8 = Vec::<i8>::new();
+        self.center_bytes_to_i8_vec(query, &mut q_i8);
+        let q_inv = self.inv_norm_i8(&q_i8);
+
+        scratch.clear();
+        if scratch.capacity() < self.len() {
+            scratch.reserve(self.len() - scratch.capacity());
+        }
+
+        for id in 0..self.len() {
+            let v = self.trav(id);
+            if v.len() != q_i8.len() {
                 continue;
             }
-            let d = cosine_i8(&q_i8, q_inv, v, self.inv_norms[id]);
+            let d = self.cosine_i8(&q_i8, q_inv, v, self.inv_norms[id]);
             scratch.push((d, id));
         }
 
@@ -111,11 +125,13 @@ impl HnswIndex {
         if self.entry.is_none() || self.dim == 0 || query.len() != self.pad_dim {
             return Vec::new();
         }
+
         let mut entry = self.entry.unwrap();
         let max_level = self.max_level;
+
         let mut q_buf = std::mem::take(&mut scratch.q_buf);
-        center_bytes_to_i8(query, &mut q_buf);
-        let q_inv = inv_norm_i8(&q_buf);
+        self.center_bytes_to_i8_vec(query, &mut q_buf);
+        let q_inv = self.inv_norm_i8(&q_buf);
         let q_slice: &[i8] = &q_buf;
 
         // Greedy descent on upper layers.
@@ -129,13 +145,12 @@ impl HnswIndex {
         let results = self.layer_search(q_slice, q_inv, entry, 0, ef_search, scratch);
         let mut res: Vec<_> = results.into_iter().take(top_k).collect();
         res.truncate(top_k);
-        // Return q_buf to scratch for reuse.
+
         scratch.q_buf = q_buf;
         res.into_iter().map(|h| h.id).collect()
     }
 
     pub fn search(&self, query: &[u8], top_k: usize, ef_search: usize) -> Vec<usize> {
-        // Fallback that allocates fresh scratch for callers that don't reuse buffers.
         let mut scratch = SearchScratch::new();
         self.search_with_scratch(query, top_k, ef_search, &mut scratch)
     }
@@ -145,28 +160,26 @@ impl HnswIndex {
             self.dim = vector.len();
             self.pad_dim = round_up_32(self.dim);
         } else if vector.len() != self.dim {
-            // Mismatched dimensions; skip insert.
             return;
         }
+
         let mut padded = vector;
         if padded.len() < self.pad_dim {
             padded.resize(self.pad_dim, 0);
         }
+
         let level = self.sample_level();
         self.ensure_node(id, level);
-        self.vectors[id] = padded.clone();
-        // Centered i8 traversal copy.
-        let mut trav: Vec<i8> = Vec::with_capacity(self.pad_dim);
-        trav.resize(self.pad_dim, 0);
-        for i in 0..self.pad_dim {
-            let b = padded[i] as i16 - 128;
-            trav[i] = b.clamp(-128, 127) as i8;
+
+        // Center into traversal slab: (u8 -> i8) is just xor 0x80.
+        {
+            let dst = self.trav_mut(id);
+            unsafe { (self.center_fn)(padded.as_ptr(), dst.as_mut_ptr(), self.pad_dim) };
         }
-        let inv = inv_norm_i8(&trav);
-        self.traversal[id] = trav;
+
+        let inv = self.inv_norm_i8(self.trav(id));
         self.inv_norms[id] = inv;
 
-        // First element short-circuits.
         if self.entry.is_none() {
             self.entry = Some(id);
             self.max_level = level;
@@ -182,59 +195,109 @@ impl HnswIndex {
 
         // Greedy descent until one level above the node's level.
         if prev_max > level {
+            let v_id = self.trav(id);
             for l in ((level + 1) as usize..=prev_max as usize).rev() {
-                entry = self.greedy_search_layer(&self.traversal[id], inv, entry, l as i32);
+                entry = self.greedy_search_layer(v_id, inv, entry, l as i32);
             }
         }
 
         // Connect on all levels down to 0.
+        let v_id = self.trav(id);
         for l in (0..=level as usize).rev() {
             let level_i32 = l as i32;
-            // Slightly wider beam on level 0; keep upper layers modest to save CPU.
             let beam = if level_i32 == 0 {
                 self.m_for_level(level_i32) * 3
             } else {
                 self.m_for_level(level_i32) * 2
             };
             let ef = self.ef_construction.max(beam);
-            // Reuse a shared scratch for inserts; move it out to satisfy the borrow checker.
+
             let mut scratch = std::mem::take(&mut self.insert_scratch);
-            let mut candidates =
-                self.layer_search(&self.traversal[id], inv, entry, level_i32, ef, &mut scratch);
+            let mut candidates = self.layer_search(v_id, inv, entry, level_i32, ef, &mut scratch);
             self.insert_scratch = scratch;
+
             let mut selected =
                 self.select_neighbors(&mut candidates, self.m_for_level(level_i32), true);
-            // Level 0 aggressive fallback: if too sparse, retry without diversity to fill degree.
             if level_i32 == 0 && selected.len() < self.m_for_level(level_i32) / 2 {
                 selected =
                     self.select_neighbors(&mut candidates, self.m_for_level(level_i32), false);
             }
             for &nbr in &selected {
-                self.connect_nodes(id, nbr as usize, level_i32);
+                self.connect_nodes(id, nbr, level_i32);
             }
             if let Some(&closest) = selected.first() {
-                entry = closest as usize;
+                entry = closest;
+            }
+        }
+    }
+
+    #[inline(always)]
+    fn trav(&self, id: usize) -> &[i8] {
+        let off = id * self.pad_dim;
+        &self.traversal[off..off + self.pad_dim]
+    }
+
+    #[inline(always)]
+    fn trav_mut(&mut self, id: usize) -> &mut [i8] {
+        let off = id * self.pad_dim;
+        &mut self.traversal[off..off + self.pad_dim]
+    }
+
+    #[inline(always)]
+    fn dot_i8(&self, a: &[i8], b: &[i8]) -> i32 {
+        unsafe { (self.dot_fn)(a, b) }
+    }
+
+    #[inline(always)]
+    fn inv_norm_i8(&self, v: &[i8]) -> f32 {
+        let sum = self.dot_i8(v, v) as f32;
+        if sum <= 0.0 {
+            0.0
+        } else {
+            1.0 / sum.sqrt()
+        }
+    }
+
+    #[inline(always)]
+    fn cosine_i8(&self, a: &[i8], a_inv_norm: f32, b: &[i8], b_inv_norm: f32) -> f32 {
+        if a_inv_norm == 0.0 || b_inv_norm == 0.0 {
+            return 1.0;
+        }
+        let dot = self.dot_i8(a, b) as f32;
+        1.0 - dot * a_inv_norm * b_inv_norm
+    }
+
+    #[inline(always)]
+    fn center_bytes_to_i8_vec(&self, src: &[u8], dst: &mut Vec<i8>) {
+        dst.resize(src.len(), 0);
+        unsafe { (self.center_fn)(src.as_ptr(), dst.as_mut_ptr(), src.len()) };
+    }
+
+    #[inline(always)]
+    fn prefetch_traversal(&self, id: usize) {
+        #[cfg(target_arch = "x86_64")]
+        unsafe {
+            use std::arch::x86_64::_mm_prefetch;
+            const HINT: i32 = std::arch::x86_64::_MM_HINT_T0;
+            let ptr = self.traversal.as_ptr().add(id * self.pad_dim);
+            _mm_prefetch(ptr as *const i8, HINT);
+            if self.pad_dim > 64 {
+                _mm_prefetch(ptr.add(64) as *const i8, HINT);
             }
         }
     }
 
     fn greedy_search_layer(&self, query: &[i8], q_inv: f32, entry: usize, level: i32) -> usize {
         let mut best = entry;
-        let mut best_dist = cosine_i8(query, q_inv, &self.traversal[best], self.inv_norms[best]);
+        let mut best_dist = self.cosine_i8(query, q_inv, self.trav(best), self.inv_norms[best]);
         loop {
             let mut improved = false;
             for &nbr in self.neighbors_at(best, level) {
-                let nbr_usize = nbr as usize;
-                prefetch_vector_bytes(&self.vectors[nbr_usize]);
-                let d = cosine_i8(
-                    query,
-                    q_inv,
-                    &self.traversal[nbr_usize],
-                    self.inv_norms[nbr_usize],
-                );
+                self.prefetch_traversal(nbr);
+                let d = self.cosine_i8(query, q_inv, self.trav(nbr), self.inv_norms[nbr]);
                 if d < best_dist {
                     best_dist = d;
-                    best = nbr_usize;
+                    best = nbr;
                     improved = true;
                 }
             }
@@ -254,13 +317,13 @@ impl HnswIndex {
         ef: usize,
         scratch: &mut SearchScratch,
     ) -> Vec<HeapItem> {
-        scratch.reset(self.vectors.len(), ef);
+        scratch.reset(self.len(), ef);
         let visited = &mut scratch.visited;
         let epoch = scratch.epoch;
         let candidates = &mut scratch.candidates;
         let results = &mut scratch.results;
 
-        let dist0 = cosine_i8(query, q_inv, &self.traversal[entry], self.inv_norms[entry]);
+        let dist0 = self.cosine_i8(query, q_inv, self.trav(entry), self.inv_norms[entry]);
         candidates.push(HeapItem::new(entry, dist0));
         results.push(HeapItem::new(entry, dist0));
         visited[entry] = epoch;
@@ -276,16 +339,17 @@ impl HnswIndex {
                     continue;
                 }
                 visited[nbr] = epoch;
-                prefetch_vector_bytes(&self.vectors[nbr]);
-                let d = cosine_i8(query, q_inv, &self.traversal[nbr], self.inv_norms[nbr]);
-                let item = HeapItem::new(nbr, d);
+
+                self.prefetch_traversal(nbr);
+                let d = self.cosine_i8(query, q_inv, self.trav(nbr), self.inv_norms[nbr]);
+
                 if results.len() < ef {
-                    results.push(item.clone());
-                    candidates.push(item);
+                    results.push(HeapItem::new(nbr, d));
+                    candidates.push(HeapItem::new(nbr, d));
                 } else if d < worst {
                     results.pop();
-                    results.push(item.clone());
-                    candidates.push(item);
+                    results.push(HeapItem::new(nbr, d));
+                    candidates.push(HeapItem::new(nbr, d));
                 }
             }
         }
@@ -295,15 +359,12 @@ impl HnswIndex {
         res
     }
 
-    fn select_neighbors(
-        &self,
-        candidates: &mut [HeapItem],
-        m: usize,
-        diversity: bool,
-    ) -> Vec<usize> {
-        // Redis-inspired heuristic: keep a diverse set; if we can't fill, fall back to closest.
+    fn select_neighbors(&self, candidates: &mut [HeapItem], m: usize, diversity: bool) -> Vec<usize> {
         candidates.sort_by(|a, b| a.dist.partial_cmp(&b.dist).unwrap_or(Ordering::Equal));
-        let mut accepted: Vec<usize> = Vec::with_capacity(m);
+
+        // Usually small (m ~ 8..64). Use a smallvec to avoid heap in the hot path.
+        let mut accepted: SmallVec<[usize; 32]> = SmallVec::new();
+        accepted.reserve(m);
 
         for cand in candidates.iter() {
             if accepted.len() >= m {
@@ -311,14 +372,10 @@ impl HnswIndex {
             }
             let mut keep = true;
             if diversity {
-                // Diversity check: accept if no already-accepted node is closer to cand than new node is.
+                let cand_v = self.trav(cand.id);
+                let cand_inv = self.inv_norms[cand.id];
                 for &acc in accepted.iter() {
-                    let d_acc = cosine_i8(
-                        &self.traversal[cand.id],
-                        self.inv_norms[cand.id],
-                        &self.traversal[acc],
-                        self.inv_norms[acc],
-                    );
+                    let d_acc = self.cosine_i8(cand_v, cand_inv, self.trav(acc), self.inv_norms[acc]);
                     if d_acc < cand.dist {
                         keep = false;
                         break;
@@ -330,26 +387,23 @@ impl HnswIndex {
             }
         }
 
-        // If we didn't fill, top up with closest remaining.
         if accepted.len() < m {
             for cand in candidates.iter() {
                 if accepted.len() >= m {
                     break;
                 }
-                // Linear contains is fine here; candidate list is small (ef scale).
-                if !accepted.contains(&cand.id) {
+                if !accepted.iter().any(|&x| x == cand.id) {
                     accepted.push(cand.id);
                 }
             }
         }
 
-        accepted
+        accepted.into_vec()
     }
 
     fn connect_nodes(&mut self, a: usize, b: usize, level: i32) {
         let inserted_ab = self.add_edge(a, b, level);
         let inserted_ba = self.add_edge(b, a, level);
-        // Keep symmetry: if only one side succeeded, drop the other side.
         if inserted_ab && !inserted_ba {
             self.remove_edge(a, b, level);
         } else if inserted_ba && !inserted_ab {
@@ -360,29 +414,28 @@ impl HnswIndex {
     fn add_edge(&mut self, src: usize, dst: usize, level: i32) -> bool {
         self.ensure_level(src, level);
         let cap = self.m_for_level(level);
-        let dist_new = cosine_i8(
-            &self.traversal[src],
+
+        let dist_new = self.cosine_i8(
+            self.trav(src),
             self.inv_norms[src],
-            &self.traversal[dst],
+            self.trav(dst),
             self.inv_norms[dst],
         );
-        // Immutable view to check duplicates and compute worst.
+
         {
             let list = &self.neighbors[src][level as usize];
             if list.contains(&dst) {
                 return true;
             }
-            if list.len() < cap {
-                // will push below
-            } else {
-                // Determine worst without mutating.
+            if list.len() >= cap {
                 let mut worst_idx = 0usize;
                 let mut worst_dist = dist_new;
+
                 for (i, &nid) in list.iter().enumerate() {
-                    let d = cosine_i8(
-                        &self.traversal[src],
+                    let d = self.cosine_i8(
+                        self.trav(src),
                         self.inv_norms[src],
-                        &self.traversal[nid],
+                        self.trav(nid),
                         self.inv_norms[nid],
                     );
                     if i == 0 || d > worst_dist {
@@ -390,9 +443,11 @@ impl HnswIndex {
                         worst_dist = d;
                     }
                 }
+
                 if dist_new >= worst_dist {
                     return false;
                 }
+
                 let victim = list[worst_idx];
                 let victim_deg = self
                     .neighbors
@@ -403,16 +458,15 @@ impl HnswIndex {
                 if victim_deg <= (cap / 4).max(1) {
                     return false;
                 }
+
                 let list_mut = &mut self.neighbors[src][level as usize];
                 list_mut[worst_idx] = dst;
-                let _ = list_mut;
                 self.remove_edge(victim, src, level);
                 return true;
             }
         }
-        // push path
-        let list = &mut self.neighbors[src][level as usize];
-        list.push(dst);
+
+        self.neighbors[src][level as usize].push(dst);
         true
     }
 
@@ -432,21 +486,10 @@ impl HnswIndex {
         if list.len() <= cap {
             return;
         }
-        let vec = std::mem::take(list);
-        let mut vec: SmallVec<[usize; 16]> = vec;
+        let mut vec: SmallVec<[usize; 16]> = std::mem::take(list);
         vec.sort_by(|&a, &b| {
-            let da = cosine_i8(
-                &self.traversal[id],
-                self.inv_norms[id],
-                &self.traversal[a],
-                self.inv_norms[a],
-            );
-            let db = cosine_i8(
-                &self.traversal[id],
-                self.inv_norms[id],
-                &self.traversal[b],
-                self.inv_norms[b],
-            );
+            let da = self.cosine_i8(self.trav(id), self.inv_norms[id], self.trav(a), self.inv_norms[a]);
+            let db = self.cosine_i8(self.trav(id), self.inv_norms[id], self.trav(b), self.inv_norms[b]);
             da.partial_cmp(&db).unwrap_or(Ordering::Equal)
         });
         vec.truncate(cap);
@@ -462,20 +505,13 @@ impl HnswIndex {
     }
 
     fn ensure_node(&mut self, id: usize, level: i32) {
-        if id >= self.vectors.len() {
-            let missing = id + 1 - self.vectors.len();
-            self.vectors.reserve(missing);
-            self.traversal.reserve(missing);
-            self.inv_norms.reserve(missing);
-            self.level_of.reserve(missing);
-            self.neighbors.reserve(missing);
-            while self.vectors.len() <= id {
-                self.vectors.push(Vec::new());
-                self.traversal.push(Vec::new());
-                self.inv_norms.push(0.0);
-                self.level_of.push(-1);
-                self.neighbors.push(Vec::new());
-            }
+        if id >= self.len() {
+            let new_n = id + 1;
+            self.inv_norms.resize(new_n, 0.0);
+            self.level_of.resize(new_n, -1);
+            self.neighbors.resize_with(new_n, Vec::new);
+            // traversal slab grows to new_n * pad_dim
+            self.traversal.resize(new_n * self.pad_dim, 0);
         }
         self.level_of[id] = level;
         self.ensure_level(id, level);
@@ -489,17 +525,11 @@ impl HnswIndex {
     }
 
     fn m_for_level(&self, level: i32) -> usize {
-        if level == 0 {
-            self.m0
-        } else {
-            self.m
-        }
+        if level == 0 { self.m0 } else { self.m }
     }
 
     fn sample_level(&mut self) -> i32 {
-        // Redis-like: geometric with p=0.25 and capped height to keep search shallow.
         const P: f32 = 0.25;
-        // Lower cap to reduce traversal work while keeping hierarchy depth reasonable.
         const MAX_LEVEL: i32 = 12;
         let mut level = 0;
         while self.rng.gen::<f32>() < P && level < MAX_LEVEL {
@@ -516,6 +546,7 @@ struct HeapItem {
 }
 
 impl HeapItem {
+    #[inline(always)]
     fn new(id: usize, dist: f32) -> Self {
         Self { id, dist }
     }
@@ -528,7 +559,6 @@ impl PartialEq for HeapItem {
 }
 impl Eq for HeapItem {}
 
-// Reverse ordering for min-heap behavior using BinaryHeap.
 impl PartialOrd for HeapItem {
     fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
         other.dist.partial_cmp(&self.dist)
@@ -540,232 +570,6 @@ impl Ord for HeapItem {
         self.partial_cmp(other).unwrap_or(Ordering::Equal)
     }
 }
-
-#[inline(always)]
-fn cosine_i8(a: &[i8], a_inv_norm: f32, b: &[i8], b_inv_norm: f32) -> f32 {
-    if a_inv_norm == 0.0 || b_inv_norm == 0.0 {
-        return 1.0;
-    }
-    #[cfg(target_arch = "x86_64")]
-    {
-        // Prefer AVX-512 when available, then AVX2, else scalar.
-        if std::arch::is_x86_feature_detected!("avx512f")
-            && std::arch::is_x86_feature_detected!("avx512bw")
-            && std::arch::is_x86_feature_detected!("avx512dq")
-        {
-            let dot = unsafe { dot_i8_avx512(a, b) };
-            return 1.0 - dot * a_inv_norm * b_inv_norm;
-        } else if std::arch::is_x86_feature_detected!("avx2") {
-            let dot = unsafe { dot_i8_avx2(a, b) };
-            return 1.0 - dot * a_inv_norm * b_inv_norm;
-        } else {
-            let dot = dot_i8_scalar(a, b);
-            return 1.0 - dot * a_inv_norm * b_inv_norm;
-        }
-    }
-    #[cfg(not(target_arch = "x86_64"))]
-    {
-        let dot = dot_i8_scalar(a, b);
-        return 1.0 - dot * a_inv_norm * b_inv_norm;
-    }
-}
-
-#[inline(always)]
-fn dot_i8_scalar(a: &[i8], b: &[i8]) -> f32 {
-    let len = a.len().min(b.len());
-    let mut sum0 = 0f32;
-    let mut sum1 = 0f32;
-    let mut i = 0;
-    while i + 8 <= len {
-        sum0 += (a[i] as f32) * (b[i] as f32);
-        sum0 += (a[i + 1] as f32) * (b[i + 1] as f32);
-        sum0 += (a[i + 2] as f32) * (b[i + 2] as f32);
-        sum0 += (a[i + 3] as f32) * (b[i + 3] as f32);
-        sum1 += (a[i + 4] as f32) * (b[i + 4] as f32);
-        sum1 += (a[i + 5] as f32) * (b[i + 5] as f32);
-        sum1 += (a[i + 6] as f32) * (b[i + 6] as f32);
-        sum1 += (a[i + 7] as f32) * (b[i + 7] as f32);
-        i += 8;
-    }
-    while i < len {
-        sum0 += (a[i] as f32) * (b[i] as f32);
-        i += 1;
-    }
-    sum0 + sum1
-}
-
-#[inline(always)]
-fn inv_norm_i8(v: &[i8]) -> f32 {
-    let mut sum = 0f32;
-    let mut i = 0;
-    let len = v.len();
-    while i + 8 <= len {
-        sum += (v[i] as f32) * (v[i] as f32);
-        sum += (v[i + 1] as f32) * (v[i + 1] as f32);
-        sum += (v[i + 2] as f32) * (v[i + 2] as f32);
-        sum += (v[i + 3] as f32) * (v[i + 3] as f32);
-        sum += (v[i + 4] as f32) * (v[i + 4] as f32);
-        sum += (v[i + 5] as f32) * (v[i + 5] as f32);
-        sum += (v[i + 6] as f32) * (v[i + 6] as f32);
-        sum += (v[i + 7] as f32) * (v[i + 7] as f32);
-        i += 8;
-    }
-    while i < len {
-        sum += (v[i] as f32) * (v[i] as f32);
-        i += 1;
-    }
-    if sum <= 0.0 {
-        0.0
-    } else {
-        1.0 / sum.sqrt()
-    }
-}
-
-#[inline(always)]
-fn round_up_32(v: usize) -> usize {
-    (v + 31) & !31
-}
-
-#[inline(always)]
-fn prefetch_vector_bytes(v: &[u8]) {
-    #[cfg(target_arch = "x86_64")]
-    unsafe {
-        use std::arch::x86_64::_mm_prefetch;
-        const HINT: i32 = std::arch::x86_64::_MM_HINT_T0;
-        let ptr = v.as_ptr();
-        // Prefetch first cache line; vectors are small-ish (centroids).
-        _mm_prefetch(ptr as *const i8, HINT);
-        if v.len() > 64 {
-            _mm_prefetch(ptr.add(64) as *const i8, HINT);
-        }
-    }
-}
-
-#[inline(always)]
-fn center_bytes_to_i8(src: &[u8], dst: &mut Vec<i8>) {
-    dst.clear();
-    dst.resize(src.len(), 0);
-    for i in 0..src.len() {
-        let v = src[i] as i16 - 128;
-        dst[i] = v.clamp(-128, 127) as i8;
-    }
-}
-
-#[cfg(target_arch = "x86_64")]
-#[target_feature(enable = "avx2", enable = "fma")]
-unsafe fn dot_i8_avx2(a: &[i8], b: &[i8]) -> f32 {
-    use std::arch::x86_64::*;
-
-    let len = a.len().min(b.len());
-    let mut acc = _mm256_setzero_ps();
-    let mut i = 0;
-    // Process 32 bytes per iteration.
-    while i + 32 <= len {
-        let va = _mm256_loadu_si256(a.as_ptr().add(i) as *const __m256i);
-        let vb = _mm256_loadu_si256(b.as_ptr().add(i) as *const __m256i);
-
-        // Unpack to 16-bit lanes and process all bytes.
-        let va16_lo = _mm256_cvtepi8_epi16(_mm256_extracti128_si256::<0>(va));
-        let vb16_lo = _mm256_cvtepi8_epi16(_mm256_extracti128_si256::<0>(vb));
-        let va16_hi = _mm256_cvtepi8_epi16(_mm256_extracti128_si256::<1>(va));
-        let vb16_hi = _mm256_cvtepi8_epi16(_mm256_extracti128_si256::<1>(vb));
-
-        // Lower 8 lanes of lower half.
-        let va_lo_lo = _mm256_castsi256_si128(va16_lo);
-        let vb_lo_lo = _mm256_castsi256_si128(vb16_lo);
-        let va_lo_lo_ps = _mm256_cvtepi32_ps(_mm256_cvtepi16_epi32(va_lo_lo));
-        let vb_lo_lo_ps = _mm256_cvtepi32_ps(_mm256_cvtepi16_epi32(vb_lo_lo));
-        acc = _mm256_fmadd_ps(va_lo_lo_ps, vb_lo_lo_ps, acc);
-
-        // Upper 8 lanes of lower half.
-        let va_lo_hi = _mm256_extracti128_si256::<1>(va16_lo);
-        let vb_lo_hi = _mm256_extracti128_si256::<1>(vb16_lo);
-        let va_lo_hi_ps = _mm256_cvtepi32_ps(_mm256_cvtepi16_epi32(va_lo_hi));
-        let vb_lo_hi_ps = _mm256_cvtepi32_ps(_mm256_cvtepi16_epi32(vb_lo_hi));
-        acc = _mm256_fmadd_ps(va_lo_hi_ps, vb_lo_hi_ps, acc);
-
-        // Lower 8 lanes of upper half.
-        let va_hi_lo = _mm256_castsi256_si128(va16_hi);
-        let vb_hi_lo = _mm256_castsi256_si128(vb16_hi);
-        let va_hi_lo_ps = _mm256_cvtepi32_ps(_mm256_cvtepi16_epi32(va_hi_lo));
-        let vb_hi_lo_ps = _mm256_cvtepi32_ps(_mm256_cvtepi16_epi32(vb_hi_lo));
-        acc = _mm256_fmadd_ps(va_hi_lo_ps, vb_hi_lo_ps, acc);
-
-        // Upper 8 lanes of upper half.
-        let va_hi_hi = _mm256_extracti128_si256::<1>(va16_hi);
-        let vb_hi_hi = _mm256_extracti128_si256::<1>(vb16_hi);
-        let va_hi_hi_ps = _mm256_cvtepi32_ps(_mm256_cvtepi16_epi32(va_hi_hi));
-        let vb_hi_hi_ps = _mm256_cvtepi32_ps(_mm256_cvtepi16_epi32(vb_hi_hi));
-        acc = _mm256_fmadd_ps(va_hi_hi_ps, vb_hi_hi_ps, acc);
-
-        i += 32;
-    }
-
-    let mut tmp = [0f32; 8];
-    _mm256_storeu_ps(tmp.as_mut_ptr(), acc);
-    let mut total = tmp.iter().sum::<f32>();
-
-    // Tail process scalars.
-    while i < len {
-        total += (a[i] as f32) * (b[i] as f32);
-        i += 1;
-    }
-
-    total
-}
-
-#[cfg(target_arch = "x86_64")]
-#[target_feature(
-    enable = "avx512f",
-    enable = "avx512bw",
-    enable = "avx512dq",
-    enable = "fma"
-)]
-#[target_feature(enable = "avx512f,avx512bw")]
-unsafe fn dot_i8_avx512(a: &[i8], b: &[i8]) -> f32 {
-    use std::arch::x86_64::*;
-
-    let len = a.len().min(b.len());
-    let mut i = 0usize;
-
-    // 16 lanes of i32
-    let mut acc32 = _mm512_setzero_si512();
-
-    while i + 64 <= len {
-        // load 2x32 bytes (because cvtepi8_epi16 takes __m256i)
-        let a0 = _mm256_loadu_si256(a.as_ptr().add(i) as *const __m256i);
-        let b0 = _mm256_loadu_si256(b.as_ptr().add(i) as *const __m256i);
-        let a1 = _mm256_loadu_si256(a.as_ptr().add(i + 32) as *const __m256i);
-        let b1 = _mm256_loadu_si256(b.as_ptr().add(i + 32) as *const __m256i);
-
-        let a0_16 = _mm512_cvtepi8_epi16(a0);
-        let b0_16 = _mm512_cvtepi8_epi16(b0);
-        let a1_16 = _mm512_cvtepi8_epi16(a1);
-        let b1_16 = _mm512_cvtepi8_epi16(b1);
-
-        // (a0*b0)[0]+(a0*b0)[1] etc -> 16x i32 partial sums
-        let p0 = _mm512_madd_epi16(a0_16, b0_16);
-        let p1 = _mm512_madd_epi16(a1_16, b1_16);
-
-        acc32 = _mm512_add_epi32(acc32, p0);
-        acc32 = _mm512_add_epi32(acc32, p1);
-
-        i += 64;
-    }
-
-    // horizontal reduce i32
-    let mut tmp = [0i32; 16];
-    _mm512_storeu_si512(tmp.as_mut_ptr() as *mut __m512i, acc32);
-    let mut total: i32 = tmp.iter().sum();
-
-    while i < len {
-        total += (a[i] as i32) * (b[i] as i32);
-        i += 1;
-    }
-
-    total as f32
-}
-
 
 #[derive(Default)]
 pub struct SearchScratch {
@@ -788,17 +592,14 @@ impl SearchScratch {
     }
 
     fn reset(&mut self, n: usize, reserve: usize) {
-        // Bump epoch instead of clearing the whole visited array.
         self.epoch = self.epoch.wrapping_add(1);
         if self.epoch == 0 {
-            // Wrapped; reset the whole array.
             self.epoch = 1;
             self.visited.iter_mut().for_each(|v| *v = 0);
         }
         if self.visited.len() < n {
             self.visited.resize(n, 0);
         }
-        // Pre-reserve heaps to avoid per-query growth.
         if self.candidates.capacity() < reserve {
             self.candidates
                 .reserve(reserve.saturating_sub(self.candidates.capacity()));
@@ -809,6 +610,209 @@ impl SearchScratch {
         }
         self.candidates.clear();
         self.results.clear();
+    }
+}
+
+#[inline(always)]
+fn round_up_32(v: usize) -> usize {
+    (v + 31) & !31
+}
+
+fn pick_kernels() -> (DotFn, CenterFn) {
+    // Defaults
+    let mut dot: DotFn = dot_i8_scalar_i32;
+    let mut center: CenterFn = center_bytes_scalar_xor_0x80;
+
+    #[cfg(target_arch = "x86_64")]
+    unsafe {
+        // Note: do NOT require avx512dq/fma; kernels below only need bw/f for the chosen path.
+        if std::arch::is_x86_feature_detected!("avx512f")
+            && std::arch::is_x86_feature_detected!("avx512bw")
+        {
+            dot = dot_i8_avx512_i32;
+            // centering via AVX-512 is fine but AVX2 is also fine; prefer AVX-512 when present.
+            center = center_bytes_avx512_xor_0x80;
+            return (dot, center);
+        }
+        if std::arch::is_x86_feature_detected!("avx2") {
+            dot = dot_i8_avx2_i32;
+            center = center_bytes_avx2_xor_0x80;
+            return (dot, center);
+        }
+        if std::arch::is_x86_feature_detected!("sse2") {
+            center = center_bytes_sse2_xor_0x80;
+        }
+    }
+
+    (dot, center)
+}
+
+#[inline(always)]
+unsafe fn dot_i8_scalar_i32(a: &[i8], b: &[i8]) -> i32 {
+    let len = a.len().min(b.len());
+    let mut sum: i32 = 0;
+    let mut i = 0usize;
+    while i + 8 <= len {
+        sum += (a[i] as i32) * (b[i] as i32);
+        sum += (a[i + 1] as i32) * (b[i + 1] as i32);
+        sum += (a[i + 2] as i32) * (b[i + 2] as i32);
+        sum += (a[i + 3] as i32) * (b[i + 3] as i32);
+        sum += (a[i + 4] as i32) * (b[i + 4] as i32);
+        sum += (a[i + 5] as i32) * (b[i + 5] as i32);
+        sum += (a[i + 6] as i32) * (b[i + 6] as i32);
+        sum += (a[i + 7] as i32) * (b[i + 7] as i32);
+        i += 8;
+    }
+    while i < len {
+        sum += (a[i] as i32) * (b[i] as i32);
+        i += 1;
+    }
+    sum
+}
+
+#[inline(always)]
+unsafe fn center_bytes_scalar_xor_0x80(src: *const u8, dst: *mut i8, len: usize) {
+    let s = std::slice::from_raw_parts(src, len);
+    let d = std::slice::from_raw_parts_mut(dst, len);
+    for i in 0..len {
+        d[i] = (s[i] ^ 0x80) as i8;
+    }
+}
+
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2")]
+unsafe fn dot_i8_avx2_i32(a: &[i8], b: &[i8]) -> i32 {
+    use std::arch::x86_64::*;
+
+    let len = a.len().min(b.len());
+    let mut i = 0usize;
+
+    let mut acc32 = _mm256_setzero_si256();
+
+    while i + 32 <= len {
+        let va = _mm256_loadu_si256(a.as_ptr().add(i) as *const __m256i);
+        let vb = _mm256_loadu_si256(b.as_ptr().add(i) as *const __m256i);
+
+        let va_lo = _mm256_cvtepi8_epi16(_mm256_castsi256_si128(va));
+        let vb_lo = _mm256_cvtepi8_epi16(_mm256_castsi256_si128(vb));
+        let va_hi = _mm256_cvtepi8_epi16(_mm256_extracti128_si256::<1>(va));
+        let vb_hi = _mm256_cvtepi8_epi16(_mm256_extracti128_si256::<1>(vb));
+
+        let p0 = _mm256_madd_epi16(va_lo, vb_lo);
+        let p1 = _mm256_madd_epi16(va_hi, vb_hi);
+
+        acc32 = _mm256_add_epi32(acc32, p0);
+        acc32 = _mm256_add_epi32(acc32, p1);
+
+        i += 32;
+    }
+
+    let mut tmp = [0i32; 8];
+    _mm256_storeu_si256(tmp.as_mut_ptr() as *mut __m256i, acc32);
+    let mut total: i32 = tmp.iter().sum();
+
+    while i < len {
+        total += (a[i] as i32) * (b[i] as i32);
+        i += 1;
+    }
+
+    total
+}
+
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx512f,avx512bw")]
+unsafe fn dot_i8_avx512_i32(a: &[i8], b: &[i8]) -> i32 {
+    use std::arch::x86_64::*;
+
+    let len = a.len().min(b.len());
+    let mut i = 0usize;
+
+    let mut acc32 = _mm512_setzero_si512();
+
+    while i + 64 <= len {
+        // cvtepi8_epi16 takes __m256i, so do 2x32B.
+        let a0 = _mm256_loadu_si256(a.as_ptr().add(i) as *const __m256i);
+        let b0 = _mm256_loadu_si256(b.as_ptr().add(i) as *const __m256i);
+        let a1 = _mm256_loadu_si256(a.as_ptr().add(i + 32) as *const __m256i);
+        let b1 = _mm256_loadu_si256(b.as_ptr().add(i + 32) as *const __m256i);
+
+        let a0_16 = _mm512_cvtepi8_epi16(a0);
+        let b0_16 = _mm512_cvtepi8_epi16(b0);
+        let a1_16 = _mm512_cvtepi8_epi16(a1);
+        let b1_16 = _mm512_cvtepi8_epi16(b1);
+
+        let p0 = _mm512_madd_epi16(a0_16, b0_16);
+        let p1 = _mm512_madd_epi16(a1_16, b1_16);
+
+        acc32 = _mm512_add_epi32(acc32, p0);
+        acc32 = _mm512_add_epi32(acc32, p1);
+
+        i += 64;
+    }
+
+    let mut tmp = [0i32; 16];
+    _mm512_storeu_si512(tmp.as_mut_ptr() as *mut __m512i, acc32);
+    let mut total: i32 = tmp.iter().sum();
+
+    while i < len {
+        total += (a[i] as i32) * (b[i] as i32);
+        i += 1;
+    }
+
+    total
+}
+
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2")]
+unsafe fn center_bytes_avx2_xor_0x80(src: *const u8, dst: *mut i8, len: usize) {
+    use std::arch::x86_64::*;
+    let mut i = 0usize;
+    let mask = _mm256_set1_epi8(0x80u8 as i8);
+    while i + 32 <= len {
+        let v = _mm256_loadu_si256(src.add(i) as *const __m256i);
+        let x = _mm256_xor_si256(v, mask);
+        _mm256_storeu_si256(dst.add(i) as *mut __m256i, x);
+        i += 32;
+    }
+    while i < len {
+        *dst.add(i) = (*src.add(i) ^ 0x80) as i8;
+        i += 1;
+    }
+}
+
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx512f,avx512bw")]
+unsafe fn center_bytes_avx512_xor_0x80(src: *const u8, dst: *mut i8, len: usize) {
+    use std::arch::x86_64::*;
+    let mut i = 0usize;
+    let mask = _mm512_set1_epi8(0x80u8 as i8);
+    while i + 64 <= len {
+        let v = _mm512_loadu_si512(src.add(i) as *const _);
+        let x = _mm512_xor_si512(v, mask);
+        _mm512_storeu_si512(dst.add(i) as *mut _, x);
+        i += 64;
+    }
+    while i < len {
+        *dst.add(i) = (*src.add(i) ^ 0x80) as i8;
+        i += 1;
+    }
+}
+
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "sse2")]
+unsafe fn center_bytes_sse2_xor_0x80(src: *const u8, dst: *mut i8, len: usize) {
+    use std::arch::x86_64::*;
+    let mut i = 0usize;
+    let mask = _mm_set1_epi8(0x80u8 as i8);
+    while i + 16 <= len {
+        let v = _mm_loadu_si128(src.add(i) as *const __m128i);
+        let x = _mm_xor_si128(v, mask);
+        _mm_storeu_si128(dst.add(i) as *mut __m128i, x);
+        i += 16;
+    }
+    while i < len {
+        *dst.add(i) = (*src.add(i) ^ 0x80) as i8;
+        i += 1;
     }
 }
 
@@ -829,10 +833,11 @@ mod tests {
     }
 
     #[test]
-    fn centers_bytes_to_i8() {
+    fn centers_bytes_to_i8_xor() {
         let src = vec![0u8, 128, 255];
-        let mut dst = Vec::new();
-        center_bytes_to_i8(&src, &mut dst);
+        let (.., center_fn) = super::pick_kernels();
+        let mut dst = vec![0i8; src.len()];
+        unsafe { (center_fn)(src.as_ptr(), dst.as_mut_ptr(), src.len()) };
         assert_eq!(dst, vec![-128, 0, 127]);
     }
 
@@ -859,7 +864,6 @@ mod tests {
     fn search_returns_empty_on_dim_mismatch() {
         let mut hnsw = HnswIndex::new(4, 8);
         hnsw.insert(0, vec![1u8, 2, 3, 4]);
-        // Query is too short, so search should bail out.
         let res = hnsw.search(&[0u8; 4], 1, 8);
         assert!(res.is_empty());
     }
