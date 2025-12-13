@@ -17,6 +17,9 @@ pub struct HnswIndex {
     dim: usize,
     pad_dim: usize,
 
+    // Optional: keep original padded u8 vectors for compatibility / debugging.
+    vectors: Vec<Vec<u8>>,
+
     // Contiguous storage: traversal[id * pad_dim .. (id+1)*pad_dim]
     traversal: Vec<i8>,
     inv_norms: Vec<f32>,
@@ -43,15 +46,20 @@ impl HnswIndex {
             ef_construction: ef_construction.max(1),
             dim: 0,
             pad_dim: 0,
+
+            vectors: Vec::new(),
             traversal: Vec::new(),
             inv_norms: Vec::new(),
             level_of: Vec::new(),
             neighbors: Vec::new(),
+
             entry: None,
             max_level: -1,
             rng: StdRng::seed_from_u64(0xBAD5_EED),
+
             dot_fn,
             center_fn,
+
             insert_scratch: SearchScratch::new(),
         }
     }
@@ -74,10 +82,7 @@ impl HnswIndex {
         top_k: usize,
         scratch: &mut Vec<(f32, usize)>,
     ) -> Vec<usize> {
-        if self.dim == 0 || query.len() != self.pad_dim {
-            return Vec::new();
-        }
-        if self.len() == 0 {
+        if self.dim == 0 || query.len() != self.pad_dim || self.len() == 0 {
             return Vec::new();
         }
 
@@ -92,9 +97,6 @@ impl HnswIndex {
 
         for id in 0..self.len() {
             let v = self.trav(id);
-            if v.len() != q_i8.len() {
-                continue;
-            }
             let d = self.cosine_i8(&q_i8, q_inv, v, self.inv_norms[id]);
             scratch.push((d, id));
         }
@@ -141,7 +143,7 @@ impl HnswIndex {
             }
         }
 
-        // Layer 0: best-first search with a wider ef_search beam.
+        // Layer 0: best-first search with ef_search beam.
         let results = self.layer_search(q_slice, q_inv, entry, 0, ef_search, scratch);
         let mut res: Vec<_> = results.into_iter().take(top_k).collect();
         res.truncate(top_k);
@@ -171,15 +173,21 @@ impl HnswIndex {
         let level = self.sample_level();
         self.ensure_node(id, level);
 
-        // Center into traversal slab: (u8 -> i8) is just xor 0x80.
-        {
-            let dst = self.trav_mut(id);
-            unsafe { (self.center_fn)(padded.as_ptr(), dst.as_mut_ptr(), self.pad_dim) };
-        }
+        // Keep original padded bytes if you need them.
+        self.vectors[id] = padded.clone();
 
+        // Center into traversal slab using a raw pointer (avoids borrow conflicts).
+        let pad = self.pad_dim;
+        let center_fn = self.center_fn;
+        let src_ptr = padded.as_ptr();
+        let dst_ptr = unsafe { self.traversal.as_mut_ptr().add(id * pad) };
+        unsafe { (center_fn)(src_ptr, dst_ptr, pad) };
+
+        // Compute inv-norm from centered traversal slice.
         let inv = self.inv_norm_i8(self.trav(id));
         self.inv_norms[id] = inv;
 
+        // First element short-circuits.
         if self.entry.is_none() {
             self.entry = Some(id);
             self.max_level = level;
@@ -193,16 +201,19 @@ impl HnswIndex {
             self.entry = Some(id);
         }
 
+        // Use a raw slice for the inserted vector so we can mutably borrow self elsewhere.
+        let v_ptr = unsafe { self.traversal.as_ptr().add(id * self.pad_dim) };
+        let v_len = self.pad_dim;
+
         // Greedy descent until one level above the node's level.
         if prev_max > level {
-            let v_id = self.trav(id);
             for l in ((level + 1) as usize..=prev_max as usize).rev() {
+                let v_id = unsafe { std::slice::from_raw_parts(v_ptr, v_len) };
                 entry = self.greedy_search_layer(v_id, inv, entry, l as i32);
             }
         }
 
         // Connect on all levels down to 0.
-        let v_id = self.trav(id);
         for l in (0..=level as usize).rev() {
             let level_i32 = l as i32;
             let beam = if level_i32 == 0 {
@@ -212,7 +223,9 @@ impl HnswIndex {
             };
             let ef = self.ef_construction.max(beam);
 
+            // Move scratch out, do the search, move it back (no lingering borrows).
             let mut scratch = std::mem::take(&mut self.insert_scratch);
+            let v_id = unsafe { std::slice::from_raw_parts(v_ptr, v_len) };
             let mut candidates = self.layer_search(v_id, inv, entry, level_i32, ef, &mut scratch);
             self.insert_scratch = scratch;
 
@@ -222,6 +235,7 @@ impl HnswIndex {
                 selected =
                     self.select_neighbors(&mut candidates, self.m_for_level(level_i32), false);
             }
+
             for &nbr in &selected {
                 self.connect_nodes(id, nbr, level_i32);
             }
@@ -235,12 +249,6 @@ impl HnswIndex {
     fn trav(&self, id: usize) -> &[i8] {
         let off = id * self.pad_dim;
         &self.traversal[off..off + self.pad_dim]
-    }
-
-    #[inline(always)]
-    fn trav_mut(&mut self, id: usize) -> &mut [i8] {
-        let off = id * self.pad_dim;
-        &mut self.traversal[off..off + self.pad_dim]
     }
 
     #[inline(always)]
@@ -362,7 +370,6 @@ impl HnswIndex {
     fn select_neighbors(&self, candidates: &mut [HeapItem], m: usize, diversity: bool) -> Vec<usize> {
         candidates.sort_by(|a, b| a.dist.partial_cmp(&b.dist).unwrap_or(Ordering::Equal));
 
-        // Usually small (m ~ 8..64). Use a smallvec to avoid heap in the hot path.
         let mut accepted: SmallVec<[usize; 32]> = SmallVec::new();
         accepted.reserve(m);
 
@@ -459,8 +466,10 @@ impl HnswIndex {
                     return false;
                 }
 
-                let list_mut = &mut self.neighbors[src][level as usize];
-                list_mut[worst_idx] = dst;
+                {
+                    let list_mut = &mut self.neighbors[src][level as usize];
+                    list_mut[worst_idx] = dst;
+                }
                 self.remove_edge(victim, src, level);
                 return true;
             }
@@ -482,18 +491,19 @@ impl HnswIndex {
 
     fn trim_neighbors(&mut self, id: usize, level: i32) {
         let cap = self.m_for_level(level);
-        let list = &mut self.neighbors[id][level as usize];
-        if list.len() <= cap {
+        if self.neighbors[id][level as usize].len() <= cap {
             return;
         }
-        let mut vec: SmallVec<[usize; 16]> = std::mem::take(list);
+
+        // Take out, sort without holding a mutable borrow of self.neighbors, then put back.
+        let mut vec: SmallVec<[usize; 16]> = std::mem::take(&mut self.neighbors[id][level as usize]);
         vec.sort_by(|&a, &b| {
             let da = self.cosine_i8(self.trav(id), self.inv_norms[id], self.trav(a), self.inv_norms[a]);
             let db = self.cosine_i8(self.trav(id), self.inv_norms[id], self.trav(b), self.inv_norms[b]);
             da.partial_cmp(&db).unwrap_or(Ordering::Equal)
         });
         vec.truncate(cap);
-        *list = vec;
+        self.neighbors[id][level as usize] = vec;
     }
 
     fn neighbors_at(&self, id: usize, level: i32) -> &[usize] {
@@ -507,9 +517,11 @@ impl HnswIndex {
     fn ensure_node(&mut self, id: usize, level: i32) {
         if id >= self.len() {
             let new_n = id + 1;
+            self.vectors.resize_with(new_n, Vec::new);
             self.inv_norms.resize(new_n, 0.0);
             self.level_of.resize(new_n, -1);
             self.neighbors.resize_with(new_n, Vec::new);
+
             // traversal slab grows to new_n * pad_dim
             self.traversal.resize(new_n * self.pad_dim, 0);
         }
@@ -539,7 +551,7 @@ impl HnswIndex {
     }
 }
 
-#[derive(Clone)]
+#[derive(Clone, Copy)]
 struct HeapItem {
     id: usize,
     dist: f32,
@@ -625,12 +637,10 @@ fn pick_kernels() -> (DotFn, CenterFn) {
 
     #[cfg(target_arch = "x86_64")]
     unsafe {
-        // Note: do NOT require avx512dq/fma; kernels below only need bw/f for the chosen path.
         if std::arch::is_x86_feature_detected!("avx512f")
             && std::arch::is_x86_feature_detected!("avx512bw")
         {
             dot = dot_i8_avx512_i32;
-            // centering via AVX-512 is fine but AVX2 is also fine; prefer AVX-512 when present.
             center = center_bytes_avx512_xor_0x80;
             return (dot, center);
         }
@@ -730,7 +740,6 @@ unsafe fn dot_i8_avx512_i32(a: &[i8], b: &[i8]) -> i32 {
     let mut acc32 = _mm512_setzero_si512();
 
     while i + 64 <= len {
-        // cvtepi8_epi16 takes __m256i, so do 2x32B.
         let a0 = _mm256_loadu_si256(a.as_ptr().add(i) as *const __m256i);
         let b0 = _mm256_loadu_si256(b.as_ptr().add(i) as *const __m256i);
         let a1 = _mm256_loadu_si256(a.as_ptr().add(i + 32) as *const __m256i);
@@ -787,9 +796,9 @@ unsafe fn center_bytes_avx512_xor_0x80(src: *const u8, dst: *mut i8, len: usize)
     let mut i = 0usize;
     let mask = _mm512_set1_epi8(0x80u8 as i8);
     while i + 64 <= len {
-        let v = _mm512_loadu_si512(src.add(i) as *const _);
+        let v = _mm512_loadu_si512(src.add(i) as *const __m512i);
         let x = _mm512_xor_si512(v, mask);
-        _mm512_storeu_si512(dst.add(i) as *mut _, x);
+        _mm512_storeu_si512(dst.add(i) as *mut __m512i, x);
         i += 64;
     }
     while i < len {
@@ -835,7 +844,7 @@ mod tests {
     #[test]
     fn centers_bytes_to_i8_xor() {
         let src = vec![0u8, 128, 255];
-        let (.., center_fn) = super::pick_kernels();
+        let (_, center_fn) = super::pick_kernels();
         let mut dst = vec![0i8; src.len()];
         unsafe { (center_fn)(src.as_ptr(), dst.as_mut_ptr(), src.len()) };
         assert_eq!(dst, vec![-128, 0, 127]);
@@ -868,3 +877,4 @@ mod tests {
         assert!(res.is_empty());
     }
 }
+
