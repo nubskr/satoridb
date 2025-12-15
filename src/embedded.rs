@@ -12,12 +12,16 @@ use std::sync::Arc;
 use std::thread;
 
 pub struct SatoriDbConfig {
+    /// WAL implementation used for durable storage.
     pub wal: Arc<Walrus>,
+    /// Number of worker shards (each shard runs on its own Glommio executor thread).
     pub workers: usize,
+    /// Virtual nodes used by the consistent hash ring for bucket->shard mapping.
     pub virtual_nodes: usize,
 }
 
 impl SatoriDbConfig {
+    /// Create a config with sane defaults.
     pub fn new(wal: Arc<Walrus>) -> Self {
         Self {
             wal,
@@ -27,6 +31,7 @@ impl SatoriDbConfig {
     }
 }
 
+/// An embedded `satoridb` instance (router manager + worker shards).
 pub struct SatoriDb {
     api: SatoriHandle,
     router_tx: crossbeam_channel::Sender<RouterCommand>,
@@ -36,6 +41,11 @@ pub struct SatoriDb {
 }
 
 impl SatoriDb {
+    /// Start a new embedded database instance.
+    ///
+    /// This spawns:
+    /// - 1 router manager thread
+    /// - `cfg.workers` worker threads (each running a Glommio local executor)
     pub fn start(cfg: SatoriDbConfig) -> Result<Self> {
         if cfg.workers == 0 {
             return Err(anyhow!("workers must be > 0"));
@@ -86,10 +96,12 @@ impl SatoriDb {
         })
     }
 
+    /// Get a cloneable handle for queries and upserts.
     pub fn handle(&self) -> SatoriHandle {
         self.api.clone()
     }
 
+    /// Flush state (best-effort) and shut down router/workers.
     pub fn shutdown(self) -> Result<()> {
         // Best-effort: persist a router snapshot so startup can skip replaying the full update log.
         let (flush_tx, flush_rx) = oneshot::channel();

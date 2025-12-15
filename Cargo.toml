@@ -2,6 +2,26 @@
 name = "satoridb"
 version = "0.1.0"
 edition = "2021"
+description = "Embedded vector database for approximate nearest neighbor search (experimental)."
+readme = "README.md"
+repository = "https://github.com/satoridb/satoridb"
+homepage = "https://github.com/satoridb/satoridb"
+documentation = "https://docs.rs/satoridb"
+license = "UNLICENSED"
+keywords = ["vector", "ann", "hnsw", "embedding", "database"]
+categories = ["database", "algorithms", "data-structures"]
+exclude = [
+    "target/**",
+    "wal_files/**",
+    ".github/**",
+    "**/*.bin",
+    "**/*.bvecs",
+    "**/*.fvecs",
+    "**/*.f32bin",
+]
+
+[package.metadata.docs.rs]
+targets = ["x86_64-unknown-linux-gnu"]
 
 [lib]
 path = "src/lib.rs"
@@ -16,7 +36,6 @@ futures = "0.3"
 futures-lite = "1.13"
 rand = "0.8"
 log = "0.4"
-env_logger = "0.10"
 async-channel = "2.3"
 lru = "0.12"
 flate2 = "1.0"

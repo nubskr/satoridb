@@ -10,6 +10,7 @@ use futures::future::join_all;
 use std::sync::Arc;
 
 #[derive(Clone)]
+/// A cloneable, in-process client for an embedded [`crate::SatoriDb`] instance.
 pub struct SatoriHandle {
     router_tx: CrossbeamSender<RouterCommand>,
     ring: ConsistentHashRing,
@@ -29,7 +30,16 @@ impl SatoriHandle {
         }
     }
 
-    pub async fn query(&self, vector: Vec<f32>, top_k: usize, router_top_k: usize) -> Result<Vec<(u64, f32)>> {
+    /// Query the database for nearest neighbors.
+    ///
+    /// - `top_k`: number of final results to return.
+    /// - `router_top_k`: number of buckets to probe via the router (higher can improve recall).
+    pub async fn query(
+        &self,
+        vector: Vec<f32>,
+        top_k: usize,
+        router_top_k: usize,
+    ) -> Result<Vec<(u64, f32)>> {
         let bucket_ids = self.route_query_buckets(&vector, router_top_k).await?;
 
         let mut pending = Vec::new();
@@ -80,6 +90,7 @@ impl SatoriHandle {
         Ok(all_results)
     }
 
+    /// Insert or update a vector.
     pub async fn upsert(
         &self,
         id: u64,
@@ -115,6 +126,7 @@ impl SatoriHandle {
         Ok((bucket_id, meta))
     }
 
+    /// Flush worker state and write a router snapshot.
     pub async fn flush(&self) -> Result<()> {
         let mut flush_waiters = Vec::new();
         for sender in &self.worker_senders {
@@ -130,6 +142,7 @@ impl SatoriHandle {
         Ok(())
     }
 
+    /// Return basic router statistics.
     pub async fn stats(&self) -> RouterStats {
         let (tx, rx) = oneshot::channel();
         if self
@@ -144,10 +157,12 @@ impl SatoriHandle {
         rx.await.unwrap_or_default()
     }
 
+    /// Blocking wrapper around [`Self::query`].
     pub fn query_blocking(&self, vector: Vec<f32>, top_k: usize, router_top_k: usize) -> Result<Vec<(u64, f32)>> {
         block_on(self.query(vector, top_k, router_top_k))
     }
 
+    /// Blocking wrapper around [`Self::upsert`].
     pub fn upsert_blocking(
         &self,
         id: u64,
@@ -157,10 +172,12 @@ impl SatoriHandle {
         block_on(self.upsert(id, vector, bucket_hint))
     }
 
+    /// Blocking wrapper around [`Self::flush`].
     pub fn flush_blocking(&self) -> Result<()> {
         block_on(self.flush())
     }
 
+    /// Blocking wrapper around [`Self::stats`].
     pub fn stats_blocking(&self) -> RouterStats {
         block_on(self.stats())
     }

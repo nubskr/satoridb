@@ -8,12 +8,6 @@ pub mod runtime {
 pub mod config {
     pub use crate::storage::wal::config::*;
 }
-pub mod paths {
-    pub use crate::storage::wal::paths::*;
-}
-pub mod storage {
-    pub use crate::storage::wal::storage::*;
-}
 pub mod block {
     pub use crate::storage::wal::block::*;
 }

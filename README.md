@@ -1,5 +1,15 @@
 # satoridb
 
+Embedded vector database for approximate nearest neighbor (ANN) search.
+
+This repo currently builds `satoridb` as a library crate (embedded-only, no TCP server).
+
+## Add As A Dependency
+
+```bash
+cargo add satoridb
+```
+
 ## Build
 
 ```bash
@@ -18,9 +28,12 @@ use satoridb::wal::{FsyncSchedule, ReadConsistency};
 use satoridb::{SatoriDb, SatoriDbConfig};
 
 fn main() -> anyhow::Result<()> {
-    let wal = Arc::new(Walrus::with_consistency_and_schedule(
+    // By default Walrus writes under `wal_files/<key>` (relative to the current working dir).
+    // Set `WALRUS_DATA_DIR=/some/dir` to control the parent directory.
+    let wal = Arc::new(Walrus::with_consistency_and_schedule_for_key(
+        "my_app",
         ReadConsistency::StrictlyAtOnce,
-        FsyncSchedule::NoFsync,
+        FsyncSchedule::Milliseconds(200),
     )?);
 
     let mut cfg = SatoriDbConfig::new(wal);
@@ -37,7 +50,19 @@ fn main() -> anyhow::Result<()> {
 }
 ```
 
+You can also run the example:
+
+```bash
+cargo run --example embedded_basic
+```
+
 ### Durability
 
 - Restart durability (clean restart): preserved as long as the process had time to write to the WAL.
 - Crash durability: configure `Walrus` with a fsync schedule like `FsyncSchedule::Milliseconds(200)` or `FsyncSchedule::SyncEach` instead of `NoFsync`.
+
+## Test
+
+```bash
+cargo test
+```

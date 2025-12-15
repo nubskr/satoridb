@@ -636,7 +636,7 @@ fn pick_kernels() -> (DotFn, CenterFn) {
     let mut center: CenterFn = center_bytes_scalar_xor_0x80;
 
     #[cfg(target_arch = "x86_64")]
-    unsafe {
+    {
         if std::arch::is_x86_feature_detected!("avx512f")
             && std::arch::is_x86_feature_detected!("avx512bw")
         {
@@ -893,4 +893,3 @@ mod tests {
         assert!(res.is_empty());
     }
 }
-

@@ -9,17 +9,6 @@ use std::sync::{Arc, RwLock};
 use rkyv::{AlignedVec, Deserialize};
 use tracing::info;
 
-#[cfg(target_os = "linux")]
-use crate::wal::config::USE_FD_BACKEND;
-#[cfg(target_os = "linux")]
-use std::sync::atomic::Ordering;
-
-#[cfg(target_os = "linux")]
-use io_uring;
-
-#[cfg(target_os = "linux")]
-use std::os::unix::io::AsRawFd;
-
 impl Walrus {
     pub fn read_next(&self, col_name: &str, checkpoint: bool) -> io::Result<Option<Entry>> {
         const TAIL_FLAG: u64 = 1u64 << 63;

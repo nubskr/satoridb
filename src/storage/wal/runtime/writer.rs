@@ -1,23 +1,14 @@
 use super::allocator::{BlockAllocator, FileStateTracker};
 use super::reader::Reader;
 use crate::wal::block::Block;
-#[cfg(target_os = "linux")]
-use crate::wal::block::Metadata;
-#[cfg(target_os = "linux")]
-use crate::wal::config::{checksum64, USE_FD_BACKEND};
 use crate::wal::config::{
     debug_print, FsyncSchedule, DEFAULT_BLOCK_SIZE, MAX_BATCH_BYTES, MAX_BATCH_ENTRIES,
     PREFIX_META_SIZE,
 };
 use std::collections::HashSet;
-#[cfg(target_os = "linux")]
-use std::convert::TryFrom;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc;
 use std::sync::{Arc, Mutex};
-
-#[cfg(target_os = "linux")]
-use std::os::unix::io::AsRawFd;
 
 pub(super) struct Writer {
     allocator: Arc<BlockAllocator>,

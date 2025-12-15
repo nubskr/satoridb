@@ -1,6 +1,5 @@
 use std::sync::Arc;
 use std::thread;
-use std::time::Duration;
 
 use async_channel::unbounded;
 use futures::channel::oneshot;
