@@ -1,7 +1,7 @@
 use crate::executor::{Executor, WorkerCache};
 use crate::ingest_counter;
 use crate::storage::wal::runtime::Walrus;
-use crate::storage::{Storage, StorageExecMode, Vector};
+use crate::storage::{Bucket, Storage, StorageExecMode, Vector};
 use async_channel::Receiver;
 use futures::channel::oneshot;
 use log::{error, info};
@@ -19,11 +19,19 @@ pub struct QueryRequest {
 
 pub enum WorkerMessage {
     Query(QueryRequest),
+    Upsert {
+        bucket_id: u64,
+        vector: Vector,
+        respond_to: oneshot::Sender<anyhow::Result<()>>,
+    },
     Ingest {
         bucket_id: u64,
         vectors: Vec<Vector>,
     },
     Flush {
+        respond_to: oneshot::Sender<()>,
+    },
+    Shutdown {
         respond_to: oneshot::Sender<()>,
     },
 }
@@ -68,6 +76,19 @@ pub async fn run_worker(id: usize, receiver: Receiver<WorkerMessage>, wal: Arc<W
                     let _ = limit_rx.recv().await;
                 })
                 .detach();
+            }
+            WorkerMessage::Upsert {
+                bucket_id,
+                vector,
+                respond_to,
+            } => {
+                let mut bucket = Bucket::new(bucket_id, Vec::new());
+                bucket.vectors = vec![vector];
+                let result = storage
+                    .put_chunk(&bucket)
+                    .await
+                    .map_err(anyhow::Error::from);
+                let _ = respond_to.send(result);
             }
             WorkerMessage::Ingest { bucket_id, vectors } => {
                 limit_tx.send(()).await.unwrap();
@@ -114,6 +135,10 @@ pub async fn run_worker(id: usize, receiver: Receiver<WorkerMessage>, wal: Arc<W
                     glommio::timer::Timer::new(Duration::from_millis(10)).await;
                 }
                 let _ = respond_to.send(());
+            }
+            WorkerMessage::Shutdown { respond_to } => {
+                let _ = respond_to.send(());
+                break;
             }
         }
     }

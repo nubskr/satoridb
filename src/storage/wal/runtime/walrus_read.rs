@@ -540,16 +540,6 @@ impl Walrus {
                         meta_len, data_size, entry_total, entry_end
                     );
 
-                    // Special handling for start_offset = 0 to skip small initial entries (likely internal metadata)
-                    if rem == 0 && data_size < 128 {
-                        info!(
-                            "batch_read_for_topic: (stateless) skipping small initial entry (rem=0, data_size={})",
-                            data_size
-                        );
-                        scan_pos = entry_end;
-                        continue;
-                    }
-
                     if entry_end > rem {
                         // Found the entry containing 'rem'
                         c_off = scan_pos;

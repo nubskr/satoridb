@@ -3,6 +3,9 @@ name = "satoridb"
 version = "0.1.0"
 edition = "2021"
 
+[lib]
+path = "src/lib.rs"
+
 [dependencies]
 glommio = "0.8"
 rkyv = { version = "0.7", features = ["validation"] }

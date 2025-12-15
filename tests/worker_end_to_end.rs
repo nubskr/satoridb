@@ -7,12 +7,17 @@ use futures::channel::oneshot;
 use futures::executor::block_on;
 use satoridb::ingest_counter;
 use satoridb::storage::wal::runtime::Walrus;
+use satoridb::wal::{FsyncSchedule, ReadConsistency};
 use satoridb::storage::Vector;
 use satoridb::worker::{run_worker, QueryRequest, WorkerMessage};
 
 fn init_wal(tmp: &tempfile::TempDir) -> Arc<Walrus> {
     std::env::set_var("WALRUS_DATA_DIR", tmp.path());
-    Arc::new(Walrus::new().expect("walrus init"))
+    std::env::set_var("WALRUS_QUIET", "1");
+    Arc::new(
+        Walrus::with_consistency_and_schedule(ReadConsistency::StrictlyAtOnce, FsyncSchedule::NoFsync)
+            .expect("walrus init"),
+    )
 }
 
 #[test]
@@ -22,7 +27,11 @@ fn worker_ingests_and_answers_queries() {
 
     let (tx, rx) = unbounded();
     let handle = thread::spawn(move || {
-        block_on(run_worker(0, rx, wal));
+        let ex = glommio::LocalExecutorBuilder::new(glommio::Placement::Unbound)
+            .name("test-worker")
+            .make()
+            .expect("make executor");
+        ex.run(run_worker(0, rx, wal));
     });
 
     // Ingest a small batch into bucket 0.
@@ -70,9 +79,12 @@ fn worker_ingests_and_answers_queries() {
         "ingest counter did not advance"
     );
 
-    drop(tx);
-    // Give the worker a moment to exit cleanly.
-    thread::sleep(Duration::from_millis(50));
+    let (shutdown_tx, shutdown_rx) = oneshot::channel();
+    tx.send_blocking(WorkerMessage::Shutdown {
+        respond_to: shutdown_tx,
+    })
+    .expect("shutdown send");
+    block_on(async { shutdown_rx.await }).expect("shutdown ack");
     handle.join().expect("worker thread joined");
 }
 
@@ -83,7 +95,11 @@ fn worker_flushes_and_shuts_down_cleanly() {
 
     let (tx, rx) = unbounded();
     let handle = thread::spawn(move || {
-        block_on(run_worker(1, rx, wal));
+        let ex = glommio::LocalExecutorBuilder::new(glommio::Placement::Unbound)
+            .name("test-worker2")
+            .make()
+            .expect("make executor");
+        ex.run(run_worker(1, rx, wal));
     });
 
     let (flush_tx, flush_rx) = oneshot::channel();
@@ -93,7 +109,11 @@ fn worker_flushes_and_shuts_down_cleanly() {
     .expect("flush send");
     block_on(async { flush_rx.await }).expect("flush ack");
 
-    drop(tx);
-    thread::sleep(Duration::from_millis(50));
+    let (shutdown_tx, shutdown_rx) = oneshot::channel();
+    tx.send_blocking(WorkerMessage::Shutdown {
+        respond_to: shutdown_tx,
+    })
+    .expect("shutdown send");
+    block_on(async { shutdown_rx.await }).expect("shutdown ack");
     handle.join().expect("worker thread joined");
 }
