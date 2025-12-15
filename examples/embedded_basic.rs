@@ -27,4 +27,3 @@ fn main() -> anyhow::Result<()> {
     db.shutdown()?;
     Ok(())
 }
-

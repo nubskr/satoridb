@@ -59,7 +59,7 @@ impl Quantizer {
         let len = src.len();
 
         while i + 4 <= len {
-            dst[i]     = quant_one(src[i],     min, scale);
+            dst[i] = quant_one(src[i], min, scale);
             dst[i + 1] = quant_one(src[i + 1], min, scale);
             dst[i + 2] = quant_one(src[i + 2], min, scale);
             dst[i + 3] = quant_one(src[i + 3], min, scale);
@@ -97,8 +97,8 @@ mod tests {
 
     #[test]
     fn computes_bounds_with_padding() {
-        let (min, max) = Quantizer::compute_bounds(&vec![vec![0.0, 1.0, 2.0], vec![-1.0, 3.0]])
-            .unwrap();
+        let (min, max) =
+            Quantizer::compute_bounds(&vec![vec![0.0, 1.0, 2.0], vec![-1.0, 3.0]]).unwrap();
         assert!(min < -1.0);
         assert!(max > 3.0);
     }

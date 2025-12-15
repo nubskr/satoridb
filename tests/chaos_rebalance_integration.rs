@@ -3,17 +3,19 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use anyhow::Result;
+use rand::rngs::StdRng;
+use rand::{Rng, SeedableRng};
+use satoridb::executor::{
+    clear_executor_fail_load_hook, set_executor_fail_load_hook, Executor, WorkerCache,
+};
 use satoridb::rebalancer::{
     clear_rebalance_fail_hook, set_rebalance_fail_hook, RebalanceTask, RebalanceTaskKind,
     RebalanceWorker,
 };
-use satoridb::executor::{clear_executor_fail_load_hook, set_executor_fail_load_hook, Executor, WorkerCache};
 use satoridb::router::RoutingTable;
 use satoridb::storage::{Bucket, Storage, Vector};
 use satoridb::wal::runtime::Walrus;
 use tempfile::TempDir;
-use rand::{Rng, SeedableRng};
-use rand::rngs::StdRng;
 
 fn init_wal(tempdir: &TempDir) -> Arc<Walrus> {
     std::env::set_var("WALRUS_DATA_DIR", tempdir.path());
@@ -160,7 +162,8 @@ fn executor_cache_survives_version_churn() -> Result<()> {
                         Arc::new(Vec::new())
                     };
                     let q = vec![1.0, 2.0];
-                    let res = futures::executor::block_on(exec.query(&q, &ids, 4, v as u64, changed));
+                    let res =
+                        futures::executor::block_on(exec.query(&q, &ids, 4, v as u64, changed));
                     let res = res.expect("query succeeds");
                     assert!(
                         !res.is_empty(),

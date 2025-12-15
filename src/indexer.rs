@@ -222,7 +222,10 @@ impl Indexer {
             final_counts[a] += 1;
         }
 
-        if opts.force_two_buckets_k2 && k == 2 && n >= 2 && (final_counts[0] == 0 || final_counts[1] == 0)
+        if opts.force_two_buckets_k2
+            && k == 2
+            && n >= 2
+            && (final_counts[0] == 0 || final_counts[1] == 0)
         {
             // Deterministic fallback: split in half to avoid returning a single bucket.
             let mid = n / 2;
@@ -247,8 +250,9 @@ impl Indexer {
             return out;
         }
 
-        let mut buckets_data: Vec<Vec<Vector>> =
-            (0..k).map(|j| Vec::with_capacity(final_counts[j])).collect();
+        let mut buckets_data: Vec<Vec<Vector>> = (0..k)
+            .map(|j| Vec::with_capacity(final_counts[j]))
+            .collect();
 
         for (i, vec) in vectors.into_iter().enumerate() {
             let cluster_idx = assignments[i];
@@ -525,12 +529,21 @@ unsafe fn nearest_centroid_k2_avx2_fma(x: &[f32], centroids: &[f32], dim: usize)
         i += 1;
     }
 
-    if dist0 <= dist1 { 0 } else { 1 }
+    if dist0 <= dist1 {
+        0
+    } else {
+        1
+    }
 }
 
 #[cfg(target_arch = "x86_64")]
 #[target_feature(enable = "avx2", enable = "fma")]
-unsafe fn nearest_centroid_block8_avx2_fma(x: &[f32], centroids_t: &[f32], k: usize, dim: usize) -> usize {
+unsafe fn nearest_centroid_block8_avx2_fma(
+    x: &[f32],
+    centroids_t: &[f32],
+    k: usize,
+    dim: usize,
+) -> usize {
     use std::arch::x86_64::*;
 
     let mut best_c = 0usize;

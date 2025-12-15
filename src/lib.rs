@@ -65,9 +65,9 @@ pub mod router_hnsw;
 #[doc(hidden)]
 pub mod router_manager;
 #[doc(hidden)]
-pub mod storage;
-#[doc(hidden)]
 pub mod service;
+#[doc(hidden)]
+pub mod storage;
 #[doc(hidden)]
 pub mod tasks;
 pub mod wal;

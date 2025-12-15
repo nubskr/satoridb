@@ -1,5 +1,5 @@
-use crate::tasks::ConsistentHashRing;
 use crate::router_manager::{BucketMeta, RouterCommand, RouterStats};
+use crate::tasks::ConsistentHashRing;
 use crate::worker::{QueryRequest, WorkerMessage};
 use anyhow::{anyhow, Result};
 use async_channel::Sender as AsyncSender;
@@ -131,7 +131,11 @@ impl SatoriHandle {
         let mut flush_waiters = Vec::new();
         for sender in &self.worker_senders {
             let (tx, rx) = oneshot::channel();
-            if sender.send(WorkerMessage::Flush { respond_to: tx }).await.is_ok() {
+            if sender
+                .send(WorkerMessage::Flush { respond_to: tx })
+                .await
+                .is_ok()
+            {
                 flush_waiters.push(rx);
             }
         }
@@ -147,9 +151,9 @@ impl SatoriHandle {
         let (tx, rx) = oneshot::channel();
         if self
             .router_tx
-            .send(RouterCommand::Stats(crate::router_manager::RouterStatsRequest {
-                respond_to: tx,
-            }))
+            .send(RouterCommand::Stats(
+                crate::router_manager::RouterStatsRequest { respond_to: tx },
+            ))
             .is_err()
         {
             return RouterStats::default();
@@ -158,7 +162,12 @@ impl SatoriHandle {
     }
 
     /// Blocking wrapper around [`Self::query`].
-    pub fn query_blocking(&self, vector: Vec<f32>, top_k: usize, router_top_k: usize) -> Result<Vec<(u64, f32)>> {
+    pub fn query_blocking(
+        &self,
+        vector: Vec<f32>,
+        top_k: usize,
+        router_top_k: usize,
+    ) -> Result<Vec<(u64, f32)>> {
         block_on(self.query(vector, top_k, router_top_k))
     }
 
@@ -235,9 +244,9 @@ impl SatoriHandle {
     async fn flush_router_snapshot(&self) -> Result<()> {
         let (tx, rx) = oneshot::channel();
         self.router_tx
-            .send(RouterCommand::Flush(crate::router_manager::RouterFlushRequest {
-                respond_to: tx,
-            }))
+            .send(RouterCommand::Flush(
+                crate::router_manager::RouterFlushRequest { respond_to: tx },
+            ))
             .map_err(|_| anyhow!("router channel closed"))?;
         rx.await.unwrap_or_else(|e| Err(e.into()))
     }

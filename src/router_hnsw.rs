@@ -367,7 +367,12 @@ impl HnswIndex {
         res
     }
 
-    fn select_neighbors(&self, candidates: &mut [HeapItem], m: usize, diversity: bool) -> Vec<usize> {
+    fn select_neighbors(
+        &self,
+        candidates: &mut [HeapItem],
+        m: usize,
+        diversity: bool,
+    ) -> Vec<usize> {
         candidates.sort_by(|a, b| a.dist.partial_cmp(&b.dist).unwrap_or(Ordering::Equal));
 
         let mut accepted: SmallVec<[usize; 32]> = SmallVec::new();
@@ -382,7 +387,8 @@ impl HnswIndex {
                 let cand_v = self.trav(cand.id);
                 let cand_inv = self.inv_norms[cand.id];
                 for &acc in accepted.iter() {
-                    let d_acc = self.cosine_i8(cand_v, cand_inv, self.trav(acc), self.inv_norms[acc]);
+                    let d_acc =
+                        self.cosine_i8(cand_v, cand_inv, self.trav(acc), self.inv_norms[acc]);
                     if d_acc < cand.dist {
                         keep = false;
                         break;
@@ -496,10 +502,21 @@ impl HnswIndex {
         }
 
         // Take out, sort without holding a mutable borrow of self.neighbors, then put back.
-        let mut vec: SmallVec<[usize; 16]> = std::mem::take(&mut self.neighbors[id][level as usize]);
+        let mut vec: SmallVec<[usize; 16]> =
+            std::mem::take(&mut self.neighbors[id][level as usize]);
         vec.sort_by(|&a, &b| {
-            let da = self.cosine_i8(self.trav(id), self.inv_norms[id], self.trav(a), self.inv_norms[a]);
-            let db = self.cosine_i8(self.trav(id), self.inv_norms[id], self.trav(b), self.inv_norms[b]);
+            let da = self.cosine_i8(
+                self.trav(id),
+                self.inv_norms[id],
+                self.trav(a),
+                self.inv_norms[a],
+            );
+            let db = self.cosine_i8(
+                self.trav(id),
+                self.inv_norms[id],
+                self.trav(b),
+                self.inv_norms[b],
+            );
             da.partial_cmp(&db).unwrap_or(Ordering::Equal)
         });
         vec.truncate(cap);
@@ -537,7 +554,11 @@ impl HnswIndex {
     }
 
     fn m_for_level(&self, level: i32) -> usize {
-        if level == 0 { self.m0 } else { self.m }
+        if level == 0 {
+            self.m0
+        } else {
+            self.m
+        }
     }
 
     fn sample_level(&mut self) -> i32 {
@@ -743,7 +764,6 @@ unsafe fn dot_i8_avx2_i32(a: &[i8], b: &[i8]) -> i32 {
     }
     total
 }
-
 
 #[cfg(target_arch = "x86_64")]
 #[target_feature(enable = "avx512f,avx512bw")]

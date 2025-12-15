@@ -308,4 +308,3 @@ struct RoutingData {
     router: Arc<Router>,
     changed: Arc<Vec<u64>>,
 }
-

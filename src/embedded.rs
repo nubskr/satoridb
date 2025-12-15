@@ -1,6 +1,6 @@
-use crate::tasks::ConsistentHashRing;
 use crate::router_manager::{spawn_router_manager, RouterCommand, RouterShutdownRequest};
 use crate::service::SatoriHandle;
+use crate::tasks::ConsistentHashRing;
 use crate::wal::runtime::Walrus;
 use crate::worker::{run_worker, WorkerMessage};
 use anyhow::{anyhow, Result};
@@ -61,8 +61,8 @@ impl SatoriDb {
             let wal_clone = cfg.wal.clone();
             let pin_cpu = i % num_cpus::get().max(1);
             let handle = thread::spawn(move || {
-                let builder =
-                    LocalExecutorBuilder::new(Placement::Fixed(pin_cpu)).name(&format!("worker-{}", i));
+                let builder = LocalExecutorBuilder::new(Placement::Fixed(pin_cpu))
+                    .name(&format!("worker-{}", i));
                 let _ = builder
                     .make()
                     .expect("failed to create executor")
@@ -79,11 +79,14 @@ impl SatoriDb {
         // Readiness barrier: ensure the router manager has finished loading state before returning.
         let (ready_tx, ready_rx) = oneshot::channel();
         router_tx
-            .send(RouterCommand::Stats(crate::router_manager::RouterStatsRequest {
-                respond_to: ready_tx,
-            }))
+            .send(RouterCommand::Stats(
+                crate::router_manager::RouterStatsRequest {
+                    respond_to: ready_tx,
+                },
+            ))
             .map_err(|e| anyhow!("router manager not running: {:?}", e))?;
-        block_on(ready_rx).map_err(|e| anyhow!("router manager failed to become ready: {:?}", e))?;
+        block_on(ready_rx)
+            .map_err(|e| anyhow!("router manager failed to become ready: {:?}", e))?;
 
         let api = SatoriHandle::new(router_tx.clone(), ring, worker_senders.clone());
 
@@ -105,17 +108,19 @@ impl SatoriDb {
     pub fn shutdown(self) -> Result<()> {
         // Best-effort: persist a router snapshot so startup can skip replaying the full update log.
         let (flush_tx, flush_rx) = oneshot::channel();
-        let _ = self
-            .router_tx
-            .send(RouterCommand::Flush(crate::router_manager::RouterFlushRequest {
+        let _ = self.router_tx.send(RouterCommand::Flush(
+            crate::router_manager::RouterFlushRequest {
                 respond_to: flush_tx,
-            }));
+            },
+        ));
         let _ = block_on(flush_rx);
 
         let (router_shutdown_tx, router_shutdown_rx) = oneshot::channel();
-        let _ = self.router_tx.send(RouterCommand::Shutdown(RouterShutdownRequest {
-            respond_to: router_shutdown_tx,
-        }));
+        let _ = self
+            .router_tx
+            .send(RouterCommand::Shutdown(RouterShutdownRequest {
+                respond_to: router_shutdown_tx,
+            }));
 
         let mut worker_shutdown_waiters = Vec::new();
         for sender in &self.worker_senders {

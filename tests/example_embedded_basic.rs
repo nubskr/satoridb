@@ -40,4 +40,3 @@ fn embedded_basic_example_works() {
 
     db.shutdown().expect("shutdown");
 }
-

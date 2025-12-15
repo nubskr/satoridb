@@ -6,16 +6,19 @@ use futures::channel::oneshot;
 use futures::executor::block_on;
 use satoridb::ingest_counter;
 use satoridb::storage::wal::runtime::Walrus;
-use satoridb::wal::{FsyncSchedule, ReadConsistency};
 use satoridb::storage::Vector;
+use satoridb::wal::{FsyncSchedule, ReadConsistency};
 use satoridb::worker::{run_worker, QueryRequest, WorkerMessage};
 
 fn init_wal(tmp: &tempfile::TempDir) -> Arc<Walrus> {
     std::env::set_var("WALRUS_DATA_DIR", tmp.path());
     std::env::set_var("WALRUS_QUIET", "1");
     Arc::new(
-        Walrus::with_consistency_and_schedule(ReadConsistency::StrictlyAtOnce, FsyncSchedule::NoFsync)
-            .expect("walrus init"),
+        Walrus::with_consistency_and_schedule(
+            ReadConsistency::StrictlyAtOnce,
+            FsyncSchedule::NoFsync,
+        )
+        .expect("walrus init"),
     )
 }
 

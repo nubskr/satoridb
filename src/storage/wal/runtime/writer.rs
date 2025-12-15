@@ -88,12 +88,7 @@ impl Writer {
             *cur = 0;
         }
         let next_block_start = block.offset + block.limit; // simplistic for now
-        pollster::block_on(block.write(
-            *cur,
-            data,
-            &self.col,
-            next_block_start,
-        ))?;
+        pollster::block_on(block.write(*cur, data, &self.col, next_block_start))?;
         debug_print!(
             "[writer] wrote: col={}, block_id={}, offset_before={}, bytes={}, offset_after={}",
             self.col,
@@ -256,18 +251,12 @@ impl Writer {
             let data = batch[*data_idx];
             let next_block_start = blk.offset + blk.limit;
 
-            if let Err(e) = pollster::block_on(blk.write(
-                *offset,
-                data,
-                &self.col,
-                next_block_start,
-            )) {
+            if let Err(e) =
+                pollster::block_on(blk.write(*offset, data, &self.col, next_block_start))
+            {
                 // Clean up any partially written headers up to and including the failed index
                 for (w_blk, w_off, _) in write_plan[0..=(*data_idx)].iter() {
-                    let _ = pollster::block_on(w_blk.zero_range(
-                        *w_off,
-                        PREFIX_META_SIZE as u64,
-                    ));
+                    let _ = pollster::block_on(w_blk.zero_range(*w_off, PREFIX_META_SIZE as u64));
                 }
 
                 // Flush zeros and rollback

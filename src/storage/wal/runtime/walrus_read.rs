@@ -485,10 +485,9 @@ impl Walrus {
                     }
 
                     // Read header
-                    match pollster::block_on(blk.file.read_at(
-                        blk.offset + scan_pos,
-                        PREFIX_META_SIZE,
-                    )) {
+                    match pollster::block_on(
+                        blk.file.read_at(blk.offset + scan_pos, PREFIX_META_SIZE),
+                    ) {
                         Ok(buf) => {
                             if buf.len() < PREFIX_META_SIZE {
                                 break;
@@ -694,10 +693,9 @@ impl Walrus {
 
                 if should_peek && cur_off + (PREFIX_META_SIZE as u64) <= block.used {
                     let mut meta_buf = [0u8; PREFIX_META_SIZE];
-                    match pollster::block_on(block.file.read_at(
-                        block.offset + cur_off,
-                        PREFIX_META_SIZE,
-                    )) {
+                    match pollster::block_on(
+                        block.file.read_at(block.offset + cur_off, PREFIX_META_SIZE),
+                    ) {
                         Ok(buf) => {
                             if buf.len() == PREFIX_META_SIZE {
                                 meta_buf.copy_from_slice(&buf);
@@ -729,10 +727,11 @@ impl Walrus {
                                     let offset2 = cur_off + required1;
                                     if offset2 + (PREFIX_META_SIZE as u64) <= block.used {
                                         let mut meta_buf2 = [0u8; PREFIX_META_SIZE];
-                                        match pollster::block_on(block.file.read_at(
-                                            block.offset + offset2,
-                                            PREFIX_META_SIZE,
-                                        )) {
+                                        match pollster::block_on(
+                                            block
+                                                .file
+                                                .read_at(block.offset + offset2, PREFIX_META_SIZE),
+                                        ) {
                                             Ok(buf) => {
                                                 if buf.len() == PREFIX_META_SIZE {
                                                     meta_buf2.copy_from_slice(&buf);
@@ -811,10 +810,11 @@ impl Walrus {
                         if scan_pos + (PREFIX_META_SIZE as u64) > written {
                             break;
                         }
-                        match pollster::block_on(active_block.file.read_at(
-                            active_block.offset + scan_pos,
-                            PREFIX_META_SIZE,
-                        )) {
+                        match pollster::block_on(
+                            active_block
+                                .file
+                                .read_at(active_block.offset + scan_pos, PREFIX_META_SIZE),
+                        ) {
                             Ok(buf) => {
                                 if buf.len() < PREFIX_META_SIZE {
                                     break;

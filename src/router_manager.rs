@@ -5,8 +5,8 @@ use anyhow::{anyhow, Result};
 use crossbeam_channel::Receiver;
 use futures::channel::oneshot;
 use log::{error, info};
-use rkyv::{Archive, Deserialize, Serialize};
 use rkyv::AlignedVec;
+use rkyv::{Archive, Deserialize, Serialize};
 use std::collections::HashMap;
 use std::sync::Arc;
 
@@ -184,9 +184,8 @@ impl RouterManager {
                 Ok(())
             }
             RouterCommand::ApplyUpsert(u) => {
-                let res = self
-                    .apply_upsert(u.bucket_id, &u.vector)
-                    .and_then(|(meta, created_new_bucket)| {
+                let res = self.apply_upsert(u.bucket_id, &u.vector).and_then(
+                    |(meta, created_new_bucket)| {
                         self.persist_update(&meta)?;
                         self.pending_updates = self.pending_updates.saturating_add(1);
                         if self.router.is_none()
@@ -197,7 +196,8 @@ impl RouterManager {
                             self.pending_updates = 0;
                         }
                         Ok(meta)
-                    });
+                    },
+                );
                 let _ = u.respond_to.send(res);
                 Ok(())
             }
@@ -365,7 +365,10 @@ impl RouterManager {
         let updates_offset = match self.try_load_snapshot_and_get_updates_offset() {
             Ok(off) => off,
             Err(e) => {
-                error!("Router snapshot load failed; replaying updates from 0: {:?}", e);
+                error!(
+                    "Router snapshot load failed; replaying updates from 0: {:?}",
+                    e
+                );
                 self.buckets.clear();
                 self.router = None;
                 self.quantizer = None;

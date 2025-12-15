@@ -40,4 +40,3 @@ fn embedded_upsert_then_query_smoke() {
 
     db.shutdown().expect("shutdown");
 }
-

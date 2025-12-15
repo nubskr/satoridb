@@ -79,10 +79,7 @@ impl Block {
 
     pub(crate) async fn read(&self, in_block_offset: u64) -> std::io::Result<(Entry, usize)> {
         let file_offset = self.offset + in_block_offset;
-        let meta_buffer = self
-            .file
-            .read_at(file_offset, PREFIX_META_SIZE)
-            .await?;
+        let meta_buffer = self.file.read_at(file_offset, PREFIX_META_SIZE).await?;
 
         // Read the actual metadata length from first 2 bytes
         let meta_len = (meta_buffer[0] as usize) | ((meta_buffer[1] as usize) << 8);
