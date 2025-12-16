@@ -188,7 +188,9 @@ impl RebalanceState {
         self.centroids.write().remove(&bucket_id);
         self.bucket_sizes.write().remove(&bucket_id);
         self.retired.write().insert(bucket_id);
-        self.locks.lock().remove(&bucket_id);
+        // Keep the lock around - don't remove it. This ensures any concurrent
+        // operations on this bucket_id serialize properly and can check the
+        // retired set while holding the same lock.
     }
 
     fn retire_bucket_io(&self, bucket_id: u64) {
@@ -276,6 +278,13 @@ impl RebalanceState {
         }
         let lock = self.lock_for(bucket_id);
         let _guard = lock.lock();
+
+        // Check if bucket was already retired (e.g., by a prior split/merge).
+        if self.retired.read().contains(&bucket_id) {
+            debug!("rebalance: split skipped, bucket {} already retired", bucket_id);
+            return;
+        }
+
         let vectors = match self.load_bucket_vectors(bucket_id) {
             Some(v) => v,
             None => {
@@ -348,6 +357,18 @@ impl RebalanceState {
         let _g1 = lock_first.lock();
         let _g2 = lock_second.lock();
 
+        // Check if either bucket was already retired (e.g., by a prior split/merge).
+        {
+            let retired = self.retired.read();
+            if retired.contains(&first) || retired.contains(&second) {
+                debug!(
+                    "rebalance: merge skipped, bucket {} or {} already retired",
+                    first, second
+                );
+                return;
+            }
+        }
+
         let va = match self.load_bucket_vectors(first) {
             Some(v) => v,
             None => {
@@ -405,6 +426,13 @@ impl RebalanceState {
         // For now, just recompute centroid from storage and republish routing.
         let lock = self.lock_for(bucket_id);
         let _guard = lock.lock();
+
+        // Check if bucket was already retired (e.g., by a prior split/merge).
+        if self.retired.read().contains(&bucket_id) {
+            debug!("rebalance: rebalance skipped, bucket {} already retired", bucket_id);
+            return;
+        }
+
         let bucket = match self.load_bucket(bucket_id) {
             Some(b) => b,
             None => {
@@ -531,6 +559,12 @@ async fn handle_split_async(state: Arc<RebalanceState>, bucket_id: u64) {
     let lock = state.lock_for(bucket_id);
     let _guard = lock.lock();
 
+    // Check if bucket was already retired (e.g., by a prior split/merge).
+    if state.retired.read().contains(&bucket_id) {
+        debug!("rebalance: split skipped, bucket {} already retired", bucket_id);
+        return;
+    }
+
     let vectors = glommio::executor()
         .spawn_blocking({
             let state = state.clone();
@@ -633,6 +667,18 @@ async fn handle_merge_async(state: Arc<RebalanceState>, a: u64, b: u64) {
     let _g1 = lock_first.lock();
     let _g2 = lock_second.lock();
 
+    // Check if either bucket was already retired (e.g., by a prior split/merge).
+    {
+        let retired = state.retired.read();
+        if retired.contains(&first) || retired.contains(&second) {
+            debug!(
+                "rebalance: merge skipped, bucket {} or {} already retired",
+                first, second
+            );
+            return;
+        }
+    }
+
     let va_opt = glommio::executor()
         .spawn_blocking({
             let state = state.clone();
@@ -726,6 +772,12 @@ async fn handle_rebalance_async(state: Arc<RebalanceState>, bucket_id: u64) {
 
     let lock = state.lock_for(bucket_id);
     let _guard = lock.lock();
+
+    // Check if bucket was already retired (e.g., by a prior split/merge).
+    if state.retired.read().contains(&bucket_id) {
+        debug!("rebalance: rebalance skipped, bucket {} already retired", bucket_id);
+        return;
+    }
 
     let vectors = glommio::executor()
         .spawn_blocking({
