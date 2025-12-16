@@ -57,7 +57,7 @@ fn rebalance_survives_split_failures() -> Result<()> {
             return false;
         }
         let n = c.fetch_add(1, Ordering::SeqCst);
-        n % 3 == 0
+        n.is_multiple_of(3)
     });
 
     for _ in 0..6 {
@@ -100,7 +100,7 @@ fn rebalance_merges_with_flaky_tasks() -> Result<()> {
             return false;
         }
         let n = c.fetch_add(1, Ordering::SeqCst);
-        n % 2 == 0
+        n.is_multiple_of(2)
     });
 
     for _ in 0..5 {
@@ -250,7 +250,7 @@ fn rebalancer_handles_jittered_tasks() -> Result<()> {
     let c = counter.clone();
     set_rebalance_fail_hook(move |kind| {
         let n = c.fetch_add(1, Ordering::SeqCst);
-        matches!(kind, RebalanceTaskKind::Split | RebalanceTaskKind::Merge) && n % 5 == 0
+        matches!(kind, RebalanceTaskKind::Split | RebalanceTaskKind::Merge) && n.is_multiple_of(5)
     });
 
     // Jittered enqueue of tasks.

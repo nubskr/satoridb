@@ -92,9 +92,12 @@ mod tests {
 
     #[test]
     fn test_compute_bounds() {
+        // compute_bounds applies 0.1% padding (min 1e-3) to the range
+        // Input: min=-1.0, max=3.0, range=4.0, pad=0.004
+        // Expected: (-1.004, 3.004)
         assert!(
             Quantizer::compute_bounds(&[vec![0.0, 1.0, 2.0], vec![-1.0, 3.0]]).unwrap()
-                == (-1.0, 3.0)
+                == (-1.004, 3.004)
         );
     }
 

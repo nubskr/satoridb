@@ -59,7 +59,7 @@ fn split_updates_routing_and_executor_results() -> Result<()> {
     // Snapshot routing after split.
     let snap = routing.snapshot().expect("routing installed");
     assert!(
-        snap.changed.len() >= 1,
+        !snap.changed.is_empty(),
         "routing snapshot should list changed buckets"
     );
 

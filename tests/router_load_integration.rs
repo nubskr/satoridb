@@ -45,7 +45,7 @@ fn router_large_centroid_set_returns_nearest_ids() -> Result<()> {
 
     for id in &res {
         assert!(
-            (*id as u64) < total,
+            *id < total,
             "router returned centroid id {} outside inserted range",
             id
         );

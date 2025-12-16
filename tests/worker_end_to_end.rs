@@ -54,7 +54,7 @@ fn worker_ingests_and_answers_queries() {
         respond_to: flush_tx,
     })
     .expect("flush send");
-    block_on(async { flush_rx.await }).expect("flush ack");
+    block_on(flush_rx).expect("flush ack");
 
     // Query the same bucket.
     let (resp_tx, resp_rx) = oneshot::channel();
@@ -67,7 +67,7 @@ fn worker_ingests_and_answers_queries() {
     }))
     .expect("query send");
 
-    let results = block_on(async { resp_rx.await })
+    let results = block_on(resp_rx)
         .expect("query recv")
         .expect("query ok");
     assert_eq!(results.len(), vectors.len());
@@ -86,7 +86,7 @@ fn worker_ingests_and_answers_queries() {
         respond_to: shutdown_tx,
     })
     .expect("shutdown send");
-    block_on(async { shutdown_rx.await }).expect("shutdown ack");
+    block_on(shutdown_rx).expect("shutdown ack");
     handle.join().expect("worker thread joined");
 }
 
@@ -109,13 +109,13 @@ fn worker_flushes_and_shuts_down_cleanly() {
         respond_to: flush_tx,
     })
     .expect("flush send");
-    block_on(async { flush_rx.await }).expect("flush ack");
+    block_on(flush_rx).expect("flush ack");
 
     let (shutdown_tx, shutdown_rx) = oneshot::channel();
     tx.send_blocking(WorkerMessage::Shutdown {
         respond_to: shutdown_tx,
     })
     .expect("shutdown send");
-    block_on(async { shutdown_rx.await }).expect("shutdown ack");
+    block_on(shutdown_rx).expect("shutdown ack");
     handle.join().expect("worker thread joined");
 }
