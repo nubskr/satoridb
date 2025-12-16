@@ -327,4 +327,100 @@ mod tests {
         let expected = ((0.0f32).powi(2) + (0.0f32).powi(2)).sqrt();
         assert!((dist - expected).abs() < 1e-5);
     }
+
+    /// L2 distance of identical vectors is zero.
+    #[test]
+    fn l2_distance_identical_is_zero() {
+        let a = vec![1.0f32, 2.0, 3.0, 4.0];
+        let dist = l2_distance_f32(&a, &a);
+        assert!(dist.abs() < 1e-10, "distance to self should be 0");
+    }
+
+    /// L2 distance with empty vectors is zero.
+    #[test]
+    fn l2_distance_empty_vectors() {
+        let a: Vec<f32> = vec![];
+        let b: Vec<f32> = vec![];
+        let dist = l2_distance_f32(&a, &b);
+        assert_eq!(dist, 0.0);
+    }
+
+    /// L2 distance with single-element vectors.
+    #[test]
+    fn l2_distance_single_element() {
+        let a = vec![0.0f32];
+        let b = vec![3.0f32];
+        let dist = l2_distance_f32(&a, &b);
+        assert!((dist - 3.0).abs() < 1e-5);
+    }
+
+    /// L2 distance should handle large vectors (SIMD path).
+    #[test]
+    fn l2_distance_large_vectors() {
+        let n = 1024;
+        let a: Vec<f32> = (0..n).map(|i| i as f32).collect();
+        let b: Vec<f32> = (0..n).map(|i| (i + 1) as f32).collect();
+        // Each element differs by 1, so sum of squares = n, sqrt = sqrt(n)
+        let expected = (n as f32).sqrt();
+        let dist = l2_distance_f32(&a, &b);
+        assert!((dist - expected).abs() < 1e-3, "expected {}, got {}", expected, dist);
+    }
+
+    /// L2 distance with negative values.
+    #[test]
+    fn l2_distance_negative_values() {
+        let a = vec![-1.0f32, -2.0, -3.0];
+        let b = vec![1.0f32, 2.0, 3.0];
+        // Differences: -2, -4, -6 → squares: 4, 16, 36 → sum: 56 → sqrt ≈ 7.483
+        let expected = 56.0f32.sqrt();
+        let dist = l2_distance_f32(&a, &b);
+        assert!((dist - expected).abs() < 1e-4);
+    }
+
+    /// WorkerCache respects max_buckets limit.
+    #[test]
+    fn worker_cache_evicts_on_limit() {
+        let mut cache = WorkerCache::new(2, usize::MAX);
+        cache.put(0, CachedBucket { vectors: vec![], byte_size: 10 });
+        cache.put(1, CachedBucket { vectors: vec![], byte_size: 10 });
+        cache.put(2, CachedBucket { vectors: vec![], byte_size: 10 });
+        // LRU should have evicted bucket 0
+        assert!(cache.get(0).is_none(), "bucket 0 should be evicted");
+        assert!(cache.get(1).is_some(), "bucket 1 should still be cached");
+        assert!(cache.get(2).is_some(), "bucket 2 should still be cached");
+    }
+
+    /// WorkerCache skips buckets exceeding byte limit.
+    #[test]
+    fn worker_cache_rejects_oversized() {
+        let mut cache = WorkerCache::new(10, 100); // max 100 bytes per bucket
+        cache.put(0, CachedBucket { vectors: vec![], byte_size: 50 });
+        cache.put(1, CachedBucket { vectors: vec![], byte_size: 200 }); // too big
+        assert!(cache.get(0).is_some(), "small bucket should be cached");
+        assert!(cache.get(1).is_none(), "oversized bucket should not be cached");
+    }
+
+    /// WorkerCache clear removes all entries.
+    #[test]
+    fn worker_cache_clear() {
+        let mut cache = WorkerCache::new(10, usize::MAX);
+        cache.put(0, CachedBucket { vectors: vec![], byte_size: 10 });
+        cache.put(1, CachedBucket { vectors: vec![], byte_size: 10 });
+        cache.clear();
+        assert!(cache.get(0).is_none());
+        assert!(cache.get(1).is_none());
+    }
+
+    /// WorkerCache invalidate_many removes specific entries.
+    #[test]
+    fn worker_cache_invalidate_many() {
+        let mut cache = WorkerCache::new(10, usize::MAX);
+        cache.put(0, CachedBucket { vectors: vec![], byte_size: 10 });
+        cache.put(1, CachedBucket { vectors: vec![], byte_size: 10 });
+        cache.put(2, CachedBucket { vectors: vec![], byte_size: 10 });
+        cache.invalidate_many(&[0, 2]);
+        assert!(cache.get(0).is_none(), "bucket 0 should be invalidated");
+        assert!(cache.get(1).is_some(), "bucket 1 should remain");
+        assert!(cache.get(2).is_none(), "bucket 2 should be invalidated");
+    }
 }

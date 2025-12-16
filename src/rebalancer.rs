@@ -865,4 +865,46 @@ mod tests {
         let centroid = compute_centroid(&[]);
         assert!(centroid.is_empty());
     }
+
+    /// Centroid of single vector is the vector itself.
+    #[test]
+    fn centroid_of_single_is_identity() {
+        let vectors = vec![Vector::new(0, vec![5.0, 10.0, 15.0])];
+        let centroid = compute_centroid(&vectors);
+        assert_eq!(centroid, vec![5.0, 10.0, 15.0]);
+    }
+
+    /// Centroid with many vectors maintains numerical stability.
+    #[test]
+    fn centroid_many_vectors() {
+        let n = 1000;
+        let vectors: Vec<Vector> = (0..n)
+            .map(|i| Vector::new(i as u64, vec![i as f32, (i * 2) as f32]))
+            .collect();
+        let centroid = compute_centroid(&vectors);
+        // Mean of 0..999 = 499.5, mean of 0..1998 (step 2) = 999
+        let expected_x = (0..n).sum::<usize>() as f32 / n as f32;
+        let expected_y = (0..n).map(|i| (i * 2) as f32).sum::<f32>() / n as f32;
+        assert!((centroid[0] - expected_x).abs() < 0.01);
+        assert!((centroid[1] - expected_y).abs() < 0.01);
+    }
+
+    /// Centroid with negative values.
+    #[test]
+    fn centroid_negative_values() {
+        let vectors = vec![
+            Vector::new(0, vec![-10.0, -20.0]),
+            Vector::new(1, vec![10.0, 20.0]),
+        ];
+        let centroid = compute_centroid(&vectors);
+        assert_eq!(centroid, vec![0.0, 0.0]);
+    }
+
+    /// Centroid of zero-dimension vectors is zero-dimension.
+    #[test]
+    fn centroid_zero_dimension() {
+        let vectors = vec![Vector::new(0, vec![]), Vector::new(1, vec![])];
+        let centroid = compute_centroid(&vectors);
+        assert!(centroid.is_empty());
+    }
 }

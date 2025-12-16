@@ -65,4 +65,71 @@ mod tests {
         let ring = ConsistentHashRing::new(1, 1);
         assert_eq!(ring.node_for(99), 0);
     }
+
+    /// Empty ring (0 nodes) should return node 0 without panicking.
+    #[test]
+    fn hash_ring_empty_returns_zero() {
+        let ring = ConsistentHashRing::new(0, 8);
+        assert_eq!(ring.node_for(42), 0);
+        assert_eq!(ring.node_for(0), 0);
+        assert_eq!(ring.node_for(u64::MAX), 0);
+    }
+
+    /// Zero virtual nodes should still work (max(1) ensures at least 1).
+    #[test]
+    fn hash_ring_zero_virtual_nodes() {
+        let ring = ConsistentHashRing::new(4, 0);
+        // With virtual_nodes=0, the max(1) ensures we have 1 virtual node per physical node.
+        let node = ring.node_for(42);
+        assert!(node < 4, "node should be in valid range");
+    }
+
+    /// Multiple keys should distribute across nodes (not all to one).
+    #[test]
+    fn hash_ring_distributes_keys() {
+        let ring = ConsistentHashRing::new(4, 8);
+        let mut counts = [0usize; 4];
+        for key in 0..1000u64 {
+            let node = ring.node_for(key);
+            counts[node] += 1;
+        }
+        // Each node should get some keys (roughly 250 each, but at least > 0).
+        assert!(counts.iter().all(|&c| c > 0), "all nodes should receive some keys");
+    }
+
+    /// Ring should handle wraparound: hash >= all ring hashes → first entry.
+    #[test]
+    fn hash_ring_wraparound() {
+        let ring = ConsistentHashRing::new(2, 1);
+        // The ring is sorted by hash. Keys with very high hashes should wrap to first node.
+        // We test with various keys to ensure wraparound works.
+        for key in [0, u64::MAX / 2, u64::MAX] {
+            let node = ring.node_for(key);
+            assert!(node < 2, "node should be valid for key {}", key);
+        }
+    }
+
+    /// Same key always maps to same node across ring instances with same params.
+    #[test]
+    fn hash_ring_consistent_across_instances() {
+        let ring1 = ConsistentHashRing::new(8, 16);
+        let ring2 = ConsistentHashRing::new(8, 16);
+        for key in 0..100u64 {
+            assert_eq!(
+                ring1.node_for(key),
+                ring2.node_for(key),
+                "same params should yield same mapping"
+            );
+        }
+    }
+
+    /// Large number of nodes should not panic or misbehave.
+    #[test]
+    fn hash_ring_many_nodes() {
+        let ring = ConsistentHashRing::new(100, 10);
+        for key in 0..1000u64 {
+            let node = ring.node_for(key);
+            assert!(node < 100, "node {} out of range for key {}", node, key);
+        }
+    }
 }

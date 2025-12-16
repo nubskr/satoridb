@@ -116,4 +116,95 @@ mod tests {
         assert_eq!(bytes[2], 255);
         assert_eq!(bytes[3], 255);
     }
+
+    /// When min == max (zero range), scale should be 0 and all values quantize to 0.
+    #[test]
+    fn zero_range_quantizes_to_zero() {
+        let q = Quantizer::new(5.0, 5.0);
+        assert_eq!(q.scale, 0.0, "zero range should have scale=0");
+        let bytes = q.quantize(&[5.0, 5.0, 5.0]);
+        // With scale=0, the formula becomes: (x - min) * 0 = 0
+        assert!(bytes.iter().all(|&b| b == 0), "all values should quantize to 0");
+    }
+
+    /// Very small range (< f32::EPSILON) triggers scale=0 to avoid overflow.
+    #[test]
+    fn tiny_range_uses_zero_scale() {
+        let q = Quantizer::new(0.0, 1e-10);
+        // Range is smaller than f32::EPSILON, so scale is set to 0 for safety.
+        assert_eq!(q.scale, 0.0, "tiny range should use scale=0");
+        let bytes = q.quantize(&[0.0, 1e-10]);
+        // With scale=0, all values quantize to 0
+        assert!(bytes.iter().all(|&b| b == 0), "scale=0 means all values -> 0");
+    }
+
+    /// Range just above f32::EPSILON should work normally.
+    #[test]
+    fn range_above_epsilon_works() {
+        let q = Quantizer::new(0.0, 1e-6);
+        // 1e-6 > f32::EPSILON, so scale should be non-zero
+        assert!(q.scale > 0.0, "range above epsilon should have positive scale");
+        let bytes = q.quantize(&[0.0, 1e-6]);
+        assert_eq!(bytes[0], 0);
+        assert_eq!(bytes[1], 255);
+    }
+
+    /// Negative values should quantize correctly.
+    #[test]
+    fn negative_values_quantize() {
+        let q = Quantizer::new(-10.0, 10.0);
+        let bytes = q.quantize(&[-10.0, 0.0, 10.0]);
+        assert_eq!(bytes[0], 0);
+        assert_eq!(bytes[1], 127); // midpoint
+        assert_eq!(bytes[2], 255);
+    }
+
+    /// Values outside range should clamp to 0 or 255.
+    #[test]
+    fn out_of_range_clamps() {
+        let q = Quantizer::new(0.0, 100.0);
+        let bytes = q.quantize(&[-50.0, 150.0]);
+        assert_eq!(bytes[0], 0, "below min should clamp to 0");
+        assert_eq!(bytes[1], 255, "above max should clamp to 255");
+    }
+
+    /// compute_bounds_from_minmax with invalid inputs returns None.
+    #[test]
+    fn invalid_bounds_returns_none() {
+        // min > max
+        assert!(Quantizer::compute_bounds_from_minmax(10.0, 5.0).is_none());
+        // NaN
+        assert!(Quantizer::compute_bounds_from_minmax(f32::NAN, 5.0).is_none());
+        assert!(Quantizer::compute_bounds_from_minmax(0.0, f32::NAN).is_none());
+        // Infinity
+        assert!(Quantizer::compute_bounds_from_minmax(f32::NEG_INFINITY, 5.0).is_none());
+        assert!(Quantizer::compute_bounds_from_minmax(0.0, f32::INFINITY).is_none());
+    }
+
+    /// Vectors with all same values should still produce valid bounds.
+    #[test]
+    fn constant_vectors_produce_bounds() {
+        let result = Quantizer::compute_bounds(&[vec![5.0, 5.0, 5.0]]);
+        assert!(result.is_some());
+        let (min, max) = result.unwrap();
+        // With padding, we should have min < max
+        assert!(min < max, "padding should ensure min < max");
+    }
+
+    /// quantize_into reuses the destination buffer.
+    #[test]
+    fn quantize_into_reuses_buffer() {
+        let q = Quantizer::new(0.0, 10.0);
+        let mut dst = Vec::with_capacity(100);
+        q.quantize_into(&[0.0, 5.0, 10.0], &mut dst);
+        assert_eq!(dst.len(), 3);
+        assert_eq!(dst[0], 0);
+        assert_eq!(dst[1], 127);
+        assert_eq!(dst[2], 255);
+
+        // Reuse for different input
+        q.quantize_into(&[2.5], &mut dst);
+        assert_eq!(dst.len(), 1);
+        assert_eq!(dst[0], 63); // 2.5 / 10 * 255 ≈ 63
+    }
 }
