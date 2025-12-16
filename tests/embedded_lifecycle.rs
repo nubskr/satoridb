@@ -6,8 +6,7 @@ use satoridb::wal::runtime::Walrus;
 use tempfile::TempDir;
 
 fn init_wal(tempdir: &TempDir) -> Arc<Walrus> {
-    std::env::set_var("WALRUS_DATA_DIR", tempdir.path());
-    Arc::new(Walrus::new().expect("walrus init"))
+    Arc::new(Walrus::with_data_dir(tempdir.path().to_path_buf()).expect("walrus init"))
 }
 
 /// SatoriDb::start with 0 workers should fail.
@@ -192,9 +191,9 @@ fn virtual_nodes_config() -> Result<()> {
     Ok(())
 }
 
-/// Query with no data returns empty.
+/// Query with no data returns error (router not initialized).
 #[test]
-fn query_empty_returns_empty() -> Result<()> {
+fn query_empty_returns_error() -> Result<()> {
     let tmp = tempfile::tempdir()?;
     let wal = init_wal(&tmp);
 
@@ -204,9 +203,9 @@ fn query_empty_returns_empty() -> Result<()> {
     let db = SatoriDb::start(cfg)?;
     let handle = db.handle();
 
-    // Query on empty database
-    let results = handle.query_blocking(vec![1.0, 2.0], 10, 5)?;
-    assert!(results.is_empty(), "empty database should return no results");
+    // Query on empty database returns error because router not initialized
+    let result = handle.query_blocking(vec![1.0, 2.0], 10, 5);
+    assert!(result.is_err(), "query on empty database should return error");
 
     db.shutdown()?;
     Ok(())

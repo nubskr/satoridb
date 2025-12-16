@@ -9,8 +9,7 @@ use satoridb::storage::{Storage, Vector};
 use satoridb::wal::runtime::Walrus;
 
 fn init_wal(tmp: &tempfile::TempDir) -> Arc<Walrus> {
-    std::env::set_var("WALRUS_DATA_DIR", tmp.path());
-    Arc::new(Walrus::new().expect("walrus init"))
+    Arc::new(Walrus::with_data_dir(tmp.path().to_path_buf()).expect("walrus init"))
 }
 
 /// Stress that an Executor can be used from multiple threads concurrently while

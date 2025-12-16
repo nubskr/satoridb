@@ -13,8 +13,7 @@ use std::sync::Arc;
 use tempfile::{tempdir, NamedTempFile, TempDir};
 
 fn init_wal(tempdir: &TempDir) -> Arc<Walrus> {
-    std::env::set_var("WALRUS_DATA_DIR", tempdir.path());
-    Arc::new(Walrus::new().expect("walrus init"))
+    Arc::new(Walrus::with_data_dir(tempdir.path().to_path_buf()).expect("walrus init"))
 }
 
 #[test]

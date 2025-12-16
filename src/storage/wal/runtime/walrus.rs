@@ -71,6 +71,28 @@ impl Walrus {
         Self::with_paths(Arc::new(paths), mode, fsync_schedule)
     }
 
+    /// Create a Walrus instance with a specific data directory.
+    /// This bypasses the `WALRUS_DATA_DIR` environment variable entirely,
+    /// making it safe for parallel tests.
+    pub fn with_data_dir(data_dir: std::path::PathBuf) -> std::io::Result<Self> {
+        Self::with_data_dir_and_options(
+            data_dir,
+            ReadConsistency::StrictlyAtOnce,
+            FsyncSchedule::Milliseconds(200),
+        )
+    }
+
+    /// Create a Walrus instance with a specific data directory and options.
+    /// This bypasses the `WALRUS_DATA_DIR` environment variable entirely.
+    pub fn with_data_dir_and_options(
+        data_dir: std::path::PathBuf,
+        mode: ReadConsistency,
+        fsync_schedule: FsyncSchedule,
+    ) -> std::io::Result<Self> {
+        let paths = WalPathManager::with_root(data_dir);
+        Self::with_paths(Arc::new(paths), mode, fsync_schedule)
+    }
+
     fn with_paths(
         paths: Arc<WalPathManager>,
         mode: ReadConsistency,

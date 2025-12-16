@@ -26,6 +26,12 @@ impl WalPathManager {
         Self { root }
     }
 
+    /// Create a WalPathManager with a specific root directory.
+    /// This bypasses the `WALRUS_DATA_DIR` environment variable entirely.
+    pub(crate) fn with_root(root: PathBuf) -> Self {
+        Self { root }
+    }
+
     pub(crate) fn ensure_root(&self) -> std::io::Result<()> {
         fs::create_dir_all(&self.root)
     }

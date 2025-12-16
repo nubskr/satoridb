@@ -7,19 +7,11 @@ use satoridb::{SatoriDb, SatoriDbConfig};
 #[test]
 fn embedded_upsert_then_query_smoke() {
     let tmp = tempfile::tempdir().expect("tempdir");
-    std::env::set_var("WALRUS_DATA_DIR", tmp.path());
     std::env::set_var("WALRUS_QUIET", "1");
 
-    let key = format!(
-        "e2e-{}",
-        std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap()
-            .as_nanos()
-    );
     let wal = Arc::new(
-        Walrus::with_consistency_and_schedule_for_key(
-            &key,
+        Walrus::with_data_dir_and_options(
+            tmp.path().to_path_buf(),
             ReadConsistency::StrictlyAtOnce,
             FsyncSchedule::NoFsync,
         )

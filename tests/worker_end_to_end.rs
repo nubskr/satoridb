@@ -11,10 +11,10 @@ use satoridb::wal::{FsyncSchedule, ReadConsistency};
 use satoridb::worker::{run_worker, QueryRequest, WorkerMessage};
 
 fn init_wal(tmp: &tempfile::TempDir) -> Arc<Walrus> {
-    std::env::set_var("WALRUS_DATA_DIR", tmp.path());
     std::env::set_var("WALRUS_QUIET", "1");
     Arc::new(
-        Walrus::with_consistency_and_schedule(
+        Walrus::with_data_dir_and_options(
+            tmp.path().to_path_buf(),
             ReadConsistency::StrictlyAtOnce,
             FsyncSchedule::NoFsync,
         )

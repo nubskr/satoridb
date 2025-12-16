@@ -7,12 +7,11 @@ use satoridb::{SatoriDb, SatoriDbConfig};
 #[test]
 fn embedded_basic_example_works() {
     let tmp = tempfile::tempdir().unwrap();
-    std::env::set_var("WALRUS_DATA_DIR", tmp.path());
     std::env::set_var("WALRUS_QUIET", "1");
 
     let wal = Arc::new(
-        Walrus::with_consistency_and_schedule_for_key(
-            "embedded_basic_example_works",
+        Walrus::with_data_dir_and_options(
+            tmp.path().to_path_buf(),
             ReadConsistency::StrictlyAtOnce,
             FsyncSchedule::NoFsync,
         )
