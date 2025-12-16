@@ -290,3 +290,120 @@ struct RoutingData {
     router: Arc<Router>,
     changed: Arc<Vec<u64>>,
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::quantizer::Quantizer;
+
+    /// Query with top_k=0 returns empty vec.
+    #[test]
+    fn router_query_topk_zero_returns_empty() {
+        let q = Quantizer::new(0.0, 1.0);
+        let mut router = Router::new(10, q);
+        router.add_centroid(0, &[0.5, 0.5]);
+        let result = router.query(&[0.5, 0.5], 0).unwrap();
+        assert!(result.is_empty(), "top_k=0 should return empty");
+    }
+
+    /// Query on empty router returns empty vec.
+    #[test]
+    fn router_query_empty_returns_empty() {
+        let q = Quantizer::new(0.0, 1.0);
+        let router = Router::new(10, q);
+        let result = router.query(&[0.5, 0.5], 5).unwrap();
+        assert!(result.is_empty(), "empty router should return empty");
+    }
+
+    /// Adding centroids and querying returns reasonable results.
+    #[test]
+    fn router_query_finds_nearest() {
+        let q = Quantizer::new(0.0, 10.0);
+        let mut router = Router::new(10, q);
+        router.add_centroid(0, &[0.0, 0.0]);
+        router.add_centroid(1, &[10.0, 10.0]);
+
+        // Query near (0,0) should return centroid 0 first
+        let result = router.query(&[0.1, 0.1], 2).unwrap();
+        assert!(!result.is_empty());
+        assert_eq!(result[0], 0, "should find centroid 0 first");
+    }
+
+    /// RoutingTable version starts at 0.
+    #[test]
+    fn routing_table_version_starts_zero() {
+        let table = RoutingTable::new();
+        assert_eq!(table.current_version(), 0);
+    }
+
+    /// RoutingTable snapshot is None before any install.
+    #[test]
+    fn routing_table_snapshot_none_initially() {
+        let table = RoutingTable::new();
+        assert!(table.snapshot().is_none());
+    }
+
+    /// RoutingTable install bumps version by 1.
+    #[test]
+    fn routing_table_install_bumps_version() {
+        let table = RoutingTable::new();
+        let q = Quantizer::new(0.0, 1.0);
+        let router = Router::new(10, q);
+
+        let v1 = table.install(router, vec![]);
+        assert_eq!(v1, 1);
+        assert_eq!(table.current_version(), 1);
+
+        let q2 = Quantizer::new(0.0, 1.0);
+        let router2 = Router::new(10, q2);
+        let v2 = table.install(router2, vec![1, 2, 3]);
+        assert_eq!(v2, 2);
+        assert_eq!(table.current_version(), 2);
+    }
+
+    /// RoutingTable snapshot returns consistent data after install.
+    #[test]
+    fn routing_table_snapshot_consistent() {
+        let table = RoutingTable::new();
+        let q = Quantizer::new(0.0, 1.0);
+        let mut router = Router::new(10, q);
+        router.add_centroid(42, &[0.5, 0.5]);
+
+        table.install(router, vec![42, 99]);
+
+        let snap = table.snapshot().expect("snapshot should exist");
+        assert_eq!(snap.version, 1);
+        assert_eq!(snap.changed.len(), 2);
+        assert!(snap.changed.contains(&42));
+        assert!(snap.changed.contains(&99));
+    }
+
+    /// Multiple concurrent snapshots don't interfere.
+    #[test]
+    fn routing_table_concurrent_snapshots() {
+        let table = Arc::new(RoutingTable::new());
+        let q = Quantizer::new(0.0, 1.0);
+        let router = Router::new(10, q);
+        table.install(router, vec![1]);
+
+        std::thread::scope(|s| {
+            for _ in 0..4 {
+                let t = table.clone();
+                s.spawn(move || {
+                    for _ in 0..100 {
+                        let snap = t.snapshot();
+                        assert!(snap.is_some());
+                        assert!(snap.unwrap().version >= 1);
+                    }
+                });
+            }
+        });
+    }
+
+    /// RoutingTable is Send + Sync.
+    #[test]
+    fn routing_table_is_send_sync() {
+        fn assert_send_sync<T: Send + Sync>() {}
+        assert_send_sync::<RoutingTable>();
+    }
+}
