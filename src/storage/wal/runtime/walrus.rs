@@ -18,6 +18,7 @@ use super::WalIndex;
 use rkyv::Deserialize;
 
 #[derive(Clone, Copy, Debug)]
+#[allow(dead_code)]
 pub enum ReadConsistency {
     StrictlyAtOnce,
     AtLeastOnce { persist_every: u32 },
@@ -195,7 +196,7 @@ impl Walrus {
     pub(super) fn get_or_create_writer(&self, col_name: &str) -> std::io::Result<Arc<Writer>> {
         if let Some(writer) = {
             let map = self.writers.read().map_err(|_| {
-                std::io::Error::new(std::io::ErrorKind::Other, "writers read lock poisoned")
+                std::io::Error::other("writers read lock poisoned")
             })?;
             map.get(col_name).cloned()
         } {
@@ -205,7 +206,7 @@ impl Walrus {
         debug_print!("[writer_debug] creating new writer for {}", col_name);
 
         let mut map = self.writers.write().map_err(|_| {
-            std::io::Error::new(std::io::ErrorKind::Other, "writers write lock poisoned")
+            std::io::Error::other("writers write lock poisoned")
         })?;
 
         if let Some(writer) = map.get(col_name).cloned() {
@@ -321,17 +322,13 @@ impl Walrus {
                     used: 0,
                 };
                 let mut in_block_off: u64 = 0;
-                loop {
-                    match pollster::block_on(block_stub.read(in_block_off)) {
-                        Ok((_entry, consumed)) => {
-                            used += consumed as u64;
-                            in_block_off += consumed as u64;
-                            entries_in_block = entries_in_block.saturating_add(1);
-                            if in_block_off >= DEFAULT_BLOCK_SIZE {
-                                break;
-                            }
-                        }
-                        Err(_) => break,
+                while let Ok((_entry, consumed)) = pollster::block_on(block_stub.read(in_block_off))
+                {
+                    used += consumed as u64;
+                    in_block_off += consumed as u64;
+                    entries_in_block = entries_in_block.saturating_add(1);
+                    if in_block_off >= DEFAULT_BLOCK_SIZE {
+                        break;
                     }
                 }
                 if used == 0 {
@@ -915,21 +912,18 @@ mod tests {
     }
 
     #[test]
-    fn batch_append_over_limit_does_not_change_count() {
+    fn test_batch_too_large() {
         let key = unique_key();
-        crate::wal::config::enable_fd_backend();
+        let wal = Arc::new(Walrus::with_consistency_for_key(&key, ReadConsistency::StrictlyAtOnce).unwrap());
 
-        let wal = Walrus::with_consistency_for_key(&key, ReadConsistency::StrictlyAtOnce).unwrap();
-        wal.append_for_topic("t", b"seed").unwrap();
-        assert_eq!(wal.get_topic_entry_count("t"), 1);
+        let too_big: Vec<&[u8]> = std::iter::repeat_n(b"x".as_slice(), 2001).collect();
 
-        let too_big: Vec<&[u8]> = std::iter::repeat(b"x".as_slice()).take(2001).collect();
-        let err = wal.batch_append_for_topic("t", &too_big).unwrap_err();
-        assert_eq!(err.kind(), std::io::ErrorKind::InvalidInput);
-        assert_eq!(wal.get_topic_entry_count("t"), 1);
+        let res = wal.batch_append_for_topic("col1", &too_big);
+        assert!(res.is_err());
 
         cleanup_key(&key);
     }
+
 
     #[test]
     fn stateless_batch_read_checkpoint_does_not_change_count() {

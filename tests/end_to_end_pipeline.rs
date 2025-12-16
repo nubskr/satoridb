@@ -22,11 +22,12 @@ fn storage_executor_pipeline_finds_nearest_vectors() -> Result<()> {
     let storage = Storage::new(wal);
 
     // Two clearly separated clusters; ids encoded by cluster.
-    let mut vectors = Vec::new();
-    vectors.push(Vector::new(1, vec![0.0, 0.0]));
-    vectors.push(Vector::new(2, vec![0.2, 0.1]));
-    vectors.push(Vector::new(101, vec![10.0, 10.0]));
-    vectors.push(Vector::new(102, vec![9.8, 10.1]));
+    let vectors = vec![
+        Vector::new(1, vec![0.0, 0.0]),
+        Vector::new(2, vec![0.2, 0.1]),
+        Vector::new(101, vec![10.0, 10.0]),
+        Vector::new(102, vec![9.8, 10.1]),
+    ];
 
     // Let the indexer build buckets and persist them.
     let mut buckets = Indexer::build_clusters(vectors, 2);

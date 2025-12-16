@@ -33,12 +33,12 @@ impl Reader {
         // fast path: try read-lock map and use per-column lock
         if let Some(info_arc) = {
             let map = self.data.read().map_err(|_| {
-                io::Error::new(io::ErrorKind::Other, "reader map read lock poisoned")
+                io::Error::other("reader map read lock poisoned")
             })?;
             map.get(col).cloned()
         } {
             let mut info = info_arc.write().map_err(|_| {
-                io::Error::new(io::ErrorKind::Other, "col info write lock poisoned")
+                io::Error::other("col info write lock poisoned")
             })?;
             let before = info.chain.len();
             info.chain.push(block.clone());
@@ -61,7 +61,7 @@ impl Reader {
         // slow path
         let info_arc = {
             let mut map = self.data.write().map_err(|_| {
-                io::Error::new(io::ErrorKind::Other, "reader map write lock poisoned")
+                io::Error::other("reader map write lock poisoned")
             })?;
             map.entry(col.to_string())
                 .or_insert_with(|| {
@@ -79,7 +79,7 @@ impl Reader {
         };
         let mut info = info_arc
             .write()
-            .map_err(|_| io::Error::new(io::ErrorKind::Other, "col info write lock poisoned"))?;
+            .map_err(|_| io::Error::other("col info write lock poisoned"))?;
         info.chain.push(block.clone());
         // If we were reading this as the active tail, carry over progress to sealed chain
         let new_idx = info.chain.len().saturating_sub(1);

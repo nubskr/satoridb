@@ -56,8 +56,8 @@ pub struct Storage {
 }
 
 thread_local! {
-    static TL_BACKING: RefCell<Vec<u8>> = RefCell::new(Vec::new());
-    static TL_RANGES: RefCell<Vec<(usize, usize)>> = RefCell::new(Vec::new());
+    static TL_BACKING: RefCell<Vec<u8>> = const { RefCell::new(Vec::new()) };
+    static TL_RANGES: RefCell<Vec<(usize, usize)>> = const { RefCell::new(Vec::new()) };
 }
 
 #[derive(Archive, Deserialize, Serialize, Debug, PartialEq, Clone)]

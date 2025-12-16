@@ -19,6 +19,7 @@ impl WalPathManager {
         Self { root }
     }
 
+    #[allow(dead_code)]
     pub(crate) fn for_key(key: &str) -> Self {
         let mut root = wal_data_dir();
         root.push(sanitize_namespace(key));
@@ -60,12 +61,14 @@ thread_local! {
     static THREAD_NAMESPACE: RefCell<Option<String>> = const { RefCell::new(None) };
 }
 
+#[allow(dead_code)]
 pub(crate) fn set_thread_namespace(key: &str) {
     THREAD_NAMESPACE.with(|tls| {
         *tls.borrow_mut() = Some(key.to_string());
     });
 }
 
+#[allow(dead_code)]
 pub(crate) fn clear_thread_namespace() {
     THREAD_NAMESPACE.with(|tls| {
         tls.borrow_mut().take();

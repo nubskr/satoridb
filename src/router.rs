@@ -60,7 +60,7 @@ impl Router {
 
     #[inline(always)]
     pub fn query(&self, vector: &[f32], top_k: usize) -> Result<Vec<u64>> {
-        if top_k == 0 || self.index.len() == 0 {
+        if top_k == 0 || self.index.is_empty() {
             return Ok(Vec::new());
         }
 
@@ -142,6 +142,7 @@ impl Router {
     // ----------------------------
 
     #[inline(always)]
+    #[allow(clippy::uninit_vec)]
     fn quantize_into_unpadded(&self, src: &[f32], dst: &mut Vec<u8>) {
         dst.clear();
         dst.reserve(src.len());
@@ -152,6 +153,7 @@ impl Router {
     /// Quantize into a padded buffer of length `pad`, padding with 0.
     /// This matches HnswIndex's current insert-side padding semantics.
     #[inline(always)]
+    #[allow(clippy::uninit_vec)]
     fn quantize_into_padded_zero(&self, src: &[f32], pad: usize, dst: &mut Vec<u8>) {
         dst.clear();
         dst.reserve(pad);
@@ -176,31 +178,10 @@ impl Router {
         let mut i = 0usize;
 
         while i + 4 <= len {
-            let mut v0 = src[i].mul_add(scale, bias);
-            let mut v1 = src[i + 1].mul_add(scale, bias);
-            let mut v2 = src[i + 2].mul_add(scale, bias);
-            let mut v3 = src[i + 3].mul_add(scale, bias);
-
-            if v0 < 0.0 {
-                v0 = 0.0;
-            } else if v0 > 255.0 {
-                v0 = 255.0;
-            }
-            if v1 < 0.0 {
-                v1 = 0.0;
-            } else if v1 > 255.0 {
-                v1 = 255.0;
-            }
-            if v2 < 0.0 {
-                v2 = 0.0;
-            } else if v2 > 255.0 {
-                v2 = 255.0;
-            }
-            if v3 < 0.0 {
-                v3 = 0.0;
-            } else if v3 > 255.0 {
-                v3 = 255.0;
-            }
+            let v0 = src[i].mul_add(scale, bias).clamp(0.0, 255.0);
+            let v1 = src[i + 1].mul_add(scale, bias).clamp(0.0, 255.0);
+            let v2 = src[i + 2].mul_add(scale, bias).clamp(0.0, 255.0);
+            let v3 = src[i + 3].mul_add(scale, bias).clamp(0.0, 255.0);
 
             out[i] = v0 as u8;
             out[i + 1] = v1 as u8;
@@ -211,12 +192,7 @@ impl Router {
         }
 
         while i < len {
-            let mut v = src[i].mul_add(scale, bias);
-            if v < 0.0 {
-                v = 0.0;
-            } else if v > 255.0 {
-                v = 255.0;
-            }
+            let v = src[i].mul_add(scale, bias).clamp(0.0, 255.0);
             out[i] = v as u8;
             i += 1;
         }
@@ -242,9 +218,9 @@ impl Router {
 
                 worst_idx = 0;
                 worst = best[0].0;
-                for j in 1..top_k {
-                    if best[j].0 > worst {
-                        worst = best[j].0;
+                for (j, (dist, _)) in best.iter().enumerate().take(top_k).skip(1) {
+                    if *dist > worst {
+                        worst = *dist;
                         worst_idx = j;
                     }
                 }
@@ -261,6 +237,12 @@ impl Router {
 pub struct RoutingTable {
     version: Arc<AtomicU64>,
     router: Arc<RwLock<Option<RoutingData>>>,
+}
+
+impl Default for RoutingTable {
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 impl RoutingTable {

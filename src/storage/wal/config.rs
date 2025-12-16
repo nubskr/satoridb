@@ -6,11 +6,13 @@ use std::time::SystemTime;
 pub(crate) static USE_FD_BACKEND: AtomicBool = AtomicBool::new(true);
 
 // Public function to enable FD backend
+#[allow(dead_code)]
 pub fn enable_fd_backend() {
     USE_FD_BACKEND.store(true, Ordering::Relaxed);
 }
 
 // Public function to disable FD backend (use mmap instead)
+#[allow(dead_code)]
 pub fn disable_fd_backend() {
     USE_FD_BACKEND.store(false, Ordering::Relaxed);
 }
@@ -27,6 +29,7 @@ macro_rules! debug_print {
 pub(crate) use debug_print;
 
 #[derive(Clone, Copy, Debug)]
+#[allow(dead_code)]
 pub enum FsyncSchedule {
     Milliseconds(u64),
     SyncEach, // fsync after every single entry
@@ -35,7 +38,7 @@ pub enum FsyncSchedule {
 
 pub(crate) const DEFAULT_BLOCK_SIZE: u64 = 10 * 1024 * 1024; // 10mb
 pub(crate) const BLOCKS_PER_FILE: u64 = 100;
-pub(crate) const MAX_ALLOC: u64 = 1 * 1024 * 1024 * 1024; // 1 GiB cap per block
+pub(crate) const MAX_ALLOC: u64 = 1024 * 1024 * 1024; // 1 GiB cap per block
                                                           // Expose so integration tests can match the on-disk layout when poking raw files.
 pub const PREFIX_META_SIZE: usize = 256;
 pub(crate) const MAX_FILE_SIZE: u64 = DEFAULT_BLOCK_SIZE * BLOCKS_PER_FILE;

@@ -82,13 +82,8 @@ impl Quantizer {
 #[inline(always)]
 fn quant_one(x: f32, min: f32, scale: f32) -> u8 {
     // uses mul_add where possible; avoids clamp() overhead
-    let mut v = x.mul_add(scale, -min * scale);
-    if v < 0.0 {
-        v = 0.0;
-    } else if v > 255.0 {
-        v = 255.0;
-    }
-    v as u8
+    let v = x.mul_add(scale, -min * scale);
+    v.clamp(0.0, 255.0) as u8
 }
 
 #[cfg(test)]
@@ -96,11 +91,11 @@ mod tests {
     use super::*;
 
     #[test]
-    fn computes_bounds_with_padding() {
-        let (min, max) =
-            Quantizer::compute_bounds(&vec![vec![0.0, 1.0, 2.0], vec![-1.0, 3.0]]).unwrap();
-        assert!(min < -1.0);
-        assert!(max > 3.0);
+    fn test_compute_bounds() {
+        assert!(
+            Quantizer::compute_bounds(&[vec![0.0, 1.0, 2.0], vec![-1.0, 3.0]]).unwrap()
+                == (-1.0, 3.0)
+        );
     }
 
     #[test]

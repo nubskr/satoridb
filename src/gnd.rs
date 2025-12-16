@@ -17,10 +17,10 @@ impl GndReader {
         let mut archive = Archive::new(decoder);
 
         // Find the .ivecs file inside tar
-        let mut entries = archive.entries()?;
+        let entries = archive.entries()?;
         let mut ivecs_data = Vec::new();
 
-        while let Some(entry) = entries.next() {
+        for entry in entries {
             let mut entry = entry?;
             let path = entry.path()?;
             if let Some(ext) = path.extension() {
@@ -45,7 +45,7 @@ impl GndReader {
 
         loop {
             // Read dim (K)
-            if let Err(_) = reader.read_exact(&mut buf) {
+            if reader.read_exact(&mut buf).is_err() {
                 break; // EOF
             }
             let k = u32::from_le_bytes(buf) as usize;
@@ -68,7 +68,6 @@ mod tests {
     use super::*;
     use flate2::write::GzEncoder;
     use flate2::Compression;
-    use std::io::Write;
     use tar::Builder;
     use tempfile::NamedTempFile;
 

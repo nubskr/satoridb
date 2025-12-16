@@ -82,7 +82,7 @@ fn is_fvecs(path: &Path) -> bool {
                 || (is_gz(path)
                     && path
                         .file_stem()
-                        .map_or(false, |s| s.to_string_lossy().ends_with("fvecs")))
+                        .is_some_and(|s| s.to_string_lossy().ends_with("fvecs")))
         })
         .unwrap_or(false)
 }
@@ -94,7 +94,7 @@ fn is_bvecs(path: &Path) -> bool {
                 || (is_gz(path)
                     && path
                         .file_stem()
-                        .map_or(false, |s| s.to_string_lossy().ends_with("bvecs")))
+                        .is_some_and(|s| s.to_string_lossy().ends_with("bvecs")))
         })
         .unwrap_or(false)
 }

@@ -17,4 +17,8 @@ pub trait WalrusFile: std::fmt::Debug {
 
     /// Get the current file length.
     async fn len(&self) -> Result<u64>;
+
+    async fn is_empty(&self) -> Result<bool> {
+        Ok(self.len().await? == 0)
+    }
 }

@@ -22,7 +22,9 @@ pub enum RebalanceTaskKind {
     Rebalance,
 }
 
-static FAIL_HOOK: StdMutex<Option<Arc<dyn Fn(RebalanceTaskKind) -> bool + Send + Sync>>> =
+type RebalanceFailHook = Arc<dyn Fn(RebalanceTaskKind) -> bool + Send + Sync>;
+
+static FAIL_HOOK: StdMutex<Option<RebalanceFailHook>> =
     StdMutex::new(None);
 
 pub fn set_rebalance_fail_hook<F>(hook: F)
@@ -516,6 +518,7 @@ async fn worker_loop_async(state: Arc<RebalanceState>, rx: Receiver<RebalanceTas
     }
 }
 
+#[allow(clippy::await_holding_lock)]
 async fn handle_split_async(state: Arc<RebalanceState>, bucket_id: u64) {
     if should_fail(RebalanceTaskKind::Split) {
         debug!(
@@ -610,9 +613,11 @@ async fn handle_split_async(state: Arc<RebalanceState>, bucket_id: u64) {
         state.centroids.read().len()
     );
 
+    drop(_guard);
     retire_io.await;
 }
 
+#[allow(clippy::await_holding_lock)]
 async fn handle_merge_async(state: Arc<RebalanceState>, a: u64, b: u64) {
     if should_fail(RebalanceTaskKind::Merge) {
         debug!(
@@ -703,10 +708,13 @@ async fn handle_merge_async(state: Arc<RebalanceState>, a: u64, b: u64) {
     drop(centroids);
     state.rebuild_router(vec![first, second, new_id]);
 
+    drop(_g1);
+    drop(_g2);
     retire_first_io.await;
     retire_second_io.await;
 }
 
+#[allow(clippy::await_holding_lock)]
 async fn handle_rebalance_async(state: Arc<RebalanceState>, bucket_id: u64) {
     if should_fail(RebalanceTaskKind::Rebalance) {
         debug!(

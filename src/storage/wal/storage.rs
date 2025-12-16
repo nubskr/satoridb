@@ -95,10 +95,7 @@ impl WalrusFile for StorageImpl {
                 let off = offset as usize;
                 let len = buf.len();
                 if off + len > mmap.len() {
-                    return Err(std::io::Error::new(
-                        std::io::ErrorKind::Other,
-                        "write beyond mmap bound",
-                    ));
+                    return Err(std::io::Error::other("write beyond mmap bound"));
                 }
                 unsafe {
                     let ptr = mmap.as_ptr() as *mut u8;
@@ -126,6 +123,7 @@ impl WalrusFile for StorageImpl {
 }
 
 impl StorageImpl {
+    #[allow(dead_code)]
     pub(crate) fn write(&self, offset: usize, data: &[u8]) {
         match self {
             StorageImpl::Mmap(mmap) => {
@@ -256,6 +254,7 @@ impl SharedMmap {
         }))
     }
 
+    #[allow(dead_code)]
     pub(crate) fn write(&self, offset: usize, data: &[u8]) {
         // Bounds check before raw copy to maintain memory safety
         debug_assert!(offset <= self.storage.len());
@@ -280,6 +279,7 @@ impl SharedMmap {
         self.storage.len()
     }
 
+    #[allow(dead_code)]
     pub(crate) fn flush(&self) -> std::io::Result<()> {
         self.storage.flush()
     }
@@ -321,7 +321,7 @@ impl SharedMmapKeeper {
         // Double-check with a fresh read lock to avoid unnecessary write lock
         {
             let keeper = keeper_lock.read().map_err(|_| {
-                std::io::Error::new(std::io::ErrorKind::Other, "mmap keeper read lock poisoned")
+                std::io::Error::other("mmap keeper read lock poisoned")
             })?;
             if let Some(existing) = keeper.data.get(path) {
                 return Ok(existing.clone());
@@ -329,7 +329,7 @@ impl SharedMmapKeeper {
         }
 
         let mut keeper = keeper_lock.write().map_err(|_| {
-            std::io::Error::new(std::io::ErrorKind::Other, "mmap keeper write lock poisoned")
+            std::io::Error::other("mmap keeper write lock poisoned")
         })?;
         if let Some(existing) = keeper.data.get(path) {
             return Ok(existing.clone());

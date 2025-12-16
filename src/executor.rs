@@ -20,7 +20,9 @@ struct CachedBucket {
     byte_size: usize,
 }
 
-static FAIL_LOAD_HOOK: StdMutex<Option<Arc<dyn Fn(u64) -> bool + Send + Sync>>> =
+type FailLoadHook = Arc<dyn Fn(u64) -> bool + Send + Sync>;
+
+static FAIL_LOAD_HOOK: StdMutex<Option<FailLoadHook>> =
     StdMutex::new(None);
 
 pub fn set_executor_fail_load_hook<F>(hook: F)

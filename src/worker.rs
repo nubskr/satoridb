@@ -69,7 +69,7 @@ pub async fn run_worker(id: usize, receiver: Receiver<WorkerMessage>, wal: Arc<W
                             req.affected_buckets,
                         )
                         .await;
-                    if let Err(_) = req.respond_to.send(result) {
+                    if req.respond_to.send(result).is_err() {
                         error!("Worker {} failed to send response back.", id);
                     }
                     // Release permit
@@ -86,8 +86,7 @@ pub async fn run_worker(id: usize, receiver: Receiver<WorkerMessage>, wal: Arc<W
                 bucket.vectors = vec![vector];
                 let result = storage
                     .put_chunk(&bucket)
-                    .await
-                    .map_err(anyhow::Error::from);
+                    .await;
                 let _ = respond_to.send(result);
             }
             WorkerMessage::Ingest { bucket_id, vectors } => {

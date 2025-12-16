@@ -85,8 +85,8 @@ impl Indexer {
                 let a0 = &vectors[0].data;
                 let mut b = 1usize;
                 let mut best = -1.0f32;
-                for i in 1..n {
-                    let d = l2_sq_scalar(a0, &vectors[i].data);
+                for (i, v) in vectors.iter().enumerate().skip(1) {
+                    let d = l2_sq_scalar(a0, &v.data);
                     if d > best {
                         best = d;
                         b = i;
@@ -96,8 +96,8 @@ impl Indexer {
                 let ab = &vectors[b].data;
                 let mut a = 0usize;
                 best = -1.0f32;
-                for i in 0..n {
-                    let d = l2_sq_scalar(ab, &vectors[i].data);
+                for (i, v) in vectors.iter().enumerate() {
+                    let d = l2_sq_scalar(ab, &v.data);
                     if d > best {
                         best = d;
                         a = i;
@@ -187,8 +187,8 @@ impl Indexer {
                 // Accumulate sums
                 let base = best * dim;
                 // Tight loop, no iterators
-                for d in 0..dim {
-                    sums[base + d] += x[d];
+                for (d, sum) in sums[base..base + dim].iter_mut().enumerate() {
+                    *sum += x[d];
                 }
                 counts[best] += 1;
             }
@@ -319,8 +319,8 @@ fn centroid_of(vectors: &[Vector], dim: usize) -> Vec<f32> {
     }
     let mut sums = vec![0.0f32; dim];
     for v in vectors {
-        for d in 0..dim {
-            sums[d] += v.data[d];
+        for (sum, val) in sums.iter_mut().zip(&v.data) {
+            *sum += val;
         }
     }
     let inv = 1.0 / vectors.len() as f32;
@@ -565,8 +565,8 @@ unsafe fn nearest_centroid_block8_avx2_fma(
 
         _mm256_storeu_ps(tmp.as_mut_ptr(), acc);
 
-        for lane in 0..8 {
-            let dist = tmp[lane];
+        for (lane, val) in tmp.iter().enumerate() {
+            let dist = *val;
             if dist < best_dist {
                 best_dist = dist;
                 best_c = base + lane;

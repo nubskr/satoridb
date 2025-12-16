@@ -52,10 +52,10 @@ impl Writer {
         }
 
         let mut block = self.current_block.lock().map_err(|_| {
-            std::io::Error::new(std::io::ErrorKind::Other, "current_block lock poisoned")
+            std::io::Error::other("current_block lock poisoned")
         })?;
         let mut cur = self.current_offset.lock().map_err(|_| {
-            std::io::Error::new(std::io::ErrorKind::Other, "current_offset lock poisoned")
+            std::io::Error::other("current_offset lock poisoned")
         })?;
 
         let need = (PREFIX_META_SIZE as u64) + (data.len() as u64);
@@ -185,10 +185,10 @@ impl Writer {
 
         // Phase 1: Pre-allocation & Planning
         let mut block = self.current_block.lock().map_err(|_| {
-            std::io::Error::new(std::io::ErrorKind::Other, "current_block lock poisoned")
+            std::io::Error::other("current_block lock poisoned")
         })?;
         let mut cur_offset = self.current_offset.lock().map_err(|_| {
-            std::io::Error::new(std::io::ErrorKind::Other, "current_offset lock poisoned")
+            std::io::Error::other("current_offset lock poisoned")
         })?;
 
         let mut revert_info = BatchRevertInfo {
@@ -305,10 +305,10 @@ struct BatchRevertInfo {
 impl Writer {
     pub(super) fn snapshot_block(&self) -> std::io::Result<(Block, u64)> {
         let block = self.current_block.lock().map_err(|_| {
-            std::io::Error::new(std::io::ErrorKind::Other, "current_block lock poisoned")
+            std::io::Error::other("current_block lock poisoned")
         })?;
         let offset = self.current_offset.lock().map_err(|_| {
-            std::io::Error::new(std::io::ErrorKind::Other, "current_offset lock poisoned")
+            std::io::Error::other("current_offset lock poisoned")
         })?;
         Ok((block.clone(), *offset))
     }

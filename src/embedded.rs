@@ -63,7 +63,7 @@ impl SatoriDb {
             let handle = thread::spawn(move || {
                 let builder = LocalExecutorBuilder::new(Placement::Fixed(pin_cpu))
                     .name(&format!("worker-{}", i));
-                let _ = builder
+                builder
                     .make()
                     .expect("failed to create executor")
                     .run(run_worker(i, receiver, wal_clone));

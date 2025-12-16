@@ -55,7 +55,7 @@ impl HnswIndex {
 
             entry: None,
             max_level: -1,
-            rng: StdRng::seed_from_u64(0xBAD5_EED),
+            rng: StdRng::seed_from_u64(0x0BAD_5EED),
 
             dot_fn,
             center_fn,
@@ -67,6 +67,11 @@ impl HnswIndex {
     #[inline(always)]
     pub fn len(&self) -> usize {
         self.inv_norms.len()
+    }
+
+    #[inline(always)]
+    pub fn is_empty(&self) -> bool {
+        self.len() == 0
     }
 
     #[inline(always)]
@@ -82,7 +87,7 @@ impl HnswIndex {
         top_k: usize,
         scratch: &mut Vec<(f32, usize)>,
     ) -> Vec<usize> {
-        if self.dim == 0 || query.len() != self.pad_dim || self.len() == 0 {
+        if self.dim == 0 || query.len() != self.pad_dim || self.is_empty() {
             return Vec::new();
         }
 
@@ -282,15 +287,16 @@ impl HnswIndex {
     }
 
     #[inline(always)]
+    #[allow(unused_unsafe)]
     fn prefetch_traversal(&self, id: usize) {
         #[cfg(target_arch = "x86_64")]
         unsafe {
             use std::arch::x86_64::_mm_prefetch;
             const HINT: i32 = std::arch::x86_64::_MM_HINT_T0;
             let ptr = self.traversal.as_ptr().add(id * self.pad_dim);
-            _mm_prefetch(ptr as *const i8, HINT);
+            _mm_prefetch(ptr, HINT);
             if self.pad_dim > 64 {
-                _mm_prefetch(ptr.add(64) as *const i8, HINT);
+                _mm_prefetch(ptr.add(64), HINT);
             }
         }
     }
@@ -405,7 +411,7 @@ impl HnswIndex {
                 if accepted.len() >= m {
                     break;
                 }
-                if !accepted.iter().any(|&x| x == cand.id) {
+                if !accepted.contains(&cand.id) {
                     accepted.push(cand.id);
                 }
             }
@@ -495,6 +501,7 @@ impl HnswIndex {
         }
     }
 
+    #[allow(dead_code)]
     fn trim_neighbors(&mut self, id: usize, level: i32) {
         let cap = self.m_for_level(level);
         if self.neighbors[id][level as usize].len() <= cap {
@@ -594,13 +601,13 @@ impl Eq for HeapItem {}
 
 impl PartialOrd for HeapItem {
     fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
-        other.dist.partial_cmp(&self.dist)
+        Some(self.cmp(other))
     }
 }
 
 impl Ord for HeapItem {
     fn cmp(&self, other: &Self) -> Ordering {
-        self.partial_cmp(other).unwrap_or(Ordering::Equal)
+        other.dist.partial_cmp(&self.dist).unwrap_or(Ordering::Equal)
     }
 }
 
@@ -879,7 +886,7 @@ mod tests {
 
     #[test]
     fn centers_bytes_to_i8_xor() {
-        let src = vec![0u8, 128, 255];
+        let src = [0u8, 128, 255];
         let (_, center_fn) = super::pick_kernels();
         let mut dst = vec![0i8; src.len()];
         unsafe { (center_fn)(src.as_ptr(), dst.as_mut_ptr(), src.len()) };

@@ -15,6 +15,7 @@ pub struct WalIndex {
 }
 
 impl WalIndex {
+    #[allow(dead_code)]
     pub fn new(file_name: &str) -> std::io::Result<Self> {
         let paths = WalPathManager::default();
         Self::new_in(&paths, file_name)
@@ -59,6 +60,7 @@ impl WalIndex {
         self.store.get(key)
     }
 
+    #[allow(dead_code)]
     pub fn remove(&mut self, key: &str) -> std::io::Result<Option<BlockPos>> {
         let result = self.store.remove(key);
         if result.is_some() {
@@ -70,10 +72,7 @@ impl WalIndex {
     fn persist(&self) -> std::io::Result<()> {
         let tmp_path = format!("{}.tmp", self.path);
         let bytes = rkyv::to_bytes::<_, 256>(&self.store).map_err(|e| {
-            std::io::Error::new(
-                std::io::ErrorKind::Other,
-                format!("index serialize failed: {:?}", e),
-            )
+            std::io::Error::other(format!("index serialize failed: {:?}", e))
         })?;
 
         fs::write(&tmp_path, &bytes)?;

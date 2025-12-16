@@ -90,7 +90,7 @@ impl BlockAllocator {
                 "invalid allocation size, a single entry can't be more than 1gb",
             ));
         }
-        let alloc_units = (want_bytes + DEFAULT_BLOCK_SIZE - 1) / DEFAULT_BLOCK_SIZE;
+        let alloc_units = want_bytes.div_ceil(DEFAULT_BLOCK_SIZE);
         let alloc_size = alloc_units * DEFAULT_BLOCK_SIZE;
         debug_print!(
             "[alloc] alloc_block: want_bytes={}, units={}, size={}",

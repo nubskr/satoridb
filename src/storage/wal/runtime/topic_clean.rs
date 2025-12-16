@@ -68,7 +68,7 @@ impl CleanMarkerStore {
         let mut guard = self
             .store
             .write()
-            .map_err(|_| std::io::Error::new(std::io::ErrorKind::Other, "store lock poisoned"))?;
+            .map_err(|_| std::io::Error::other("store lock poisoned"))?;
         for (topic, record) in updates {
             guard.insert(topic.clone(), record.clone());
         }
@@ -78,10 +78,7 @@ impl CleanMarkerStore {
     fn persist_map(path: &str, map: &HashMap<String, CleanMarkerRecord>) -> std::io::Result<()> {
         let tmp_path = format!("{}.tmp", path);
         let bytes = rkyv::to_bytes::<_, 256>(map).map_err(|e| {
-            std::io::Error::new(
-                std::io::ErrorKind::Other,
-                format!("clean marker serialize failed: {:?}", e),
-            )
+            std::io::Error::other(format!("clean marker serialize failed: {:?}", e))
         })?;
         fs::write(&tmp_path, &bytes)?;
         fs::File::open(&tmp_path)?.sync_all()?;
@@ -162,10 +159,12 @@ impl TopicCleanTracker {
         self.update_state(topic, false);
     }
 
+    #[allow(dead_code)]
     pub fn mark_clean(&self, topic: &str) {
         self.update_state(topic, true);
     }
 
+    #[allow(dead_code)]
     pub fn topic_is_clean(&self, topic: &str) -> bool {
         self.states
             .read()
