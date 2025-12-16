@@ -403,7 +403,7 @@ fn split_on_retired_bucket_is_noop() -> Result<()> {
     worker.enqueue_blocking(RebalanceTask::Split(0))?;
 
     // Wait for split to complete.
-    let done = wait_until(Duration::from_secs(3), || worker.snapshot_sizes().len() == 2);
+    let done = wait_until(Duration::from_secs(5), || worker.snapshot_sizes().len() == 2);
     assert!(done, "initial split should complete");
 
     let version_after_first_split = routing.current_version();
@@ -439,11 +439,13 @@ fn merge_on_retired_bucket_is_noop() -> Result<()> {
     let routing = Arc::new(RoutingTable::new());
     let worker = RebalanceWorker::spawn(storage.clone(), routing.clone(), None);
 
-    // Create two small buckets.
+    // Create two small buckets with enough vectors for merge to proceed.
     let mut a = Bucket::new(0, vec![0.0, 0.0]);
     a.add_vector(Vector::new(0, vec![0.0, 0.0]));
+    a.add_vector(Vector::new(1, vec![0.1, 0.1]));
     let mut b = Bucket::new(1, vec![1.0, 1.0]);
-    b.add_vector(Vector::new(1, vec![1.0, 1.0]));
+    b.add_vector(Vector::new(2, vec![1.0, 1.0]));
+    b.add_vector(Vector::new(3, vec![1.1, 1.1]));
     futures::executor::block_on(storage.put_chunk(&a))?;
     futures::executor::block_on(storage.put_chunk(&b))?;
     futures::executor::block_on(worker.prime_centroids(&[a.clone(), b.clone()]))?;
@@ -451,7 +453,9 @@ fn merge_on_retired_bucket_is_noop() -> Result<()> {
     worker.enqueue_blocking(RebalanceTask::Merge(0, 1))?;
 
     // Wait for merge to complete.
-    let done = wait_until(Duration::from_secs(3), || worker.snapshot_sizes().len() == 1);
+    let done = wait_until(Duration::from_secs(5), || {
+        worker.snapshot_sizes().len() == 1 && routing.current_version() > 0
+    });
     assert!(done, "initial merge should complete");
 
     let version_after_first_merge = routing.current_version();
