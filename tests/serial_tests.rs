@@ -2,7 +2,8 @@
 //! - Global fail hook interference between tests
 //! - CPU-intensive operations that starve other tests
 //!
-//! Run with: `cargo test --test serial_tests -- --test-threads=1`
+//! These tests are marked `#[ignore]` so they don't run with `cargo test`.
+//! Run with: `cargo test --test serial_tests -- --ignored --test-threads=1`
 
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -37,6 +38,7 @@ fn wait_until(timeout: Duration, mut f: impl FnMut() -> bool) -> bool {
 
 /// After a split completes and retires bucket X, enqueueing another Split(X) should be a no-op.
 #[test]
+#[ignore]
 fn split_on_retired_bucket_is_noop() -> Result<()> {
     clear_rebalance_fail_hook();
 
@@ -82,6 +84,7 @@ fn split_on_retired_bucket_is_noop() -> Result<()> {
 
 /// After a merge completes and retires buckets A and B, enqueueing Merge(A,B) again should be a no-op.
 #[test]
+#[ignore]
 fn merge_on_retired_bucket_is_noop() -> Result<()> {
     clear_rebalance_fail_hook();
 
@@ -137,6 +140,7 @@ fn merge_on_retired_bucket_is_noop() -> Result<()> {
 /// Large centroid set should still return the closest IDs when the graph path
 /// and EF autotuning are used.
 #[test]
+#[ignore]
 fn router_large_centroid_set_returns_nearest_ids() -> Result<()> {
     let mut router = Router::new(100_000, Quantizer::new(0.0, 100_000.0));
 
@@ -184,6 +188,7 @@ fn router_large_centroid_set_returns_nearest_ids() -> Result<()> {
 /// Very large centroid sets force the graph search path; ensure it returns
 /// non-empty and reasonably close neighbors.
 #[test]
+#[ignore]
 fn router_graph_path_returns_near_ids() -> Result<()> {
     let mut router = Router::new(200_000, Quantizer::new(0.0, 200_000.0));
     let total = 30_000u64;
