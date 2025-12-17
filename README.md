@@ -64,5 +64,19 @@ cargo run --example embedded_basic
 ## Test
 
 ```bash
+# Run all parallel-safe tests
 cargo test
+
+# Run serial tests (CPU-intensive or require single-threaded execution)
+cargo test --test serial_tests -- --test-threads=1
+
+# Run everything
+cargo test && cargo test --test serial_tests -- --test-threads=1
 ```
+
+### Serial Tests
+
+Some tests are separated into `tests/serial_tests.rs` and must run single-threaded:
+
+- **Router load tests** (`router_large_centroid_set_returns_nearest_ids`, `router_graph_path_returns_near_ids`): Build 15k-30k centroids, CPU-intensive (~16s each)
+- **Rebalancer idempotency tests** (`split_on_retired_bucket_is_noop`, `merge_on_retired_bucket_is_noop`): Affected by global fail hooks used by other chaos tests
