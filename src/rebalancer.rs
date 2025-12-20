@@ -5,7 +5,6 @@ use crate::router::{Router, RoutingTable};
 use crate::storage::{Bucket, BucketMeta, BucketMetaStatus, Storage, Vector};
 use crate::wal::runtime::Walrus;
 use anyhow::Result;
-use async_channel::{Receiver, Sender};
 use futures::executor::block_on;
 use log::{debug, error, warn};
 use parking_lot::{Mutex, RwLock};
@@ -14,6 +13,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::sync::Mutex as StdMutex;
 use std::thread;
+use std::time::Duration;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum RebalanceTaskKind {
@@ -46,19 +46,10 @@ fn should_fail(kind: RebalanceTaskKind) -> bool {
     false
 }
 
-#[derive(Debug, Clone)]
-#[allow(dead_code)]
-pub enum RebalanceTask {
-    Split(u64),
-    Merge(u64, u64),
-    Rebalance(u64),
-}
-
 pub(crate) struct RebalanceState {
     storage: Storage,
     wal: Arc<Walrus>,
     routing: Arc<RoutingTable>,
-    checkpoint_tx: Sender<u64>,
     centroids: RwLock<HashMap<u64, Vec<f32>>>,
     bucket_sizes: RwLock<HashMap<u64, usize>>,
     retired: RwLock<HashSet<u64>>,
@@ -67,12 +58,11 @@ pub(crate) struct RebalanceState {
 }
 
 impl RebalanceState {
-    fn new(storage: Storage, routing: Arc<RoutingTable>, checkpoint_tx: Sender<u64>) -> Self {
+    fn new(storage: Storage, routing: Arc<RoutingTable>) -> Self {
         Self {
             wal: storage.wal.clone(),
             storage,
             routing,
-            checkpoint_tx,
             centroids: RwLock::new(HashMap::new()),
             bucket_sizes: RwLock::new(HashMap::new()),
             retired: RwLock::new(HashSet::new()),
@@ -198,13 +188,6 @@ impl RebalanceState {
             bucket_id,
             status: BucketMetaStatus::Retired,
         }));
-        // Checkpoint draining can be expensive; keep it off the critical split/merge path.
-        let _ = self.checkpoint_tx.send_blocking(bucket_id);
-    }
-
-    fn retire_bucket(&self, bucket_id: u64) {
-        self.retire_bucket_local(bucket_id);
-        self.retire_bucket_io(bucket_id);
     }
 
     fn mark_bucket_checkpointed(&self, bucket_id: u64) {
@@ -268,7 +251,7 @@ impl RebalanceState {
         }
     }
 
-    fn handle_split(&self, bucket_id: u64) {
+    fn handle_split_sync(&self, bucket_id: u64) {
         if should_fail(RebalanceTaskKind::Split) {
             debug!(
                 "rebalance: injected failure for split on bucket {}",
@@ -285,6 +268,7 @@ impl RebalanceState {
             return;
         }
 
+        // 1. Load Vectors
         let vectors = match self.load_bucket_vectors(bucket_id) {
             Some(v) => v,
             None => {
@@ -292,6 +276,8 @@ impl RebalanceState {
                 return;
             }
         };
+
+        // 2. K-Means Split
         let mut bucket = Bucket::new(bucket_id, Vec::new());
         bucket.vectors = vectors;
         let splits = Indexer::split_bucket_once(bucket);
@@ -299,6 +285,7 @@ impl RebalanceState {
             return;
         }
 
+        // 3. Persist New Buckets
         let mut new_entries = Vec::new();
         for mut split in splits {
             let new_id = self.allocate_bucket_id();
@@ -321,12 +308,15 @@ impl RebalanceState {
             return;
         }
 
-        let mut changed = Vec::with_capacity(1 + new_entries.len());
-        changed.push(bucket_id);
-        self.retire_bucket(bucket_id);
+        // 4. Retire Old Bucket & Update Router
+        self.retire_bucket_local(bucket_id);
+        self.retire_bucket_io(bucket_id);
+
         let mut centroids = self.centroids.write();
         let mut sizes = self.bucket_sizes.write();
         let new_count = new_entries.len();
+        let mut changed = Vec::with_capacity(1 + new_count);
+        changed.push(bucket_id);
         for (id, centroid, size) in new_entries {
             centroids.insert(id, centroid);
             sizes.insert(id, size);
@@ -335,6 +325,10 @@ impl RebalanceState {
         drop(sizes);
         drop(centroids);
         self.rebuild_router(changed);
+
+        // 5. Checkpoint (Cleanup) - Inline
+        self.mark_bucket_checkpointed(bucket_id);
+
         log::info!(
             "rebalance: split {} into {} buckets (new_total={})",
             bucket_id,
@@ -342,144 +336,18 @@ impl RebalanceState {
             self.centroids.read().len()
         );
     }
-
-    fn handle_merge(&self, a: u64, b: u64) {
-        if should_fail(RebalanceTaskKind::Merge) {
-            debug!(
-                "rebalance: injected failure for merge on buckets {} and {}",
-                a, b
-            );
-            return;
-        }
-        let (first, second) = if a <= b { (a, b) } else { (b, a) };
-        let lock_first = self.lock_for(first);
-        let lock_second = self.lock_for(second);
-        let _g1 = lock_first.lock();
-        let _g2 = lock_second.lock();
-
-        // Check if either bucket was already retired (e.g., by a prior split/merge).
-        {
-            let retired = self.retired.read();
-            if retired.contains(&first) || retired.contains(&second) {
-                debug!(
-                    "rebalance: merge skipped, bucket {} or {} already retired",
-                    first, second
-                );
-                return;
-            }
-        }
-
-        let va = match self.load_bucket_vectors(first) {
-            Some(v) => v,
-            None => {
-                warn!("rebalance: merge skipped, bucket {} not found", first);
-                return;
-            }
-        };
-        let vb = match self.load_bucket_vectors(second) {
-            Some(v) => v,
-            None => {
-                warn!("rebalance: merge skipped, bucket {} not found", second);
-                return;
-            }
-        };
-
-        let mut combined = Vec::with_capacity(va.len() + vb.len());
-        combined.extend(va);
-        combined.extend(vb);
-        let centroid = compute_centroid(&combined);
-        let new_id = self.allocate_bucket_id();
-        let mut merged = Bucket::new(new_id, centroid.clone());
-        merged.vectors = combined;
-        let merged_size = merged.vectors.len();
-        if let Err(e) = block_on(self.storage.put_chunk(&merged)) {
-            error!(
-                "rebalance: failed to persist merged bucket {}+{} -> {}: {:?}",
-                first, second, new_id, e
-            );
-            return;
-        }
-        let _ = block_on(self.storage.put_bucket_meta(&BucketMeta {
-            bucket_id: new_id,
-            status: BucketMetaStatus::Active,
-        }));
-
-        self.retire_bucket(first);
-        self.retire_bucket(second);
-        let mut centroids = self.centroids.write();
-        let mut sizes = self.bucket_sizes.write();
-        centroids.insert(new_id, centroid);
-        sizes.insert(new_id, merged_size);
-        drop(sizes);
-        drop(centroids);
-        self.rebuild_router(vec![first, second, new_id]);
-    }
-
-    fn handle_rebalance(&self, bucket_id: u64) {
-        if should_fail(RebalanceTaskKind::Rebalance) {
-            debug!(
-                "rebalance: injected failure for rebalance on bucket {}",
-                bucket_id
-            );
-            return;
-        }
-        // For now, just recompute centroid from storage and republish routing.
-        let lock = self.lock_for(bucket_id);
-        let _guard = lock.lock();
-
-        // Check if bucket was already retired (e.g., by a prior split/merge).
-        if self.retired.read().contains(&bucket_id) {
-            debug!("rebalance: rebalance skipped, bucket {} already retired", bucket_id);
-            return;
-        }
-
-        let bucket = match self.load_bucket(bucket_id) {
-            Some(b) => b,
-            None => {
-                // Bucket may have been retired or is empty; skip quietly to avoid log spam.
-                log::debug!(
-                    "rebalance: rebalance skipped, bucket {} not found",
-                    bucket_id
-                );
-                return;
-            }
-        };
-        let centroid = compute_centroid(&bucket.vectors);
-        let mut centroids = self.centroids.write();
-        let mut sizes = self.bucket_sizes.write();
-        centroids.insert(bucket_id, centroid);
-        sizes.insert(bucket_id, bucket.vectors.len());
-        drop(sizes);
-        drop(centroids);
-        self.rebuild_router(vec![bucket_id]);
-    }
 }
 
 #[derive(Clone)]
 pub struct RebalanceWorker {
-    #[allow(dead_code)]
-    tx: Sender<RebalanceTask>,
     state: Arc<RebalanceState>,
 }
 
 impl RebalanceWorker {
     pub fn spawn(storage: Storage, routing: Arc<RoutingTable>, pin_cpu: Option<usize>) -> Self {
-        let (checkpoint_tx, checkpoint_rx) = async_channel::unbounded::<u64>();
-        let state = Arc::new(RebalanceState::new(storage, routing, checkpoint_tx));
-        let (tx, rx) = async_channel::unbounded();
+        let state = Arc::new(RebalanceState::new(storage, routing));
         let state_clone = state.clone();
-        let name = "rebalance-worker".to_string();
-
-        // Separate checkpoint drainer: prevents slow WAL drains from stalling split/merge throughput.
-        let checkpoint_state = state.clone();
-        thread::Builder::new()
-            .name("rebalance-checkpoint".to_string())
-            .spawn(move || {
-                while let Ok(bucket_id) = checkpoint_rx.recv_blocking() {
-                    checkpoint_state.mark_bucket_checkpointed(bucket_id);
-                }
-            })
-            .expect("rebalance checkpoint worker");
+        let name = "rebalance-loop".to_string();
 
         match pin_cpu {
             Some(cpu) => {
@@ -490,17 +358,21 @@ impl RebalanceWorker {
                     builder
                         .make()
                         .expect("failed to create rebalance executor")
-                        .run(worker_loop_async(state_clone, rx));
+                        .run(run_autonomous_loop(state_clone));
                 });
             }
             None => {
                 thread::Builder::new()
                     .name(name)
-                    .spawn(move || worker_loop_blocking(state_clone, rx))
+                    .spawn(move || {
+                        // Create a dummy runtime for block_on if needed,
+                        // or just run blocking code.
+                        block_on(run_autonomous_loop(state_clone));
+                    })
                     .expect("rebalance worker");
             }
         }
-        Self { tx, state }
+        Self { state }
     }
 
     pub async fn prime_centroids(&self, buckets: &[Bucket]) -> Result<()> {
@@ -518,312 +390,51 @@ impl RebalanceWorker {
         Ok(())
     }
 
-    #[allow(dead_code)]
-    pub fn enqueue_blocking(&self, task: RebalanceTask) -> anyhow::Result<()> {
-        self.tx
-            .send_blocking(task)
-            .map_err(|e| anyhow::anyhow!("rebalance enqueue failed: {e:?}"))
-    }
-
     pub fn snapshot_sizes(&self) -> HashMap<u64, usize> {
         self.state.refresh_sizes()
     }
 
-    /// Close the task channel to allow the background worker to exit.
-    pub fn close(&self) {
-        self.tx.close();
-        self.state.checkpoint_tx.close();
-    }
+    // No-op for compatibility, loop shuts down with process for now
+    pub fn close(&self) {}
 }
 
-async fn worker_loop_async(state: Arc<RebalanceState>, rx: Receiver<RebalanceTask>) {
-    while let Ok(task) = rx.recv().await {
-        match task {
-            RebalanceTask::Split(bucket) => handle_split_async(state.clone(), bucket).await,
-            RebalanceTask::Merge(a, b) => handle_merge_async(state.clone(), a, b).await,
-            RebalanceTask::Rebalance(bucket) => handle_rebalance_async(state.clone(), bucket).await,
-        }
-    }
-}
+async fn run_autonomous_loop(state: Arc<RebalanceState>) {
+    // Configurable threshold: split if bucket has more than N vectors.
+    let threshold: usize = std::env::var("SATORI_REBALANCE_THRESHOLD")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(2000);
 
-#[allow(clippy::await_holding_lock)]
-async fn handle_split_async(state: Arc<RebalanceState>, bucket_id: u64) {
-    if should_fail(RebalanceTaskKind::Split) {
-        debug!(
-            "rebalance: injected failure for split on bucket {}",
-            bucket_id
-        );
-        return;
-    }
+    loop {
+        // 1. Refresh sizes
+        let sizes = state.refresh_sizes();
 
-    let lock = state.lock_for(bucket_id);
-    let _guard = lock.lock();
-
-    // Check if bucket was already retired (e.g., by a prior split/merge).
-    if state.retired.read().contains(&bucket_id) {
-        debug!("rebalance: split skipped, bucket {} already retired", bucket_id);
-        return;
-    }
-
-    let vectors = glommio::executor()
-        .spawn_blocking({
-            let state = state.clone();
-            move || state.load_bucket_vectors(bucket_id)
-        })
-        .await;
-    let vectors = match vectors {
-        Some(v) => v,
-        None => {
-            log::debug!("rebalance: split skipped, bucket {} not found", bucket_id);
-            return;
-        }
-    };
-
-    let mut bucket = Bucket::new(bucket_id, Vec::new());
-    bucket.vectors = vectors;
-    let splits = Indexer::split_bucket_once(bucket);
-    if splits.is_empty() {
-        return;
-    }
-
-    let mut new_entries: Vec<(u64, Vec<f32>, usize)> = Vec::new();
-    for mut split in splits {
-        let new_id = state.allocate_bucket_id();
-        split.id = new_id;
-
-        let persisted: Result<(u64, Vec<f32>, usize), anyhow::Error> = glommio::executor()
-            .spawn_blocking({
-                let state = state.clone();
-                move || {
-                    block_on(state.storage.put_chunk(&split))?;
-                    let _ = block_on(state.storage.put_bucket_meta(&BucketMeta {
-                        bucket_id: new_id,
-                        status: BucketMetaStatus::Active,
-                    }));
-                    Ok((new_id, split.centroid, split.vectors.len()))
-                }
-            })
-            .await;
-
-        match persisted {
-            Ok(entry) => new_entries.push(entry),
-            Err(e) => {
-                error!(
-                    "rebalance: failed to persist split bucket {} -> {}: {:?}",
-                    bucket_id, new_id, e
-                );
-                continue;
+        // 2. Find biggest bucket
+        let mut max_id = 0;
+        let mut max_size = 0;
+        for (id, size) in sizes {
+            if size > max_size {
+                max_size = size;
+                max_id = id;
             }
         }
-    }
 
-    if new_entries.is_empty() {
-        return;
-    }
-
-    let retire_io = glommio::executor().spawn_blocking({
-        let state = state.clone();
-        move || state.retire_bucket_io(bucket_id)
-    });
-    state.retire_bucket_local(bucket_id);
-
-    let mut centroids = state.centroids.write();
-    let mut sizes = state.bucket_sizes.write();
-    let new_count = new_entries.len();
-    let mut changed = Vec::with_capacity(1 + new_count);
-    changed.push(bucket_id);
-    for (id, centroid, size) in new_entries {
-        centroids.insert(id, centroid);
-        sizes.insert(id, size);
-        changed.push(id);
-    }
-    drop(sizes);
-    drop(centroids);
-    state.rebuild_router(changed);
-    log::info!(
-        "rebalance: split {} into {} buckets (new_total={})",
-        bucket_id,
-        new_count,
-        state.centroids.read().len()
-    );
-
-    drop(_guard);
-    retire_io.await;
-}
-
-#[allow(clippy::await_holding_lock)]
-async fn handle_merge_async(state: Arc<RebalanceState>, a: u64, b: u64) {
-    if should_fail(RebalanceTaskKind::Merge) {
-        debug!(
-            "rebalance: injected failure for merge on buckets {} and {}",
-            a, b
-        );
-        return;
-    }
-
-    let (first, second) = if a <= b { (a, b) } else { (b, a) };
-    let lock_first = state.lock_for(first);
-    let lock_second = state.lock_for(second);
-    let _g1 = lock_first.lock();
-    let _g2 = lock_second.lock();
-
-    // Check if either bucket was already retired (e.g., by a prior split/merge).
-    {
-        let retired = state.retired.read();
-        if retired.contains(&first) || retired.contains(&second) {
-            debug!(
-                "rebalance: merge skipped, bucket {} or {} already retired",
-                first, second
-            );
-            return;
-        }
-    }
-
-    let va_opt = glommio::executor()
-        .spawn_blocking({
-            let state = state.clone();
-            move || state.load_bucket_vectors(first)
-        })
-        .await;
-    if va_opt.is_none() {
-        warn!("rebalance: merge skipped, bucket {} not found", first);
-        return;
-    }
-
-    let vb_opt = glommio::executor()
-        .spawn_blocking({
-            let state = state.clone();
-            move || state.load_bucket_vectors(second)
-        })
-        .await;
-    if vb_opt.is_none() {
-        warn!("rebalance: merge skipped, bucket {} not found", second);
-        return;
-    }
-
-    let va = va_opt.expect("checked above");
-    let vb = vb_opt.expect("checked above");
-
-    let mut combined = Vec::with_capacity(va.len() + vb.len());
-    combined.extend(va);
-    combined.extend(vb);
-    let centroid = compute_centroid(&combined);
-    let new_id = state.allocate_bucket_id();
-    let mut merged = Bucket::new(new_id, centroid.clone());
-    merged.vectors = combined;
-    let merged_size = merged.vectors.len();
-
-    let persisted: Result<(), anyhow::Error> = glommio::executor()
-        .spawn_blocking({
-            let state = state.clone();
-            let merged = merged;
-            move || {
-                block_on(state.storage.put_chunk(&merged))?;
-                let _ = block_on(state.storage.put_bucket_meta(&BucketMeta {
-                    bucket_id: new_id,
-                    status: BucketMetaStatus::Active,
-                }));
-                Ok(())
-            }
-        })
-        .await;
-    if let Err(e) = persisted {
-        error!(
-            "rebalance: failed to persist merged bucket {}+{} -> {}: {:?}",
-            first, second, new_id, e
-        );
-        return;
-    }
-
-    let retire_first_io = glommio::executor().spawn_blocking({
-        let state = state.clone();
-        move || state.retire_bucket_io(first)
-    });
-    let retire_second_io = glommio::executor().spawn_blocking({
-        let state = state.clone();
-        move || state.retire_bucket_io(second)
-    });
-    state.retire_bucket_local(first);
-    state.retire_bucket_local(second);
-
-    let mut centroids = state.centroids.write();
-    let mut sizes = state.bucket_sizes.write();
-    centroids.insert(new_id, centroid);
-    sizes.insert(new_id, merged_size);
-    drop(sizes);
-    drop(centroids);
-    state.rebuild_router(vec![first, second, new_id]);
-
-    drop(_g1);
-    drop(_g2);
-    retire_first_io.await;
-    retire_second_io.await;
-}
-
-#[allow(clippy::await_holding_lock)]
-async fn handle_rebalance_async(state: Arc<RebalanceState>, bucket_id: u64) {
-    if should_fail(RebalanceTaskKind::Rebalance) {
-        debug!(
-            "rebalance: injected failure for rebalance on bucket {}",
-            bucket_id
-        );
-        return;
-    }
-
-    let lock = state.lock_for(bucket_id);
-    let _guard = lock.lock();
-
-    // Check if bucket was already retired (e.g., by a prior split/merge).
-    if state.retired.read().contains(&bucket_id) {
-        debug!("rebalance: rebalance skipped, bucket {} already retired", bucket_id);
-        return;
-    }
-
-    let vectors = glommio::executor()
-        .spawn_blocking({
-            let state = state.clone();
-            move || state.load_bucket_vectors(bucket_id)
-        })
-        .await;
-    let vectors = match vectors {
-        Some(v) => v,
-        None => {
-            log::debug!(
-                "rebalance: rebalance skipped, bucket {} not found",
-                bucket_id
-            );
-            return;
-        }
-    };
-
-    let centroid = compute_centroid(&vectors);
-    let mut centroids = state.centroids.write();
-    let mut sizes = state.bucket_sizes.write();
-    centroids.insert(bucket_id, centroid);
-    sizes.insert(bucket_id, vectors.len());
-    drop(sizes);
-    drop(centroids);
-    state.rebuild_router(vec![bucket_id]);
-}
-
-fn worker_loop_blocking(state: Arc<RebalanceState>, rx: Receiver<RebalanceTask>) {
-    // Splits are far more common; prefer them when both types are queued.
-    let mut backlog: Vec<RebalanceTask> = Vec::new();
-    while let Ok(task) = rx.recv_blocking() {
-        // Push the incoming task into a small backlog so we can choose order.
-        backlog.push(task);
-        // Drain backlog preferring splits first.
-        while let Some(idx) = backlog
-            .iter()
-            .position(|t| matches!(t, RebalanceTask::Split(_)))
-            .or_else(|| (!backlog.is_empty()).then_some(0))
-        {
-            let task = backlog.swap_remove(idx);
-            match task {
-                RebalanceTask::Split(bucket) => state.handle_split(bucket),
-                RebalanceTask::Merge(a, b) => state.handle_merge(a, b),
-                RebalanceTask::Rebalance(bucket) => state.handle_rebalance(bucket),
-            }
+        // 3. Decide
+        if max_size > threshold {
+            // 4. Execute Split (Synchronously)
+            // Note: Since this function is async but handle_split_sync is blocking (uses block_on internally),
+            // we wrap it in spawn_blocking if we were in a strictly async context.
+            // But here we are the only thing running on this thread/executor.
+            // Using spawn_blocking is safer for Glommio integration.
+            let state_ref = state.clone();
+            let _ = glommio::executor()
+                .spawn_blocking(move || {
+                    state_ref.handle_split_sync(max_id);
+                })
+                .await;
+        } else {
+            // Nothing urgent, sleep a bit
+            glommio::timer::Timer::new(Duration::from_millis(500)).await;
         }
     }
 }

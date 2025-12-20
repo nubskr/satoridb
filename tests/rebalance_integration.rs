@@ -4,7 +4,7 @@ use std::time::{Duration, Instant};
 
 use anyhow::Result;
 use futures::executor::block_on;
-use satoridb::rebalancer::{RebalanceTask, RebalanceWorker};
+use satoridb::rebalancer::RebalanceWorker;
 use satoridb::router::RoutingTable;
 use satoridb::storage::{Bucket, Storage, Vector};
 use satoridb::wal::runtime::Walrus;
@@ -27,6 +27,9 @@ fn wait_until(timeout: Duration, mut f: impl FnMut() -> bool) -> bool {
 
 #[test]
 fn rebalance_split_increases_buckets_and_router_version() -> Result<()> {
+    // Force aggressive splitting for test
+    std::env::set_var("SATORI_REBALANCE_THRESHOLD", "10");
+
     let tmp = tempfile::tempdir()?;
     let wal = init_wal(&tmp);
     let storage = Storage::new(wal);
@@ -42,9 +45,7 @@ fn rebalance_split_increases_buckets_and_router_version() -> Result<()> {
     block_on(worker.prime_centroids(&[bucket]))?;
 
     let initial_version = routing.current_version();
-    worker
-        .enqueue_blocking(RebalanceTask::Split(0))
-        .expect("enqueue split");
+    // No manual enqueue; autonomous loop should pick it up since 16 > 10.
 
     let progressed = wait_until(Duration::from_secs(2), || {
         let sizes = worker.snapshot_sizes();
@@ -60,40 +61,3 @@ fn rebalance_split_increases_buckets_and_router_version() -> Result<()> {
     Ok(())
 }
 
-#[test]
-fn rebalance_merge_retires_inputs_and_rebuilds_router() -> Result<()> {
-    let tmp = tempfile::tempdir()?;
-    let wal = init_wal(&tmp);
-    let storage = Storage::new(wal);
-    let routing = Arc::new(RoutingTable::new());
-    let worker = RebalanceWorker::spawn(storage.clone(), routing.clone(), None);
-
-    // Two small buckets that will be merged into a new one.
-    let mut b0 = Bucket::new(0, vec![0.0, 0.0]);
-    let mut b1 = Bucket::new(1, vec![1.0, 1.0]);
-    for i in 0..4u64 {
-        b0.add_vector(Vector::new(i, vec![i as f32, 0.0]));
-        b1.add_vector(Vector::new(10 + i, vec![1.0 + i as f32, 1.0]));
-    }
-    block_on(storage.put_chunk(&b0))?;
-    block_on(storage.put_chunk(&b1))?;
-    block_on(worker.prime_centroids(&[b0, b1]))?;
-
-    let initial_version = routing.current_version();
-    worker
-        .enqueue_blocking(RebalanceTask::Merge(0, 1))
-        .expect("enqueue merge");
-
-    let merged = wait_until(Duration::from_secs(2), || {
-        let sizes = worker.snapshot_sizes();
-        sizes.len() == 1 && sizes.values().next().copied().unwrap_or(0) >= 8
-    });
-    assert!(merged, "merge did not produce a single combined bucket");
-    assert!(
-        routing.current_version() > initial_version,
-        "router version did not advance after merge"
-    );
-
-    drop(worker);
-    Ok(())
-}
