@@ -29,6 +29,8 @@ pub struct Block {
 }
 
 impl Block {
+    // Async variants are kept for async backends; currently unused in sync-only code paths.
+    #[allow(dead_code)]
     pub(crate) async fn write(
         &self,
         in_block_offset: u64,
@@ -167,6 +169,7 @@ impl Block {
         Ok((Entry { data: ret_buffer }, consumed))
     }
 
+    #[allow(dead_code)]
     pub(crate) async fn read(&self, in_block_offset: u64) -> std::io::Result<(Entry, usize)> {
         let file_offset = self.offset + in_block_offset;
         let meta_buffer = self.file.read_at(file_offset, PREFIX_META_SIZE).await?;
@@ -226,6 +229,7 @@ impl Block {
         Ok(())
     }
 
+    #[allow(dead_code)]
     pub(crate) async fn zero_range(&self, in_block_offset: u64, size: u64) -> std::io::Result<()> {
         let len = size as usize;
         if len == 0 {

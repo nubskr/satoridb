@@ -168,7 +168,7 @@ fn detect_dataset() -> anyhow::Result<Option<DatasetConfig>> {
 
 fn main() -> anyhow::Result<()> {
     env_logger::init();
-    
+
     let satori_cores: usize = std::env::var("SATORI_CORES")
         .ok()
         .and_then(|v| v.parse().ok())
@@ -206,12 +206,10 @@ fn main() -> anyhow::Result<()> {
             let builder =
                 LocalExecutorBuilder::new(Placement::Fixed(pin_cpu)).name(&format!("worker-{}", i));
 
-            let result = builder
+            builder
                 .make()
                 .expect("failed to create executor")
                 .run(run_worker(i, receiver, wal_clone));
-
-            result
         });
         worker_handles.push(handle);
     }
@@ -245,7 +243,7 @@ fn main() -> anyhow::Result<()> {
                 let sizes = worker.snapshot_sizes();
                 let mut sizes_vec: Vec<usize> = sizes.values().cloned().collect();
                 sizes_vec.sort_unstable();
-                
+
                 info!(
                     "monitor: tick={} buckets={} total_vectors={} sizes={:?}",
                     tick,
@@ -564,7 +562,7 @@ async fn run_benchmark_mode(
                     respond_to: tx,
                 };
                 let msg = WorkerMessage::Query(req);
-                if let Ok(_) = senders[shard].send(msg).await {
+                if senders[shard].send(msg).await.is_ok() {
                     pending.push(rx);
                 }
             }

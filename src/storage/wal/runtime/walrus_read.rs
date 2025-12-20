@@ -482,7 +482,10 @@ impl Walrus {
                     }
 
                     // Read header
-                    match blk.file.read_at_sync(blk.offset + scan_pos, PREFIX_META_SIZE) {
+                    match blk
+                        .file
+                        .read_at_sync(blk.offset + scan_pos, PREFIX_META_SIZE)
+                    {
                         Ok(buf) => {
                             if buf.len() < PREFIX_META_SIZE {
                                 break;
@@ -694,7 +697,10 @@ impl Walrus {
 
                 if should_peek && cur_off + (PREFIX_META_SIZE as u64) <= block.used {
                     let mut meta_buf = [0u8; PREFIX_META_SIZE];
-                    match block.file.read_at_sync(block.offset + cur_off, PREFIX_META_SIZE) {
+                    match block
+                        .file
+                        .read_at_sync(block.offset + cur_off, PREFIX_META_SIZE)
+                    {
                         Ok(buf) => {
                             if buf.len() == PREFIX_META_SIZE {
                                 meta_buf.copy_from_slice(&buf);
@@ -728,7 +734,8 @@ impl Walrus {
                                         let mut meta_buf2 = [0u8; PREFIX_META_SIZE];
                                         if let Ok(buf) = block
                                             .file
-                                            .read_at_sync(block.offset + offset2, PREFIX_META_SIZE) {
+                                            .read_at_sync(block.offset + offset2, PREFIX_META_SIZE)
+                                        {
                                             if buf.len() == PREFIX_META_SIZE {
                                                 meta_buf2.copy_from_slice(&buf);
                                             }
@@ -804,7 +811,8 @@ impl Walrus {
                         }
                         match active_block
                             .file
-                            .read_at_sync(active_block.offset + scan_pos, PREFIX_META_SIZE) {
+                            .read_at_sync(active_block.offset + scan_pos, PREFIX_META_SIZE)
+                        {
                             Ok(buf) => {
                                 if buf.len() < PREFIX_META_SIZE {
                                     break;

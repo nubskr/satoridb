@@ -7,9 +7,9 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, OnceLock, RwLock};
 use std::time::SystemTime;
 
+use std::cell::RefCell;
 #[cfg(unix)]
 use std::os::unix::fs::OpenOptionsExt;
-use std::cell::RefCell;
 use std::rc::Rc;
 
 #[derive(Debug)]
@@ -63,17 +63,15 @@ thread_local! {
 }
 
 async fn get_or_open_dma_file(path: &str) -> std::io::Result<Rc<glommio::io::DmaFile>> {
-    let cached = DMA_FILE_CACHE.with(|cache| {
-        cache.borrow().get(path).cloned()
-    });
-    
+    let cached = DMA_FILE_CACHE.with(|cache| cache.borrow().get(path).cloned());
+
     if let Some(file) = cached {
         return Ok(file);
     }
 
     let file = glommio::io::DmaFile::open(path)
         .await
-        .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e.to_string()))?;
+        .map_err(|e| std::io::Error::other(e.to_string()))?;
     let rc_file = Rc::new(file);
 
     DMA_FILE_CACHE.with(|cache| {
@@ -97,7 +95,7 @@ impl WalrusFile for StorageImpl {
             let res = dma_file
                 .read_at(offset, len)
                 .await
-                .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e.to_string()))?;
+                .map_err(|e| std::io::Error::other(e.to_string()))?;
             Ok(res.to_vec())
         } else {
             self.read_at_sync(offset, len)
@@ -116,11 +114,11 @@ impl WalrusFile for StorageImpl {
             // Glommio requires DmaBuffer for write_at. Copy from &[u8].
             let mut dma_buf = dma_file.alloc_dma_buffer(buf.len());
             dma_buf.as_bytes_mut().copy_from_slice(buf);
-            
+
             let n = dma_file
                 .write_at(dma_buf, offset)
                 .await
-                .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e.to_string()))?;
+                .map_err(|e| std::io::Error::other(e.to_string()))?;
             Ok(n)
         } else {
             self.write_at_sync(offset, buf)
@@ -137,7 +135,7 @@ impl WalrusFile for StorageImpl {
             dma_file
                 .fdatasync()
                 .await
-                .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e.to_string()))?;
+                .map_err(|e| std::io::Error::other(e.to_string()))?;
             Ok(())
         } else {
             self.sync_all_sync()
@@ -154,7 +152,7 @@ impl WalrusFile for StorageImpl {
             let len = dma_file
                 .file_size()
                 .await
-                .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e.to_string()))?;
+                .map_err(|e| std::io::Error::other(e.to_string()))?;
             Ok(len)
         } else {
             self.len_sync()
@@ -203,10 +201,10 @@ fn create_storage_impl(path: &str) -> std::io::Result<StorageImpl> {
     // Always create FdBackend for sync fallback and compatibility
     let use_o_sync = should_use_o_sync();
     let sync_backend = FdBackend::new(path, use_o_sync)?;
-    
+
     // We don't eagerly create Glommio backend here because we might not be in a reactor.
     // It is lazy-loaded in read_at/write_at.
-    
+
     Ok(StorageImpl {
         path: path.to_string(),
         sync_backend,

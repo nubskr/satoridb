@@ -255,9 +255,7 @@ impl Writer {
             let data = batch[*data_idx];
             let next_block_start = blk.offset + blk.limit;
 
-            if let Err(e) =
-                blk.write_sync(*offset, data, &self.col, next_block_start)
-            {
+            if let Err(e) = blk.write_sync(*offset, data, &self.col, next_block_start) {
                 // Clean up any partially written headers up to and including the failed index
                 for (w_blk, w_off, _) in write_plan[0..=(*data_idx)].iter() {
                     let _ = w_blk.zero_range_sync(*w_off, PREFIX_META_SIZE as u64);
