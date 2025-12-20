@@ -432,27 +432,27 @@ async fn run_autonomous_loop(state: Arc<RebalanceState>) {
     }
 }
 
-pub(crate) fn compute_centroid(vectors: &[Vector]) -> Vec<f32> {
-    if vectors.is_empty() {
-        return Vec::new();
-    }
-    let dim = vectors[0].data.len();
-    let mut sums = vec![0.0f32; dim];
-    for v in vectors {
-        for (i, val) in v.data.iter().enumerate() {
-            sums[i] += *val;
-        }
-    }
-    let count = vectors.len() as f32;
-    for s in sums.iter_mut() {
-        *s /= count;
-    }
-    sums
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    pub(crate) fn compute_centroid(vectors: &[Vector]) -> Vec<f32> {
+        if vectors.is_empty() {
+            return Vec::new();
+        }
+        let dim = vectors[0].data.len();
+        let mut sums = vec![0.0f32; dim];
+        for v in vectors {
+            for (i, val) in v.data.iter().enumerate() {
+                sums[i] += *val;
+            }
+        }
+        let count = vectors.len() as f32;
+        for s in sums.iter_mut() {
+            *s /= count;
+        }
+        sums
+    }
 
     #[test]
     fn centroid_of_vectors_is_mean() {
