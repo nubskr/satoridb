@@ -1,7 +1,6 @@
-use crate::storage::wal::config::{FsyncSchedule, USE_FD_BACKEND};
+use crate::storage::wal::config::FsyncSchedule;
 use crate::storage::wal::io::WalrusFile;
 use async_trait::async_trait;
-use memmap2::MmapMut;
 use std::collections::HashMap;
 use std::fs::OpenOptions;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -10,25 +9,8 @@ use std::time::SystemTime;
 
 #[cfg(unix)]
 use std::os::unix::fs::OpenOptionsExt;
-
-#[derive(Debug)]
-pub(crate) struct GlommioBackend {
-    file: glommio::io::DmaFile,
-    len: u64,
-}
-
-impl GlommioBackend {
-    pub(crate) async fn new(path: &str) -> std::io::Result<Self> {
-        let file = glommio::io::DmaFile::open(path)
-            .await
-            .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e))?;
-        let len = file
-            .file_size()
-            .await
-            .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e))?;
-        Ok(Self { file, len })
-    }
-}
+use std::cell::RefCell;
+use std::rc::Rc;
 
 #[derive(Debug)]
 pub(crate) struct FdBackend {
@@ -55,13 +37,11 @@ impl FdBackend {
 
     pub(crate) fn write(&self, offset: usize, data: &[u8]) -> std::io::Result<usize> {
         use std::os::unix::fs::FileExt;
-        // pwrite doesn't move the file cursor
         self.file.write_at(data, offset as u64)
     }
 
     pub(crate) fn read(&self, offset: usize, dest: &mut [u8]) -> std::io::Result<usize> {
         use std::os::unix::fs::FileExt;
-        // pread doesn't move the file cursor
         self.file.read_at(dest, offset as u64)
     }
 
@@ -73,174 +53,116 @@ impl FdBackend {
         self.len
     }
 
-    #[allow(dead_code)]
     pub(crate) fn file(&self) -> &std::fs::File {
         &self.file
     }
 }
 
+thread_local! {
+    static DMA_FILE_CACHE: RefCell<HashMap<String, Rc<glommio::io::DmaFile>>> = RefCell::new(HashMap::new());
+}
+
+async fn get_or_open_dma_file(path: &str) -> std::io::Result<Rc<glommio::io::DmaFile>> {
+    let cached = DMA_FILE_CACHE.with(|cache| {
+        cache.borrow().get(path).cloned()
+    });
+    
+    if let Some(file) = cached {
+        return Ok(file);
+    }
+
+    let file = glommio::io::DmaFile::open(path)
+        .await
+        .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e.to_string()))?;
+    let rc_file = Rc::new(file);
+
+    DMA_FILE_CACHE.with(|cache| {
+        cache.borrow_mut().insert(path.to_string(), rc_file.clone());
+    });
+
+    Ok(rc_file)
+}
+
 #[derive(Debug)]
-pub(crate) enum StorageImpl {
-    Mmap(MmapMut),
-    Fd(FdBackend),
-    Glommio(GlommioBackend),
+pub(crate) struct StorageImpl {
+    path: String,
+    sync_backend: FdBackend,
 }
 
 #[async_trait(?Send)]
 impl WalrusFile for StorageImpl {
     async fn read_at(&self, offset: u64, len: usize) -> std::io::Result<Vec<u8>> {
-        match self {
-            StorageImpl::Mmap(mmap) => {
-                let mut buf = vec![0u8; len];
-                let off = offset as usize;
-                if off + len > mmap.len() {
-                    return Err(std::io::Error::new(
-                        std::io::ErrorKind::UnexpectedEof,
-                        "read beyond mmap bound",
-                    ));
-                }
-                buf.copy_from_slice(&mmap[off..off + len]);
-                Ok(buf)
-            }
-            StorageImpl::Fd(fd) => {
-                let mut buf = vec![0u8; len];
-                fd.read(offset as usize, &mut buf)?;
-                Ok(buf)
-            }
-            StorageImpl::Glommio(gf) => {
-                let res = gf
-                    .file
-                    .read_at(offset, len)
-                    .await
-                    .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e))?;
-                Ok(res.to_vec())
-            }
+        if glommio::executor().id() != 0 {
+            let dma_file = get_or_open_dma_file(&self.path).await?;
+            let res = dma_file
+                .read_at(offset, len)
+                .await
+                .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e.to_string()))?;
+            Ok(res.to_vec())
+        } else {
+            self.read_at_sync(offset, len)
         }
     }
 
     fn read_at_sync(&self, offset: u64, len: usize) -> std::io::Result<Vec<u8>> {
-        match self {
-            StorageImpl::Glommio(_) => Err(std::io::Error::new(
-                std::io::ErrorKind::Other,
-                "Synchronous read not supported on Glommio backend",
-            )),
-            _ => {
-                let mut buf = vec![0u8; len];
-                match self {
-                    StorageImpl::Mmap(mmap) => {
-                        let off = offset as usize;
-                        if off + len > mmap.len() {
-                            return Err(std::io::Error::new(
-                                std::io::ErrorKind::UnexpectedEof,
-                                "read beyond mmap bound",
-                            ));
-                        }
-                        buf.copy_from_slice(&mmap[off..off + len]);
-                        Ok(buf)
-                    }
-                    StorageImpl::Fd(fd) => {
-                        fd.read(offset as usize, &mut buf)?;
-                        Ok(buf)
-                    }
-                    _ => unreachable!(),
-                }
-            }
-        }
+        let mut buf = vec![0u8; len];
+        self.sync_backend.read(offset as usize, &mut buf)?;
+        Ok(buf)
     }
 
     async fn write_at(&self, offset: u64, buf: &[u8]) -> std::io::Result<usize> {
-        match self {
-            StorageImpl::Mmap(mmap) => {
-                let off = offset as usize;
-                let len = buf.len();
-                if off + len > mmap.len() {
-                    return Err(std::io::Error::other("write beyond mmap bound"));
-                }
-                unsafe {
-                    let ptr = mmap.as_ptr() as *mut u8;
-                    std::ptr::copy_nonoverlapping(buf.as_ptr(), ptr.add(off), len);
-                }
-                Ok(len)
-            }
-            StorageImpl::Fd(fd) => fd.write(offset as usize, buf),
-            StorageImpl::Glommio(gf) => {
-                let n = gf
-                    .file
-                    .write_at(buf, offset)
-                    .await
-                    .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e))?;
-                Ok(n)
-            }
+        if glommio::executor().id() != 0 {
+            let dma_file = get_or_open_dma_file(&self.path).await?;
+            // Glommio requires DmaBuffer for write_at. Copy from &[u8].
+            let mut dma_buf = dma_file.alloc_dma_buffer(buf.len());
+            dma_buf.as_bytes_mut().copy_from_slice(buf);
+            
+            let n = dma_file
+                .write_at(dma_buf, offset)
+                .await
+                .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e.to_string()))?;
+            Ok(n)
+        } else {
+            self.write_at_sync(offset, buf)
         }
     }
 
     fn write_at_sync(&self, offset: u64, buf: &[u8]) -> std::io::Result<usize> {
-        match self {
-            StorageImpl::Glommio(_) => Err(std::io::Error::new(
-                std::io::ErrorKind::Other,
-                "Synchronous write not supported on Glommio backend",
-            )),
-            _ => match self {
-                StorageImpl::Mmap(mmap) => {
-                    let off = offset as usize;
-                    let len = buf.len();
-                    if off + len > mmap.len() {
-                        return Err(std::io::Error::other("write beyond mmap bound"));
-                    }
-                    unsafe {
-                        let ptr = mmap.as_ptr() as *mut u8;
-                        std::ptr::copy_nonoverlapping(buf.as_ptr(), ptr.add(off), len);
-                    }
-                    Ok(len)
-                }
-                StorageImpl::Fd(fd) => fd.write(offset as usize, buf),
-                _ => unreachable!(),
-            },
-        }
+        self.sync_backend.write(offset as usize, buf)
     }
 
     async fn sync_all(&self) -> std::io::Result<()> {
-        match self {
-            StorageImpl::Mmap(mmap) => mmap.flush(),
-            StorageImpl::Fd(fd) => fd.flush(),
-            StorageImpl::Glommio(gf) => gf
-                .file
+        if glommio::executor().id() != 0 {
+            let dma_file = get_or_open_dma_file(&self.path).await?;
+            dma_file
                 .fdatasync()
                 .await
-                .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e)),
+                .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e.to_string()))?;
+            Ok(())
+        } else {
+            self.sync_all_sync()
         }
     }
 
     fn sync_all_sync(&self) -> std::io::Result<()> {
-        match self {
-            StorageImpl::Glommio(_) => Err(std::io::Error::new(
-                std::io::ErrorKind::Other,
-                "Synchronous sync_all not supported on Glommio backend",
-            )),
-            StorageImpl::Mmap(mmap) => mmap.flush(),
-            StorageImpl::Fd(fd) => fd.flush(),
-            _ => unreachable!(),
-        }
+        self.sync_backend.flush()
     }
 
     async fn len(&self) -> std::io::Result<u64> {
-        match self {
-            StorageImpl::Mmap(mmap) => Ok(mmap.len() as u64),
-            StorageImpl::Fd(fd) => Ok(fd.len() as u64),
-            StorageImpl::Glommio(gf) => Ok(gf.len),
+        if glommio::executor().id() != 0 {
+            let dma_file = get_or_open_dma_file(&self.path).await?;
+            let len = dma_file
+                .file_size()
+                .await
+                .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e.to_string()))?;
+            Ok(len)
+        } else {
+            self.len_sync()
         }
     }
 
     fn len_sync(&self) -> std::io::Result<u64> {
-        match self {
-            StorageImpl::Glommio(_) => Err(std::io::Error::new(
-                std::io::ErrorKind::Other,
-                "Synchronous len not supported on Glommio backend",
-            )),
-            StorageImpl::Mmap(mmap) => Ok(mmap.len() as u64),
-            StorageImpl::Fd(fd) => Ok(fd.len() as u64),
-            _ => unreachable!(),
-        }
+        Ok(self.sync_backend.len() as u64)
     }
 }
 
@@ -251,19 +173,7 @@ impl StorageImpl {
     }
 
     pub(crate) fn read(&self, offset: usize, dest: &mut [u8]) {
-        match self {
-            StorageImpl::Mmap(mmap) => {
-                debug_assert!(offset + dest.len() <= mmap.len());
-                let src = &mmap[offset..offset + dest.len()];
-                dest.copy_from_slice(src);
-            }
-            StorageImpl::Fd(fd) => {
-                let _ = fd.read(offset, dest);
-            }
-            StorageImpl::Glommio(_) => {
-                panic!("StorageImpl::read called on Glommio backend");
-            }
-        }
+        let _ = self.sync_backend.read(offset, dest);
     }
 
     pub(crate) fn flush(&self) -> std::io::Result<()> {
@@ -276,11 +186,7 @@ impl StorageImpl {
 
     #[allow(dead_code)]
     pub(crate) fn as_fd(&self) -> Option<&FdBackend> {
-        if let StorageImpl::Fd(fd) = self {
-            Some(fd)
-        } else {
-            None
-        }
+        Some(&self.sync_backend)
     }
 }
 
@@ -294,16 +200,17 @@ fn should_use_o_sync() -> bool {
 }
 
 fn create_storage_impl(path: &str) -> std::io::Result<StorageImpl> {
-    if USE_FD_BACKEND.load(Ordering::Relaxed) {
-        let use_o_sync = should_use_o_sync();
-        Ok(StorageImpl::Fd(FdBackend::new(path, use_o_sync)?))
-    } else {
-        let file = OpenOptions::new().read(true).write(true).open(path)?;
-        // SAFETY: `file` is opened read/write and lives for the duration of this
-        // mapping; `memmap2` upholds aliasing invariants for `MmapMut`.
-        let mmap = unsafe { MmapMut::map_mut(&file)? };
-        Ok(StorageImpl::Mmap(mmap))
-    }
+    // Always create FdBackend for sync fallback and compatibility
+    let use_o_sync = should_use_o_sync();
+    let sync_backend = FdBackend::new(path, use_o_sync)?;
+    
+    // We don't eagerly create Glommio backend here because we might not be in a reactor.
+    // It is lazy-loaded in read_at/write_at.
+    
+    Ok(StorageImpl {
+        path: path.to_string(),
+        sync_backend,
+    })
 }
 
 #[derive(Debug)]

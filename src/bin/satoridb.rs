@@ -479,6 +479,10 @@ async fn run_benchmark_mode(
             "Ingestion complete. Total vectors ingested or scanned: {}",
             total_processed
         );
+
+        info!("Waiting 5 minutes for system to settle/rebalance before querying...");
+        std::thread::sleep(std::time::Duration::from_secs(300));
+        info!("Wait complete. Starting queries.");
     } else {
         info!(
             "{} not found. Skipping Benchmark Ingestion.",
