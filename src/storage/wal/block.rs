@@ -57,6 +57,47 @@ impl Block {
         }
 
         let mut meta_buffer = vec![0u8; PREFIX_META_SIZE];
+        meta_buffer[0] = (meta_bytes.len() & 0xFF) as u8;
+        meta_buffer[1] = ((meta_bytes.len() >> 8) & 0xFF) as u8;
+        meta_buffer[2..2 + meta_bytes.len()].copy_from_slice(&meta_bytes);
+
+        let mut combined = Vec::with_capacity(PREFIX_META_SIZE + data.len());
+        combined.extend_from_slice(&meta_buffer);
+        combined.extend_from_slice(data);
+
+        let file_offset = self.offset + in_block_offset;
+        self.file.write_at(file_offset, &combined).await?;
+        Ok(())
+    }
+
+    pub(crate) fn write_sync(
+        &self,
+        in_block_offset: u64,
+        data: &[u8],
+        owned_by: &str,
+        next_block_start: u64,
+    ) -> std::io::Result<()> {
+        debug_assert!(
+            in_block_offset + (data.len() as u64 + PREFIX_META_SIZE as u64) <= self.limit
+        );
+
+        let new_meta = Metadata {
+            read_size: data.len(),
+            owned_by: owned_by.to_string(),
+            next_block_start,
+            checksum: checksum64(data),
+        };
+
+        let meta_bytes = rkyv::to_bytes::<_, 256>(&new_meta)
+            .map_err(|e| std::io::Error::other(format!("serialize metadata failed: {:?}", e)))?;
+        if meta_bytes.len() > PREFIX_META_SIZE - 2 {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "metadata too large",
+            ));
+        }
+
+        let mut meta_buffer = vec![0u8; PREFIX_META_SIZE];
         // Store actual length in first 2 bytes (little endian)
         meta_buffer[0] = (meta_bytes.len() & 0xFF) as u8;
         meta_buffer[1] = ((meta_bytes.len() >> 8) & 0xFF) as u8;
@@ -69,13 +110,13 @@ impl Block {
         combined.extend_from_slice(data);
 
         let file_offset = self.offset + in_block_offset;
-        self.file.write_at(file_offset, &combined).await?;
+        self.file.write_at_sync(file_offset, &combined)?;
         Ok(())
     }
 
-    pub(crate) async fn read(&self, in_block_offset: u64) -> std::io::Result<(Entry, usize)> {
+    pub(crate) fn read_sync(&self, in_block_offset: u64) -> std::io::Result<(Entry, usize)> {
         let file_offset = self.offset + in_block_offset;
-        let meta_buffer = self.file.read_at(file_offset, PREFIX_META_SIZE).await?;
+        let meta_buffer = self.file.read_at_sync(file_offset, PREFIX_META_SIZE)?;
 
         // Read the actual metadata length from first 2 bytes
         let meta_len = (meta_buffer[0] as usize) | ((meta_buffer[1] as usize) << 8);
@@ -105,7 +146,7 @@ impl Block {
 
         // Read the actual data
         let new_offset = file_offset + PREFIX_META_SIZE as u64;
-        let ret_buffer = self.file.read_at(new_offset, actual_entry_size).await?;
+        let ret_buffer = self.file.read_at_sync(new_offset, actual_entry_size)?;
 
         // Verify checksum
         let expected = meta.checksum;
@@ -126,9 +167,66 @@ impl Block {
         Ok((Entry { data: ret_buffer }, consumed))
     }
 
-    pub(crate) async fn zero_range(&self, in_block_offset: u64, size: u64) -> std::io::Result<()> {
+    pub(crate) async fn read(&self, in_block_offset: u64) -> std::io::Result<(Entry, usize)> {
+        let file_offset = self.offset + in_block_offset;
+        let meta_buffer = self.file.read_at(file_offset, PREFIX_META_SIZE).await?;
+
+        let meta_len = (meta_buffer[0] as usize) | ((meta_buffer[1] as usize) << 8);
+
+        if meta_len == 0 || meta_len > PREFIX_META_SIZE - 2 {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                format!("invalid metadata length: {}", meta_len),
+            ));
+        }
+
+        let mut aligned = rkyv::AlignedVec::with_capacity(meta_len);
+        aligned.extend_from_slice(&meta_buffer[2..2 + meta_len]);
+
+        let archived = unsafe { rkyv::archived_root::<Metadata>(&aligned[..]) };
+        let meta: Metadata = archived.deserialize(&mut rkyv::Infallible).map_err(|_| {
+            std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "failed to deserialize metadata",
+            )
+        })?;
+        let actual_entry_size = meta.read_size;
+
+        let new_offset = file_offset + PREFIX_META_SIZE as u64;
+        let ret_buffer = self.file.read_at(new_offset, actual_entry_size).await?;
+
+        let expected = meta.checksum;
+        if checksum64(&ret_buffer) != expected {
+            debug_print!(
+                "[reader] checksum mismatch; skipping corrupted entry at offset={} in file={}, block_id={}",
+                in_block_offset,
+                self.file_path,
+                self.id
+            );
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "checksum mismatch, data corruption detected",
+            ));
+        }
+
+        let consumed = PREFIX_META_SIZE + actual_entry_size;
+        Ok((Entry { data: ret_buffer }, consumed))
+    }
+
+    pub(crate) fn zero_range_sync(&self, in_block_offset: u64, size: u64) -> std::io::Result<()> {
         // Zero a small region within this block; used to invalidate headers on rollback
         // Caller ensures size is reasonable (typically PREFIX_META_SIZE)
+        let len = size as usize;
+        if len == 0 {
+            return Ok(());
+        }
+        let zeros = vec![0u8; len];
+        let file_offset = self.offset + in_block_offset;
+        self.file.write_at_sync(file_offset, &zeros)?;
+        Ok(())
+    }
+
+    pub(crate) async fn zero_range(&self, in_block_offset: u64, size: u64) -> std::io::Result<()> {
         let len = size as usize;
         if len == 0 {
             return Ok(());

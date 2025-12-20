@@ -346,8 +346,7 @@ impl Walrus {
                     used: 0,
                 };
                 let mut in_block_off: u64 = 0;
-                while let Ok((_entry, consumed)) = pollster::block_on(block_stub.read(in_block_off))
-                {
+                while let Ok((_entry, consumed)) = block_stub.read_sync(in_block_off) {
                     used += consumed as u64;
                     in_block_off += consumed as u64;
                     entries_in_block = entries_in_block.saturating_add(1);
@@ -448,7 +447,7 @@ impl Walrus {
             let mut off: u64 = 0;
             let mut count: u64 = 0;
             while off < limit {
-                match pollster::block_on(block.read(off)) {
+                match block.read_sync(off) {
                     Ok((_entry, consumed)) => {
                         let next = off.saturating_add(consumed as u64);
                         if next > limit {

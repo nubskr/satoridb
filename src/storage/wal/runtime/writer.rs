@@ -73,7 +73,7 @@ impl Writer {
             FileStateTracker::set_block_unlocked(block.id as usize);
             let mut sealed = block.clone();
             sealed.used = *cur;
-            pollster::block_on(sealed.file.sync_all())?;
+            sealed.file.sync_all_sync()?;
             let _ = self.reader.append_block_to_chain(&self.col, sealed);
             debug_print!("[writer] appended sealed block to chain: col={}", self.col);
             // switch to new block
@@ -90,7 +90,7 @@ impl Writer {
             *cur = 0;
         }
         let next_block_start = block.offset + block.limit; // simplistic for now
-        pollster::block_on(block.write(*cur, data, &self.col, next_block_start))?;
+        block.write_sync(*cur, data, &self.col, next_block_start)?;
         debug_print!(
             "[writer] wrote: col={}, block_id={}, offset_before={}, bytes={}, offset_after={}",
             self.col,
@@ -105,7 +105,7 @@ impl Writer {
         match self.fsync_schedule {
             FsyncSchedule::SyncEach => {
                 // Immediate mmap flush, skip background flusher
-                pollster::block_on(block.file.sync_all())?;
+                block.file.sync_all_sync()?;
                 debug_print!(
                     "[writer] immediate fsync: col={}, block_id={}",
                     self.col,
@@ -229,7 +229,7 @@ impl Writer {
                 FileStateTracker::set_block_unlocked(block.id as usize);
                 let mut sealed = block.clone();
                 sealed.used = planning_offset;
-                pollster::block_on(sealed.file.sync_all())?;
+                sealed.file.sync_all_sync()?;
                 let _ = self.reader.append_block_to_chain(&self.col, sealed);
 
                 // Allocate new block
@@ -256,18 +256,18 @@ impl Writer {
             let next_block_start = blk.offset + blk.limit;
 
             if let Err(e) =
-                pollster::block_on(blk.write(*offset, data, &self.col, next_block_start))
+                blk.write_sync(*offset, data, &self.col, next_block_start)
             {
                 // Clean up any partially written headers up to and including the failed index
                 for (w_blk, w_off, _) in write_plan[0..=(*data_idx)].iter() {
-                    let _ = pollster::block_on(w_blk.zero_range(*w_off, PREFIX_META_SIZE as u64));
+                    let _ = w_blk.zero_range_sync(*w_off, PREFIX_META_SIZE as u64);
                 }
 
                 // Flush zeros and rollback
                 let mut fsynced = HashSet::new();
                 for (w_blk, _, _) in write_plan[0..=(*data_idx)].iter() {
                     if fsynced.insert(w_blk.file_path.clone()) {
-                        let _ = pollster::block_on(w_blk.file.sync_all());
+                        let _ = w_blk.file.sync_all_sync();
                     }
                 }
 
@@ -283,7 +283,7 @@ impl Writer {
         let mut fsynced = HashSet::new();
         for (blk, _, _) in write_plan.iter() {
             if !fsynced.contains(&blk.file_path) {
-                pollster::block_on(blk.file.sync_all())?;
+                blk.file.sync_all_sync()?;
                 fsynced.insert(blk.file_path.clone());
             }
         }

@@ -133,7 +133,7 @@ impl Walrus {
                     continue;
                 }
 
-                match pollster::block_on(block.read(off)) {
+                match block.read_sync(off) {
                     Ok((entry, consumed)) => {
                         // Compute new offset and decide whether to commit progress
                         let new_off = off + consumed as u64;
@@ -270,7 +270,7 @@ impl Walrus {
             }
 
             if tail_off < written {
-                match pollster::block_on(active_block.read(tail_off)) {
+                match active_block.read_sync(tail_off) {
                     Ok((entry, consumed)) => {
                         let new_off = tail_off + consumed as u64;
                         // Reacquire column lock to update in-memory progress, then decide persistence
@@ -482,9 +482,7 @@ impl Walrus {
                     }
 
                     // Read header
-                    match pollster::block_on(
-                        blk.file.read_at(blk.offset + scan_pos, PREFIX_META_SIZE),
-                    ) {
+                    match blk.file.read_at_sync(blk.offset + scan_pos, PREFIX_META_SIZE) {
                         Ok(buf) => {
                             if buf.len() < PREFIX_META_SIZE {
                                 break;
@@ -696,9 +694,7 @@ impl Walrus {
 
                 if should_peek && cur_off + (PREFIX_META_SIZE as u64) <= block.used {
                     let mut meta_buf = [0u8; PREFIX_META_SIZE];
-                    match pollster::block_on(
-                        block.file.read_at(block.offset + cur_off, PREFIX_META_SIZE),
-                    ) {
+                    match block.file.read_at_sync(block.offset + cur_off, PREFIX_META_SIZE) {
                         Ok(buf) => {
                             if buf.len() == PREFIX_META_SIZE {
                                 meta_buf.copy_from_slice(&buf);
@@ -730,11 +726,9 @@ impl Walrus {
                                     let offset2 = cur_off + required1;
                                     if offset2 + (PREFIX_META_SIZE as u64) <= block.used {
                                         let mut meta_buf2 = [0u8; PREFIX_META_SIZE];
-                                        if let Ok(buf) = pollster::block_on(
-                                            block
-                                                .file
-                                                .read_at(block.offset + offset2, PREFIX_META_SIZE),
-                                        ) {
+                                        if let Ok(buf) = block
+                                            .file
+                                            .read_at_sync(block.offset + offset2, PREFIX_META_SIZE) {
                                             if buf.len() == PREFIX_META_SIZE {
                                                 meta_buf2.copy_from_slice(&buf);
                                             }
@@ -808,11 +802,9 @@ impl Walrus {
                         if scan_pos + (PREFIX_META_SIZE as u64) > written {
                             break;
                         }
-                        match pollster::block_on(
-                            active_block
-                                .file
-                                .read_at(active_block.offset + scan_pos, PREFIX_META_SIZE),
-                        ) {
+                        match active_block
+                            .file
+                            .read_at_sync(active_block.offset + scan_pos, PREFIX_META_SIZE) {
                             Ok(buf) => {
                                 if buf.len() < PREFIX_META_SIZE {
                                     break;
@@ -891,7 +883,7 @@ impl Walrus {
             .map(|read_plan| {
                 let size = (read_plan.end - read_plan.start) as usize;
                 let file_offset = read_plan.blk.offset + read_plan.start;
-                match pollster::block_on(read_plan.blk.file.read_at(file_offset, size)) {
+                match read_plan.blk.file.read_at_sync(file_offset, size) {
                     Ok(buf) => buf,
                     Err(_) => vec![0u8; size], // Should handle error better, but match existing fallback behavior
                 }

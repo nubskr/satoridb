@@ -12,6 +12,25 @@ use std::time::SystemTime;
 use std::os::unix::fs::OpenOptionsExt;
 
 #[derive(Debug)]
+pub(crate) struct GlommioBackend {
+    file: glommio::io::DmaFile,
+    len: u64,
+}
+
+impl GlommioBackend {
+    pub(crate) async fn new(path: &str) -> std::io::Result<Self> {
+        let file = glommio::io::DmaFile::open(path)
+            .await
+            .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e))?;
+        let len = file
+            .file_size()
+            .await
+            .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e))?;
+        Ok(Self { file, len })
+    }
+}
+
+#[derive(Debug)]
 pub(crate) struct FdBackend {
     file: std::fs::File,
     len: usize,
@@ -64,14 +83,15 @@ impl FdBackend {
 pub(crate) enum StorageImpl {
     Mmap(MmapMut),
     Fd(FdBackend),
+    Glommio(GlommioBackend),
 }
 
 #[async_trait(?Send)]
 impl WalrusFile for StorageImpl {
     async fn read_at(&self, offset: u64, len: usize) -> std::io::Result<Vec<u8>> {
-        let mut buf = vec![0u8; len];
         match self {
             StorageImpl::Mmap(mmap) => {
+                let mut buf = vec![0u8; len];
                 let off = offset as usize;
                 if off + len > mmap.len() {
                     return Err(std::io::Error::new(
@@ -83,8 +103,47 @@ impl WalrusFile for StorageImpl {
                 Ok(buf)
             }
             StorageImpl::Fd(fd) => {
+                let mut buf = vec![0u8; len];
                 fd.read(offset as usize, &mut buf)?;
                 Ok(buf)
+            }
+            StorageImpl::Glommio(gf) => {
+                let res = gf
+                    .file
+                    .read_at(offset, len)
+                    .await
+                    .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e))?;
+                Ok(res.to_vec())
+            }
+        }
+    }
+
+    fn read_at_sync(&self, offset: u64, len: usize) -> std::io::Result<Vec<u8>> {
+        match self {
+            StorageImpl::Glommio(_) => Err(std::io::Error::new(
+                std::io::ErrorKind::Other,
+                "Synchronous read not supported on Glommio backend",
+            )),
+            _ => {
+                let mut buf = vec![0u8; len];
+                match self {
+                    StorageImpl::Mmap(mmap) => {
+                        let off = offset as usize;
+                        if off + len > mmap.len() {
+                            return Err(std::io::Error::new(
+                                std::io::ErrorKind::UnexpectedEof,
+                                "read beyond mmap bound",
+                            ));
+                        }
+                        buf.copy_from_slice(&mmap[off..off + len]);
+                        Ok(buf)
+                    }
+                    StorageImpl::Fd(fd) => {
+                        fd.read(offset as usize, &mut buf)?;
+                        Ok(buf)
+                    }
+                    _ => unreachable!(),
+                }
             }
         }
     }
@@ -104,6 +163,39 @@ impl WalrusFile for StorageImpl {
                 Ok(len)
             }
             StorageImpl::Fd(fd) => fd.write(offset as usize, buf),
+            StorageImpl::Glommio(gf) => {
+                let n = gf
+                    .file
+                    .write_at(buf, offset)
+                    .await
+                    .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e))?;
+                Ok(n)
+            }
+        }
+    }
+
+    fn write_at_sync(&self, offset: u64, buf: &[u8]) -> std::io::Result<usize> {
+        match self {
+            StorageImpl::Glommio(_) => Err(std::io::Error::new(
+                std::io::ErrorKind::Other,
+                "Synchronous write not supported on Glommio backend",
+            )),
+            _ => match self {
+                StorageImpl::Mmap(mmap) => {
+                    let off = offset as usize;
+                    let len = buf.len();
+                    if off + len > mmap.len() {
+                        return Err(std::io::Error::other("write beyond mmap bound"));
+                    }
+                    unsafe {
+                        let ptr = mmap.as_ptr() as *mut u8;
+                        std::ptr::copy_nonoverlapping(buf.as_ptr(), ptr.add(off), len);
+                    }
+                    Ok(len)
+                }
+                StorageImpl::Fd(fd) => fd.write(offset as usize, buf),
+                _ => unreachable!(),
+            },
         }
     }
 
@@ -111,6 +203,23 @@ impl WalrusFile for StorageImpl {
         match self {
             StorageImpl::Mmap(mmap) => mmap.flush(),
             StorageImpl::Fd(fd) => fd.flush(),
+            StorageImpl::Glommio(gf) => gf
+                .file
+                .fdatasync()
+                .await
+                .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e)),
+        }
+    }
+
+    fn sync_all_sync(&self) -> std::io::Result<()> {
+        match self {
+            StorageImpl::Glommio(_) => Err(std::io::Error::new(
+                std::io::ErrorKind::Other,
+                "Synchronous sync_all not supported on Glommio backend",
+            )),
+            StorageImpl::Mmap(mmap) => mmap.flush(),
+            StorageImpl::Fd(fd) => fd.flush(),
+            _ => unreachable!(),
         }
     }
 
@@ -118,6 +227,19 @@ impl WalrusFile for StorageImpl {
         match self {
             StorageImpl::Mmap(mmap) => Ok(mmap.len() as u64),
             StorageImpl::Fd(fd) => Ok(fd.len() as u64),
+            StorageImpl::Glommio(gf) => Ok(gf.len),
+        }
+    }
+
+    fn len_sync(&self) -> std::io::Result<u64> {
+        match self {
+            StorageImpl::Glommio(_) => Err(std::io::Error::new(
+                std::io::ErrorKind::Other,
+                "Synchronous len not supported on Glommio backend",
+            )),
+            StorageImpl::Mmap(mmap) => Ok(mmap.len() as u64),
+            StorageImpl::Fd(fd) => Ok(fd.len() as u64),
+            _ => unreachable!(),
         }
     }
 }
@@ -125,19 +247,7 @@ impl WalrusFile for StorageImpl {
 impl StorageImpl {
     #[allow(dead_code)]
     pub(crate) fn write(&self, offset: usize, data: &[u8]) {
-        match self {
-            StorageImpl::Mmap(mmap) => {
-                debug_assert!(offset <= mmap.len());
-                debug_assert!(mmap.len() - offset >= data.len());
-                unsafe {
-                    let ptr = mmap.as_ptr() as *mut u8;
-                    std::ptr::copy_nonoverlapping(data.as_ptr(), ptr.add(offset), data.len());
-                }
-            }
-            StorageImpl::Fd(fd) => {
-                let _ = fd.write(offset, data);
-            }
-        }
+        let _ = self.write_at_sync(offset as u64, data);
     }
 
     pub(crate) fn read(&self, offset: usize, dest: &mut [u8]) {
@@ -150,21 +260,18 @@ impl StorageImpl {
             StorageImpl::Fd(fd) => {
                 let _ = fd.read(offset, dest);
             }
+            StorageImpl::Glommio(_) => {
+                panic!("StorageImpl::read called on Glommio backend");
+            }
         }
     }
 
     pub(crate) fn flush(&self) -> std::io::Result<()> {
-        match self {
-            StorageImpl::Mmap(mmap) => mmap.flush(),
-            StorageImpl::Fd(fd) => fd.flush(),
-        }
+        self.sync_all_sync()
     }
 
     pub(crate) fn len(&self) -> usize {
-        match self {
-            StorageImpl::Mmap(mmap) => mmap.len(),
-            StorageImpl::Fd(fd) => fd.len(),
-        }
+        self.len_sync().unwrap_or(0) as usize
     }
 
     #[allow(dead_code)]
@@ -216,11 +323,19 @@ unsafe impl Send for SharedMmap {}
 #[async_trait(?Send)]
 impl WalrusFile for SharedMmap {
     async fn read_at(&self, offset: u64, len: usize) -> std::io::Result<Vec<u8>> {
-        self.storage.read_at(offset, len).await
+        self.read_at_sync(offset, len)
+    }
+
+    fn read_at_sync(&self, offset: u64, len: usize) -> std::io::Result<Vec<u8>> {
+        self.storage.read_at_sync(offset, len)
     }
 
     async fn write_at(&self, offset: u64, buf: &[u8]) -> std::io::Result<usize> {
-        let res = self.storage.write_at(offset, buf).await;
+        self.write_at_sync(offset, buf)
+    }
+
+    fn write_at_sync(&self, offset: u64, buf: &[u8]) -> std::io::Result<usize> {
+        let res = self.storage.write_at_sync(offset, buf);
         if res.is_ok() {
             let now_ms = SystemTime::now()
                 .duration_since(SystemTime::UNIX_EPOCH)
@@ -232,11 +347,19 @@ impl WalrusFile for SharedMmap {
     }
 
     async fn sync_all(&self) -> std::io::Result<()> {
-        self.storage.sync_all().await
+        self.sync_all_sync()
+    }
+
+    fn sync_all_sync(&self) -> std::io::Result<()> {
+        self.storage.sync_all_sync()
     }
 
     async fn len(&self) -> std::io::Result<u64> {
-        WalrusFile::len(&self.storage).await
+        self.len_sync()
+    }
+
+    fn len_sync(&self) -> std::io::Result<u64> {
+        WalrusFile::len_sync(&self.storage)
     }
 }
 
