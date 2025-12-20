@@ -1,0 +1,44 @@
+name: Integration Tests
+
+on:
+  push:
+    branches: [ main ]
+  pull_request:
+    branches: [ main ]
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  integration:
+    name: Run Integration Tests
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install Rust
+        run: rustup update stable
+      - name: Cache dependencies
+        uses: actions/cache@v3
+        with:
+          path: |
+            ~/.cargo/bin/
+            ~/.cargo/registry/index/
+            ~/.cargo/registry/cache/
+            ~/.cargo/git/db/
+            target/
+          key: ${{ runner.os }}-cargo-integration-${{ hashFiles('**/Cargo.lock') }}
+      - name: Run Integration Tests
+        run: |
+          cargo test --test dataset_readers_integration
+          cargo test --test example_embedded_basic
+          cargo test --test rebalance_executor_integration
+          cargo test --test executor_routing_integration
+          cargo test --test worker_cache_integration
+          cargo test --test executor_concurrency_integration
+          cargo test --test executor_multibucket_integration
+          cargo test --test router_load_integration
+          cargo test --test embedded_lifecycle
+          cargo test --test rebalance_integration
+          cargo test --test worker_end_to_end
+          cargo test --test rebalance_concurrency_integration
+          cargo test --test embedded_smoke
