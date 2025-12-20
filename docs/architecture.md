@@ -666,3 +666,142 @@ On startup (`router_manager.rs:364-391`):
 │                                                                             │
 └─────────────────────────────────────────────────────────────────────────────┘
 ```
+
+---
+
+## Design Patterns
+
+Recurring choices scattered throughout the codebase:
+
+### 1. SIMD with Fallback Chains, Dispatch Once
+
+```
+┌─────────────────────────────────────────────────────────────────────────────┐
+│                                                                             │
+│   router_hnsw.rs    AVX-512 → AVX2 → SSE2 → scalar   (pick_kernels())       │
+│   executor.rs       AVX2+FMA → scalar                (L2 distance)          │
+│   indexer.rs        AVX2+FMA → scalar                (k-means)              │
+│                     + specialized k=2 and k≥8 kernels                       │
+│                                                                             │
+│   Pattern: Detect CPU features ONCE at construction, store function         │
+│            pointer, never branch per-call in hot path.                      │
+│                                                                             │
+└─────────────────────────────────────────────────────────────────────────────┘
+```
+
+### 2. Thread-Local Scratch Buffers
+
+```
+┌─────────────────────────────────────────────────────────────────────────────┐
+│                                                                             │
+│   router.rs         ThreadLocal<RefCell<SearchScratch>>                     │
+│   router.rs         ThreadLocal<RefCell<Vec<u8>>>       (quant buffers)     │
+│   storage.rs        TL_BACKING, TL_RANGES                                   │
+│   router_hnsw.rs    insert_scratch field                                    │
+│   executor.rs       reusable buffers in query path                          │
+│                                                                             │
+│   Pattern: Pre-allocate per-thread, clear-and-reuse, never allocate         │
+│            in steady state.                                                 │
+│                                                                             │
+└─────────────────────────────────────────────────────────────────────────────┘
+```
+
+### 3. Single-Threaded Actors with Channels
+
+```
+┌─────────────────────────────────────────────────────────────────────────────┐
+│                                                                             │
+│   router_manager    1 thread    crossbeam receiver                          │
+│   workers           1 thread    async_channel receiver                      │
+│   rebalancer        1 thread    autonomous loop                             │
+│                                                                             │
+│   Pattern: No locks on hot data, no shared mutable state. Each component    │
+│            is owned by one thread, accessed only via message passing.       │
+│                                                                             │
+└─────────────────────────────────────────────────────────────────────────────┘
+```
+
+### 4. Lossy Where It Doesn't Hurt, Precise Where It Does
+
+```
+┌─────────────────────────────────────────────────────────────────────────────┐
+│                                                                             │
+│   APPROXIMATE (speed/memory)          PRECISE (accuracy)                    │
+│   ─────────────────────────           ──────────────────                    │
+│   Router centroids: f32 → u8          Bucket storage: f32                   │
+│   HNSW vectors: u8 → i8 centered      L2 final ranking: f32                 │
+│   Routing lookup: quantized cosine    Distance computation: exact L2        │
+│                                                                             │
+│   Pattern: Routing/indexing can be approximate, final distance              │
+│            computation must be precise.                                     │
+│                                                                             │
+└─────────────────────────────────────────────────────────────────────────────┘
+```
+
+### 5. Adaptive Algorithms by Scale
+
+```
+┌─────────────────────────────────────────────────────────────────────────────┐
+│                                                                             │
+│   router.rs:62-70     ≤20k centroids → flat scan                            │
+│                       >20k centroids → HNSW                                 │
+│                                                                             │
+│   router.rs:80-100    top_k = 1  → ef_search = 64-128   (fast)              │
+│                       top_k > 1  → ef_search = 1200-4000 (thorough)         │
+│                                                                             │
+│   indexer.rs          k = 2  → specialized paired kernel                    │
+│                       k ≥ 8  → block-of-8 transposed kernel                 │
+│                                                                             │
+│   Pattern: Don't use the complex algorithm when the simple one is           │
+│            faster. Scale-aware branching.                                   │
+│                                                                             │
+└─────────────────────────────────────────────────────────────────────────────┘
+```
+
+### 6. Incremental Updates + Periodic Rebuilds
+
+```
+┌─────────────────────────────────────────────────────────────────────────────┐
+│                                                                             │
+│   Centroids          Running mean: c = (c * n + v) / (n + 1)                │
+│   HNSW index         Rebuild every 1000 updates                             │
+│   Router snapshot    Periodic full snapshot to WAL                          │
+│   Router updates     Incremental changes between snapshots                  │
+│                                                                             │
+│   Pattern: Amortize expensive operations. Don't rebuild on every            │
+│            change, batch them up.                                           │
+│                                                                             │
+└─────────────────────────────────────────────────────────────────────────────┘
+```
+
+### 7. Pre-Compute Derived Values
+
+```
+┌─────────────────────────────────────────────────────────────────────────────┐
+│                                                                             │
+│   quantizer.rs       scale = 255.0 / (max - min)    stored once             │
+│   router_hnsw.rs     inv_norms[] = 1.0 / sqrt(dot(v,v))   per vector        │
+│   router.rs          quant_scale, quant_min         stored once             │
+│                                                                             │
+│   Pattern: If you'll use a derived value repeatedly, compute it once        │
+│            and cache it. Avoid sqrt/division in hot paths.                  │
+│                                                                             │
+└─────────────────────────────────────────────────────────────────────────────┘
+```
+
+---
+
+## Philosophy
+
+```
+┌─────────────────────────────────────────────────────────────────────────────┐
+│                                                                             │
+│                    ALLOCATION IS THE ENEMY                                  │
+│                    BRANCHING IS THE ENEMY                                   │
+│                    PRECISION IS A SPECTRUM                                  │
+│                                                                             │
+│   The entire codebase is tuned for predictable, cache-friendly,             │
+│   zero-allocation steady-state performance.                                 │
+│                                                                             │
+└─────────────────────────────────────────────────────────────────────────────┘
+```
