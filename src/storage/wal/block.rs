@@ -47,9 +47,8 @@ impl Block {
             checksum: checksum64(data),
         };
 
-        let meta_bytes = rkyv::to_bytes::<_, 256>(&new_meta).map_err(|e| {
-            std::io::Error::other(format!("serialize metadata failed: {:?}", e))
-        })?;
+        let meta_bytes = rkyv::to_bytes::<_, 256>(&new_meta)
+            .map_err(|e| std::io::Error::other(format!("serialize metadata failed: {:?}", e)))?;
         if meta_bytes.len() > PREFIX_META_SIZE - 2 {
             return Err(std::io::Error::new(
                 std::io::ErrorKind::InvalidData,

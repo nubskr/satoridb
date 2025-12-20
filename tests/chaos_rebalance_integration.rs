@@ -7,8 +7,7 @@ use satoridb::executor::{
     clear_executor_fail_load_hook, set_executor_fail_load_hook, Executor, WorkerCache,
 };
 use satoridb::rebalancer::{
-    clear_rebalance_fail_hook, set_rebalance_fail_hook, RebalanceTaskKind,
-    RebalanceWorker,
+    clear_rebalance_fail_hook, set_rebalance_fail_hook, RebalanceTaskKind, RebalanceWorker,
 };
 use satoridb::router::RoutingTable;
 use satoridb::storage::{Bucket, Storage, Vector};
@@ -173,4 +172,3 @@ fn executor_load_failures_do_not_panic() -> Result<()> {
     assert!(!last.is_empty(), "eventual load should succeed");
     Ok(())
 }
-

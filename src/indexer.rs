@@ -695,7 +695,10 @@ mod tests {
     fn zero_dimension_returns_empty() {
         let vectors = vec![Vector::new(0, vec![]), Vector::new(1, vec![])];
         let buckets = Indexer::build_clusters(vectors, 2);
-        assert!(buckets.is_empty(), "zero-dimension vectors should return empty");
+        assert!(
+            buckets.is_empty(),
+            "zero-dimension vectors should return empty"
+        );
     }
 
     /// Total vector count is preserved after clustering.

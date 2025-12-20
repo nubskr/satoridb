@@ -94,7 +94,10 @@ mod tests {
             counts[node] += 1;
         }
         // Each node should get some keys (roughly 250 each, but at least > 0).
-        assert!(counts.iter().all(|&c| c > 0), "all nodes should receive some keys");
+        assert!(
+            counts.iter().all(|&c| c > 0),
+            "all nodes should receive some keys"
+        );
     }
 
     /// Ring should handle wraparound: hash >= all ring hashes → first entry.

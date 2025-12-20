@@ -124,7 +124,10 @@ mod tests {
         assert_eq!(q.scale, 0.0, "zero range should have scale=0");
         let bytes = q.quantize(&[5.0, 5.0, 5.0]);
         // With scale=0, the formula becomes: (x - min) * 0 = 0
-        assert!(bytes.iter().all(|&b| b == 0), "all values should quantize to 0");
+        assert!(
+            bytes.iter().all(|&b| b == 0),
+            "all values should quantize to 0"
+        );
     }
 
     /// Very small range (< f32::EPSILON) triggers scale=0 to avoid overflow.
@@ -135,7 +138,10 @@ mod tests {
         assert_eq!(q.scale, 0.0, "tiny range should use scale=0");
         let bytes = q.quantize(&[0.0, 1e-10]);
         // With scale=0, all values quantize to 0
-        assert!(bytes.iter().all(|&b| b == 0), "scale=0 means all values -> 0");
+        assert!(
+            bytes.iter().all(|&b| b == 0),
+            "scale=0 means all values -> 0"
+        );
     }
 
     /// Range just above f32::EPSILON should work normally.
@@ -143,7 +149,10 @@ mod tests {
     fn range_above_epsilon_works() {
         let q = Quantizer::new(0.0, 1e-6);
         // 1e-6 > f32::EPSILON, so scale should be non-zero
-        assert!(q.scale > 0.0, "range above epsilon should have positive scale");
+        assert!(
+            q.scale > 0.0,
+            "range above epsilon should have positive scale"
+        );
         let bytes = q.quantize(&[0.0, 1e-6]);
         assert_eq!(bytes[0], 0);
         assert_eq!(bytes[1], 255);

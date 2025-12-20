@@ -84,9 +84,7 @@ pub async fn run_worker(id: usize, receiver: Receiver<WorkerMessage>, wal: Arc<W
             } => {
                 let mut bucket = Bucket::new(bucket_id, Vec::new());
                 bucket.vectors = vec![vector];
-                let result = storage
-                    .put_chunk(&bucket)
-                    .await;
+                let result = storage.put_chunk(&bucket).await;
                 let _ = respond_to.send(result);
             }
             WorkerMessage::Ingest { bucket_id, vectors } => {

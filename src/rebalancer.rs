@@ -24,8 +24,7 @@ pub enum RebalanceTaskKind {
 
 type RebalanceFailHook = Arc<dyn Fn(RebalanceTaskKind) -> bool + Send + Sync>;
 
-static FAIL_HOOK: StdMutex<Option<RebalanceFailHook>> =
-    StdMutex::new(None);
+static FAIL_HOOK: StdMutex<Option<RebalanceFailHook>> = StdMutex::new(None);
 
 pub fn set_rebalance_fail_hook<F>(hook: F)
 where
@@ -254,7 +253,10 @@ impl RebalanceState {
 
         // Check if bucket was already retired (e.g., by a prior split/merge).
         if self.retired.read().contains(&bucket_id) {
-            debug!("rebalance: split skipped, bucket {} already retired", bucket_id);
+            debug!(
+                "rebalance: split skipped, bucket {} already retired",
+                bucket_id
+            );
             return;
         }
 

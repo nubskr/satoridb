@@ -32,14 +32,15 @@ impl Reader {
     pub(super) fn append_block_to_chain(&self, col: &str, block: Block) -> io::Result<()> {
         // fast path: try read-lock map and use per-column lock
         if let Some(info_arc) = {
-            let map = self.data.read().map_err(|_| {
-                io::Error::other("reader map read lock poisoned")
-            })?;
+            let map = self
+                .data
+                .read()
+                .map_err(|_| io::Error::other("reader map read lock poisoned"))?;
             map.get(col).cloned()
         } {
-            let mut info = info_arc.write().map_err(|_| {
-                io::Error::other("col info write lock poisoned")
-            })?;
+            let mut info = info_arc
+                .write()
+                .map_err(|_| io::Error::other("col info write lock poisoned"))?;
             let before = info.chain.len();
             info.chain.push(block.clone());
             // If we were reading this as the active tail, carry over progress to sealed chain
@@ -60,9 +61,10 @@ impl Reader {
 
         // slow path
         let info_arc = {
-            let mut map = self.data.write().map_err(|_| {
-                io::Error::other("reader map write lock poisoned")
-            })?;
+            let mut map = self
+                .data
+                .write()
+                .map_err(|_| io::Error::other("reader map write lock poisoned"))?;
             map.entry(col.to_string())
                 .or_insert_with(|| {
                     Arc::new(RwLock::new(ColReaderInfo {

@@ -54,4 +54,3 @@ fn rebalance_fast_path_split_triggers_on_oversized_bucket() -> Result<()> {
     );
     Ok(())
 }
-

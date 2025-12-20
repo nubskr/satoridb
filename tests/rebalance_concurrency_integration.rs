@@ -67,4 +67,3 @@ fn routing_snapshots_survive_concurrent_split() -> Result<()> {
 
     Ok(())
 }
-

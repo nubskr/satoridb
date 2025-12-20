@@ -67,9 +67,7 @@ fn worker_ingests_and_answers_queries() {
     }))
     .expect("query send");
 
-    let results = block_on(resp_rx)
-        .expect("query recv")
-        .expect("query ok");
+    let results = block_on(resp_rx).expect("query recv").expect("query ok");
     assert_eq!(results.len(), vectors.len());
     assert!(results.iter().any(|(id, _)| *id == 1));
     assert!(results.iter().any(|(id, _)| *id == 2));

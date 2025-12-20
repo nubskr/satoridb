@@ -607,7 +607,10 @@ impl PartialOrd for HeapItem {
 
 impl Ord for HeapItem {
     fn cmp(&self, other: &Self) -> Ordering {
-        other.dist.partial_cmp(&self.dist).unwrap_or(Ordering::Equal)
+        other
+            .dist
+            .partial_cmp(&self.dist)
+            .unwrap_or(Ordering::Equal)
     }
 }
 

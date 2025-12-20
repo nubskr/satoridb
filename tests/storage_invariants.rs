@@ -23,7 +23,10 @@ fn empty_bucket_does_not_write() -> Result<()> {
 
     // Reading should return empty
     let chunks = block_on(storage.get_chunks(0))?;
-    assert!(chunks.is_empty(), "empty bucket should not create WAL entries");
+    assert!(
+        chunks.is_empty(),
+        "empty bucket should not create WAL entries"
+    );
 
     Ok(())
 }
@@ -63,7 +66,11 @@ fn multiple_vectors_same_bucket() -> Result<()> {
     block_on(storage.put_chunk(&bucket))?;
 
     let chunks = block_on(storage.get_chunks(0))?;
-    assert_eq!(chunks.len(), 10, "should have 10 WAL entries (one per vector)");
+    assert_eq!(
+        chunks.len(),
+        10,
+        "should have 10 WAL entries (one per vector)"
+    );
 
     Ok(())
 }

@@ -217,9 +217,10 @@ impl Walrus {
 
     pub(super) fn get_or_create_writer(&self, col_name: &str) -> std::io::Result<Arc<Writer>> {
         if let Some(writer) = {
-            let map = self.writers.read().map_err(|_| {
-                std::io::Error::other("writers read lock poisoned")
-            })?;
+            let map = self
+                .writers
+                .read()
+                .map_err(|_| std::io::Error::other("writers read lock poisoned"))?;
             map.get(col_name).cloned()
         } {
             return Ok(writer);
@@ -227,9 +228,10 @@ impl Walrus {
 
         debug_print!("[writer_debug] creating new writer for {}", col_name);
 
-        let mut map = self.writers.write().map_err(|_| {
-            std::io::Error::other("writers write lock poisoned")
-        })?;
+        let mut map = self
+            .writers
+            .write()
+            .map_err(|_| std::io::Error::other("writers write lock poisoned"))?;
 
         if let Some(writer) = map.get(col_name).cloned() {
             return Ok(writer);
@@ -936,7 +938,9 @@ mod tests {
     #[test]
     fn test_batch_too_large() {
         let key = unique_key();
-        let wal = Arc::new(Walrus::with_consistency_for_key(&key, ReadConsistency::StrictlyAtOnce).unwrap());
+        let wal = Arc::new(
+            Walrus::with_consistency_for_key(&key, ReadConsistency::StrictlyAtOnce).unwrap(),
+        );
 
         let too_big: Vec<&[u8]> = std::iter::repeat_n(b"x".as_slice(), 2001).collect();
 
@@ -945,7 +949,6 @@ mod tests {
 
         cleanup_key(&key);
     }
-
 
     #[test]
     fn stateless_batch_read_checkpoint_does_not_change_count() {

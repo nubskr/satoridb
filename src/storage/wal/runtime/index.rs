@@ -71,9 +71,8 @@ impl WalIndex {
 
     fn persist(&self) -> std::io::Result<()> {
         let tmp_path = format!("{}.tmp", self.path);
-        let bytes = rkyv::to_bytes::<_, 256>(&self.store).map_err(|e| {
-            std::io::Error::other(format!("index serialize failed: {:?}", e))
-        })?;
+        let bytes = rkyv::to_bytes::<_, 256>(&self.store)
+            .map_err(|e| std::io::Error::other(format!("index serialize failed: {:?}", e)))?;
 
         fs::write(&tmp_path, &bytes)?;
         fs::File::open(&tmp_path)?.sync_all()?;

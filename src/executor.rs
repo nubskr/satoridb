@@ -22,8 +22,7 @@ struct CachedBucket {
 
 type FailLoadHook = Arc<dyn Fn(u64) -> bool + Send + Sync>;
 
-static FAIL_LOAD_HOOK: StdMutex<Option<FailLoadHook>> =
-    StdMutex::new(None);
+static FAIL_LOAD_HOOK: StdMutex<Option<FailLoadHook>> = StdMutex::new(None);
 
 pub fn set_executor_fail_load_hook<F>(hook: F)
 where
@@ -363,7 +362,12 @@ mod tests {
         // Each element differs by 1, so sum of squares = n, sqrt = sqrt(n)
         let expected = (n as f32).sqrt();
         let dist = l2_distance_f32(&a, &b);
-        assert!((dist - expected).abs() < 1e-3, "expected {}, got {}", expected, dist);
+        assert!(
+            (dist - expected).abs() < 1e-3,
+            "expected {}, got {}",
+            expected,
+            dist
+        );
     }
 
     /// L2 distance with negative values.
@@ -381,9 +385,27 @@ mod tests {
     #[test]
     fn worker_cache_evicts_on_limit() {
         let mut cache = WorkerCache::new(2, usize::MAX);
-        cache.put(0, CachedBucket { vectors: vec![], byte_size: 10 });
-        cache.put(1, CachedBucket { vectors: vec![], byte_size: 10 });
-        cache.put(2, CachedBucket { vectors: vec![], byte_size: 10 });
+        cache.put(
+            0,
+            CachedBucket {
+                vectors: vec![],
+                byte_size: 10,
+            },
+        );
+        cache.put(
+            1,
+            CachedBucket {
+                vectors: vec![],
+                byte_size: 10,
+            },
+        );
+        cache.put(
+            2,
+            CachedBucket {
+                vectors: vec![],
+                byte_size: 10,
+            },
+        );
         // LRU should have evicted bucket 0
         assert!(cache.get(0).is_none(), "bucket 0 should be evicted");
         assert!(cache.get(1).is_some(), "bucket 1 should still be cached");
@@ -394,18 +416,45 @@ mod tests {
     #[test]
     fn worker_cache_rejects_oversized() {
         let mut cache = WorkerCache::new(10, 100); // max 100 bytes per bucket
-        cache.put(0, CachedBucket { vectors: vec![], byte_size: 50 });
-        cache.put(1, CachedBucket { vectors: vec![], byte_size: 200 }); // too big
+        cache.put(
+            0,
+            CachedBucket {
+                vectors: vec![],
+                byte_size: 50,
+            },
+        );
+        cache.put(
+            1,
+            CachedBucket {
+                vectors: vec![],
+                byte_size: 200,
+            },
+        ); // too big
         assert!(cache.get(0).is_some(), "small bucket should be cached");
-        assert!(cache.get(1).is_none(), "oversized bucket should not be cached");
+        assert!(
+            cache.get(1).is_none(),
+            "oversized bucket should not be cached"
+        );
     }
 
     /// WorkerCache clear removes all entries.
     #[test]
     fn worker_cache_clear() {
         let mut cache = WorkerCache::new(10, usize::MAX);
-        cache.put(0, CachedBucket { vectors: vec![], byte_size: 10 });
-        cache.put(1, CachedBucket { vectors: vec![], byte_size: 10 });
+        cache.put(
+            0,
+            CachedBucket {
+                vectors: vec![],
+                byte_size: 10,
+            },
+        );
+        cache.put(
+            1,
+            CachedBucket {
+                vectors: vec![],
+                byte_size: 10,
+            },
+        );
         cache.clear();
         assert!(cache.get(0).is_none());
         assert!(cache.get(1).is_none());
@@ -415,9 +464,27 @@ mod tests {
     #[test]
     fn worker_cache_invalidate_many() {
         let mut cache = WorkerCache::new(10, usize::MAX);
-        cache.put(0, CachedBucket { vectors: vec![], byte_size: 10 });
-        cache.put(1, CachedBucket { vectors: vec![], byte_size: 10 });
-        cache.put(2, CachedBucket { vectors: vec![], byte_size: 10 });
+        cache.put(
+            0,
+            CachedBucket {
+                vectors: vec![],
+                byte_size: 10,
+            },
+        );
+        cache.put(
+            1,
+            CachedBucket {
+                vectors: vec![],
+                byte_size: 10,
+            },
+        );
+        cache.put(
+            2,
+            CachedBucket {
+                vectors: vec![],
+                byte_size: 10,
+            },
+        );
         cache.invalidate_many(&[0, 2]);
         assert!(cache.get(0).is_none(), "bucket 0 should be invalidated");
         assert!(cache.get(1).is_some(), "bucket 1 should remain");

@@ -60,4 +60,3 @@ fn rebalance_split_increases_buckets_and_router_version() -> Result<()> {
     drop(worker);
     Ok(())
 }
-

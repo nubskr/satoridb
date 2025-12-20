@@ -77,12 +77,18 @@ fn stats_ready_after_upsert() -> Result<()> {
 
     // Before any upsert, router is not initialized
     let stats_before = handle.stats_blocking();
-    assert!(!stats_before.ready, "router should not be ready before first upsert");
+    assert!(
+        !stats_before.ready,
+        "router should not be ready before first upsert"
+    );
 
     // After first upsert, router is ready
     handle.upsert_blocking(1, vec![1.0, 2.0], None)?;
     let stats_after = handle.stats_blocking();
-    assert!(stats_after.ready, "router should be ready after first upsert");
+    assert!(
+        stats_after.ready,
+        "router should be ready after first upsert"
+    );
 
     db.shutdown()?;
     Ok(())
@@ -205,7 +211,10 @@ fn query_empty_returns_error() -> Result<()> {
 
     // Query on empty database returns error because router not initialized
     let result = handle.query_blocking(vec![1.0, 2.0], 10, 5);
-    assert!(result.is_err(), "query on empty database should return error");
+    assert!(
+        result.is_err(),
+        "query on empty database should return error"
+    );
 
     db.shutdown()?;
     Ok(())

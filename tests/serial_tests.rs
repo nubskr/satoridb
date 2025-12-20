@@ -93,4 +93,3 @@ fn router_graph_path_returns_near_ids() -> Result<()> {
 
     Ok(())
 }
-
