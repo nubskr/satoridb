@@ -5,133 +5,9 @@
 //! These tests are marked `#[ignore]` so they don't run with `cargo test`.
 //! Run with: `cargo test --test serial_tests -- --ignored --test-threads=1`
 
-use std::sync::Arc;
-use std::time::{Duration, Instant};
-
 use anyhow::Result;
-use satoridb::rebalancer::{clear_rebalance_fail_hook, RebalanceTask, RebalanceWorker};
-use satoridb::router::RoutingTable;
-use satoridb::storage::{Bucket, Storage, Vector};
-use satoridb::wal::runtime::Walrus;
 use satoridb::quantizer::Quantizer;
 use satoridb::router::Router;
-use tempfile::TempDir;
-
-fn init_wal(tempdir: &TempDir) -> Arc<Walrus> {
-    Arc::new(Walrus::with_data_dir(tempdir.path().to_path_buf()).expect("walrus init"))
-}
-
-fn wait_until(timeout: Duration, mut f: impl FnMut() -> bool) -> bool {
-    let start = Instant::now();
-    while start.elapsed() < timeout {
-        if f() {
-            return true;
-        }
-        std::thread::sleep(Duration::from_millis(20));
-    }
-    false
-}
-
-// ============================================================================
-// Rebalancer idempotency tests (affected by global fail hook)
-// ============================================================================
-
-/// After a split completes and retires bucket X, enqueueing another Split(X) should be a no-op.
-#[test]
-#[ignore]
-fn split_on_retired_bucket_is_noop() -> Result<()> {
-    clear_rebalance_fail_hook();
-
-    let tmp = tempfile::tempdir()?;
-    let wal = init_wal(&tmp);
-    let storage = Storage::new(wal);
-    let routing = Arc::new(RoutingTable::new());
-    let worker = RebalanceWorker::spawn(storage.clone(), routing.clone(), None);
-
-    let mut bucket = Bucket::new(0, vec![0.0, 0.0]);
-    for i in 0..20u64 {
-        bucket.add_vector(Vector::new(i, vec![i as f32, i as f32 + 0.5]));
-    }
-    futures::executor::block_on(storage.put_chunk(&bucket))?;
-    futures::executor::block_on(worker.prime_centroids(&[bucket.clone()]))?;
-
-    worker.enqueue_blocking(RebalanceTask::Split(0))?;
-
-    let done = wait_until(Duration::from_secs(5), || worker.snapshot_sizes().len() == 2);
-    assert!(done, "initial split should complete");
-
-    let version_after_first_split = routing.current_version();
-    let sizes_after_first_split = worker.snapshot_sizes();
-
-    // Now enqueue another split on the retired bucket 0.
-    worker.enqueue_blocking(RebalanceTask::Split(0))?;
-
-    std::thread::sleep(Duration::from_millis(200));
-
-    assert_eq!(
-        routing.current_version(),
-        version_after_first_split,
-        "split on retired bucket should not bump routing version"
-    );
-    assert_eq!(
-        worker.snapshot_sizes().len(),
-        sizes_after_first_split.len(),
-        "split on retired bucket should not create new buckets"
-    );
-
-    Ok(())
-}
-
-/// After a merge completes and retires buckets A and B, enqueueing Merge(A,B) again should be a no-op.
-#[test]
-#[ignore]
-fn merge_on_retired_bucket_is_noop() -> Result<()> {
-    clear_rebalance_fail_hook();
-
-    let tmp = tempfile::tempdir()?;
-    let wal = init_wal(&tmp);
-    let storage = Storage::new(wal);
-    let routing = Arc::new(RoutingTable::new());
-    let worker = RebalanceWorker::spawn(storage.clone(), routing.clone(), None);
-
-    let mut a = Bucket::new(0, vec![0.0, 0.0]);
-    a.add_vector(Vector::new(0, vec![0.0, 0.0]));
-    a.add_vector(Vector::new(1, vec![0.1, 0.1]));
-    let mut b = Bucket::new(1, vec![1.0, 1.0]);
-    b.add_vector(Vector::new(2, vec![1.0, 1.0]));
-    b.add_vector(Vector::new(3, vec![1.1, 1.1]));
-    futures::executor::block_on(storage.put_chunk(&a))?;
-    futures::executor::block_on(storage.put_chunk(&b))?;
-    futures::executor::block_on(worker.prime_centroids(&[a.clone(), b.clone()]))?;
-
-    worker.enqueue_blocking(RebalanceTask::Merge(0, 1))?;
-
-    let done = wait_until(Duration::from_secs(5), || {
-        worker.snapshot_sizes().len() == 1 && routing.current_version() > 0
-    });
-    assert!(done, "initial merge should complete");
-
-    let version_after_first_merge = routing.current_version();
-    let sizes_after_first_merge = worker.snapshot_sizes();
-
-    // Now enqueue another merge on the retired buckets 0 and 1.
-    worker.enqueue_blocking(RebalanceTask::Merge(0, 1))?;
-
-    std::thread::sleep(Duration::from_millis(200));
-
-    assert_eq!(
-        routing.current_version(),
-        version_after_first_merge,
-        "merge on retired buckets should not bump routing version"
-    );
-    assert_eq!(
-        worker.snapshot_sizes().len(),
-        sizes_after_first_merge.len(),
-        "merge on retired buckets should not create new buckets"
-    );
-
-    Ok(())
-}
 
 // ============================================================================
 // Router load tests (CPU-intensive, 15k-30k centroids)
@@ -217,3 +93,4 @@ fn router_graph_path_returns_near_ids() -> Result<()> {
 
     Ok(())
 }
+

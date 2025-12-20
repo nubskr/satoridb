@@ -2,7 +2,7 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use anyhow::Result;
-use satoridb::rebalancer::{RebalanceTask, RebalanceWorker};
+use satoridb::rebalancer::RebalanceWorker;
 use satoridb::router::RoutingTable;
 use satoridb::storage::{Bucket, Storage, Vector};
 use satoridb::wal::runtime::Walrus;
@@ -26,6 +26,9 @@ fn wait_until(timeout: Duration, mut f: impl FnMut() -> bool) -> bool {
 /// Concurrent routing snapshots during a split should not panic or deadlock.
 #[test]
 fn routing_snapshots_survive_concurrent_split() -> Result<()> {
+    // Force split with 10 vectors
+    std::env::set_var("SATORI_REBALANCE_THRESHOLD", "5");
+
     let tmp = tempfile::tempdir()?;
     let wal = init_wal(&tmp);
     let storage = Storage::new(wal);
@@ -49,10 +52,7 @@ fn routing_snapshots_survive_concurrent_split() -> Result<()> {
         }
     });
 
-    // Enqueue split.
-    worker
-        .enqueue_blocking(RebalanceTask::Split(bucket.id))
-        .expect("enqueue split");
+    // Autonomous loop will trigger split on bucket 0.
 
     let progressed = wait_until(Duration::from_secs(3), || {
         worker.snapshot_sizes().len() > 1 && routing.current_version() > 0
@@ -67,3 +67,4 @@ fn routing_snapshots_survive_concurrent_split() -> Result<()> {
 
     Ok(())
 }
+

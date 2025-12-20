@@ -123,16 +123,6 @@ impl RebalanceState {
             .clone()
     }
 
-    pub(crate) fn load_bucket(&self, bucket_id: u64) -> Option<Bucket> {
-        let vectors = self.load_bucket_vectors(bucket_id)?;
-        let centroid = compute_centroid(&vectors);
-        Some(Bucket {
-            id: bucket_id,
-            centroid,
-            vectors,
-        })
-    }
-
     pub(crate) fn load_bucket_vectors(&self, bucket_id: u64) -> Option<Vec<Vector>> {
         let chunks = block_on(self.storage.get_chunks(bucket_id)).ok()?;
         let mut vectors: Vec<Vector> = Vec::new();
@@ -363,11 +353,14 @@ impl RebalanceWorker {
             }
             None => {
                 thread::Builder::new()
-                    .name(name)
+                    .name(name.clone())
                     .spawn(move || {
-                        // Create a dummy runtime for block_on if needed,
-                        // or just run blocking code.
-                        block_on(run_autonomous_loop(state_clone));
+                        // FIX: Run inside a Glommio executor to support spawn_blocking and timers
+                        glommio::LocalExecutorBuilder::default()
+                            .name(&name)
+                            .make()
+                            .expect("failed to create default rebalance executor")
+                            .run(run_autonomous_loop(state_clone));
                     })
                     .expect("rebalance worker");
             }

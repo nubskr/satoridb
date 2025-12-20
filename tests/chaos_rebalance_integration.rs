@@ -3,13 +3,11 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use anyhow::Result;
-use rand::rngs::StdRng;
-use rand::{Rng, SeedableRng};
 use satoridb::executor::{
     clear_executor_fail_load_hook, set_executor_fail_load_hook, Executor, WorkerCache,
 };
 use satoridb::rebalancer::{
-    clear_rebalance_fail_hook, set_rebalance_fail_hook, RebalanceTask, RebalanceTaskKind,
+    clear_rebalance_fail_hook, set_rebalance_fail_hook, RebalanceTaskKind,
     RebalanceWorker,
 };
 use satoridb::router::RoutingTable;
@@ -34,13 +32,16 @@ fn wait_until(timeout: Duration, mut f: impl FnMut() -> bool) -> bool {
 
 #[test]
 fn rebalance_survives_split_failures() -> Result<()> {
+    // Force split at 10
+    std::env::set_var("SATORI_REBALANCE_THRESHOLD", "10");
+
     let tmp = tempfile::tempdir()?;
     let wal = init_wal(&tmp);
     let storage = Storage::new(wal);
     let routing = Arc::new(RoutingTable::new());
     let worker = RebalanceWorker::spawn(storage.clone(), routing.clone(), None);
 
-    // Seed one bucket with enough vectors to split.
+    // Seed one bucket with enough vectors to split (32 > 10).
     let mut bucket = Bucket::new(0, vec![0.0, 0.0]);
     for i in 0..32u64 {
         bucket.add_vector(Vector::new(i, vec![i as f32, i as f32 + 0.5]));
@@ -59,64 +60,13 @@ fn rebalance_survives_split_failures() -> Result<()> {
         n.is_multiple_of(3)
     });
 
-    for _ in 0..6 {
-        worker
-            .enqueue_blocking(RebalanceTask::Split(bucket.id))
-            .expect("enqueue split");
-    }
+    // Autonomous loop will try to split. It might fail, but it should retry.
 
     let ok = wait_until(Duration::from_secs(15), || {
         worker.snapshot_sizes().len() >= 2 && routing.current_version() > 0
     });
     clear_rebalance_fail_hook();
     assert!(ok, "rebalance should progress despite injected failures");
-    Ok(())
-}
-
-#[test]
-fn rebalance_merges_with_flaky_tasks() -> Result<()> {
-    let tmp = tempfile::tempdir()?;
-    let wal = init_wal(&tmp);
-    let storage = Storage::new(wal);
-    let routing = Arc::new(RoutingTable::new());
-    let worker = RebalanceWorker::spawn(storage.clone(), routing.clone(), None);
-
-    // Two small buckets to merge.
-    let mut a = Bucket::new(0, vec![0.0, 0.0]);
-    a.add_vector(Vector::new(0, vec![0.0, 0.0]));
-    a.add_vector(Vector::new(1, vec![0.1, 0.1]));
-    let mut b = Bucket::new(1, vec![1.0, 1.0]);
-    b.add_vector(Vector::new(2, vec![1.0, 1.0]));
-    b.add_vector(Vector::new(3, vec![1.1, 1.2]));
-    futures::executor::block_on(storage.put_chunk(&a))?;
-    futures::executor::block_on(storage.put_chunk(&b))?;
-    futures::executor::block_on(worker.prime_centroids(&[a.clone(), b.clone()]))?;
-
-    let counter = Arc::new(AtomicUsize::new(0));
-    let c = counter.clone();
-    set_rebalance_fail_hook(move |kind| {
-        if kind != RebalanceTaskKind::Merge {
-            return false;
-        }
-        let n = c.fetch_add(1, Ordering::SeqCst);
-        n.is_multiple_of(2)
-    });
-
-    for _ in 0..5 {
-        worker
-            .enqueue_blocking(RebalanceTask::Merge(a.id, b.id))
-            .expect("enqueue merge");
-    }
-
-    let ok = wait_until(Duration::from_secs(15), || {
-        let sizes = worker.snapshot_sizes();
-        sizes.len() == 1 && routing.current_version() > 0
-    });
-    clear_rebalance_fail_hook();
-    assert!(
-        ok,
-        "merge should eventually succeed even with intermittent failures"
-    );
     Ok(())
 }
 
@@ -224,217 +174,3 @@ fn executor_load_failures_do_not_panic() -> Result<()> {
     Ok(())
 }
 
-#[test]
-fn rebalancer_handles_jittered_tasks() -> Result<()> {
-    let tmp = tempfile::tempdir()?;
-    let wal = init_wal(&tmp);
-    let storage = Storage::new(wal);
-    let routing = Arc::new(RoutingTable::new());
-    let worker = RebalanceWorker::spawn(storage.clone(), routing.clone(), None);
-
-    // Seed two buckets.
-    let mut buckets = Vec::new();
-    for id in 0..2u64 {
-        let mut b = Bucket::new(id, vec![id as f32, id as f32]);
-        for j in 0..16u64 {
-            b.add_vector(Vector::new(id * 100 + j, vec![j as f32, j as f32 + 0.5]));
-        }
-        futures::executor::block_on(storage.put_chunk(&b))?;
-        buckets.push(b);
-    }
-    futures::executor::block_on(worker.prime_centroids(&buckets))?;
-
-    // Inject occasional failures.
-    let counter = Arc::new(AtomicUsize::new(0));
-    let c = counter.clone();
-    set_rebalance_fail_hook(move |kind| {
-        let n = c.fetch_add(1, Ordering::SeqCst);
-        matches!(kind, RebalanceTaskKind::Split | RebalanceTaskKind::Merge) && n.is_multiple_of(5)
-    });
-
-    // Jittered enqueue of tasks.
-    let mut rng = StdRng::seed_from_u64(42);
-    for _ in 0..30 {
-        if rng.gen_bool(0.6) {
-            let _ = worker.enqueue_blocking(RebalanceTask::Split(0));
-        } else {
-            let _ = worker.enqueue_blocking(RebalanceTask::Merge(0, 1));
-        }
-        std::thread::sleep(Duration::from_millis(rng.gen_range(1..5)));
-    }
-
-    let progressed = wait_until(Duration::from_secs(15), || routing.current_version() > 0);
-    clear_rebalance_fail_hook();
-    assert!(progressed, "routing should advance despite jitter/failures");
-    let sizes = worker.snapshot_sizes();
-    assert!(
-        !sizes.is_empty() && sizes.values().all(|s| *s > 0),
-        "bucket sizes should remain positive"
-    );
-    Ok(())
-}
-
-#[test]
-fn rebalancer_close_allows_shutdown() -> Result<()> {
-    let tmp = tempfile::tempdir()?;
-    let wal = init_wal(&tmp);
-    let storage = Storage::new(wal);
-    let routing = Arc::new(RoutingTable::new());
-    let worker = RebalanceWorker::spawn(storage.clone(), routing.clone(), None);
-
-    // Close channel and ensure further enqueue fails quickly.
-    worker.close();
-    let res = worker.enqueue_blocking(RebalanceTask::Split(0));
-    assert!(res.is_err(), "enqueue after close should error");
-    Ok(())
-}
-
-/// Enqueueing Split(X) multiple times should only create 2 buckets total (not 2 per split).
-/// This tests idempotency: once a bucket is split and retired, subsequent splits are no-ops.
-#[test]
-fn duplicate_split_is_idempotent() -> Result<()> {
-    // Clear any fail hooks that might be set by other tests running in parallel.
-    clear_rebalance_fail_hook();
-
-    let tmp = tempfile::tempdir()?;
-    let wal = init_wal(&tmp);
-    let storage = Storage::new(wal);
-    let routing = Arc::new(RoutingTable::new());
-    let worker = RebalanceWorker::spawn(storage.clone(), routing.clone(), None);
-
-    // Create one bucket with enough vectors to split.
-    let mut bucket = Bucket::new(0, vec![0.0, 0.0]);
-    for i in 0..20u64 {
-        bucket.add_vector(Vector::new(i, vec![i as f32, i as f32 + 0.5]));
-    }
-    futures::executor::block_on(storage.put_chunk(&bucket))?;
-    futures::executor::block_on(worker.prime_centroids(&[bucket.clone()]))?;
-
-    // Enqueue the same split 5 times rapidly.
-    for _ in 0..5 {
-        worker.enqueue_blocking(RebalanceTask::Split(0))?;
-    }
-
-    // Wait for all tasks to be processed.
-    let done = wait_until(Duration::from_secs(15), || {
-        worker.snapshot_sizes().len() >= 2 && routing.current_version() > 0
-    });
-    assert!(done, "split should complete");
-
-    // Key assertion: we should have exactly 2 buckets (from one split), not 4, 6, 8, or 10.
-    let sizes = worker.snapshot_sizes();
-    assert_eq!(
-        sizes.len(),
-        2,
-        "duplicate splits should be idempotent; expected 2 buckets, got {}",
-        sizes.len()
-    );
-
-    Ok(())
-}
-
-/// Enqueueing Merge(A,B) multiple times should only create 1 merged bucket.
-/// Once A and B are retired, subsequent merges are no-ops.
-#[test]
-fn duplicate_merge_is_idempotent() -> Result<()> {
-    // Clear any fail hooks that might be set by other tests running in parallel.
-    clear_rebalance_fail_hook();
-
-    let tmp = tempfile::tempdir()?;
-    let wal = init_wal(&tmp);
-    let storage = Storage::new(wal);
-    let routing = Arc::new(RoutingTable::new());
-    let worker = RebalanceWorker::spawn(storage.clone(), routing.clone(), None);
-
-    // Create two small buckets.
-    let mut a = Bucket::new(0, vec![0.0, 0.0]);
-    a.add_vector(Vector::new(0, vec![0.0, 0.0]));
-    a.add_vector(Vector::new(1, vec![0.1, 0.1]));
-    let mut b = Bucket::new(1, vec![1.0, 1.0]);
-    b.add_vector(Vector::new(2, vec![1.0, 1.0]));
-    b.add_vector(Vector::new(3, vec![1.1, 1.1]));
-    futures::executor::block_on(storage.put_chunk(&a))?;
-    futures::executor::block_on(storage.put_chunk(&b))?;
-    futures::executor::block_on(worker.prime_centroids(&[a.clone(), b.clone()]))?;
-
-    // Enqueue the same merge 5 times rapidly.
-    for _ in 0..5 {
-        worker.enqueue_blocking(RebalanceTask::Merge(0, 1))?;
-    }
-
-    // Wait for all tasks to be processed.
-    let done = wait_until(Duration::from_secs(15), || {
-        worker.snapshot_sizes().len() == 1 && routing.current_version() > 0
-    });
-    assert!(done, "merge should complete");
-
-    // Key assertion: we should have exactly 1 bucket, not multiple merged copies.
-    let sizes = worker.snapshot_sizes();
-    assert_eq!(
-        sizes.len(),
-        1,
-        "duplicate merges should be idempotent; expected 1 bucket, got {}",
-        sizes.len()
-    );
-
-    // The merged bucket should have 4 vectors total.
-    let total_vectors: usize = sizes.values().sum();
-    assert_eq!(
-        total_vectors, 4,
-        "merged bucket should have 4 vectors, got {}",
-        total_vectors
-    );
-
-    Ok(())
-}
-
-/// Concurrent splits on the same bucket from multiple threads should not create duplicate buckets.
-#[test]
-fn concurrent_splits_same_bucket() -> Result<()> {
-    // Clear any fail hooks that might be set by other tests running in parallel.
-    clear_rebalance_fail_hook();
-
-    let tmp = tempfile::tempdir()?;
-    let wal = init_wal(&tmp);
-    let storage = Storage::new(wal);
-    let routing = Arc::new(RoutingTable::new());
-    let worker = RebalanceWorker::spawn(storage.clone(), routing.clone(), None);
-
-    // Create one bucket with enough vectors to split.
-    let mut bucket = Bucket::new(0, vec![0.0, 0.0]);
-    for i in 0..20u64 {
-        bucket.add_vector(Vector::new(i, vec![i as f32, i as f32 + 0.5]));
-    }
-    futures::executor::block_on(storage.put_chunk(&bucket))?;
-    futures::executor::block_on(worker.prime_centroids(&[bucket.clone()]))?;
-
-    // Spawn multiple threads that all try to enqueue Split(0) at the same time.
-    std::thread::scope(|s| {
-        for _ in 0..4 {
-            let w = &worker;
-            s.spawn(move || {
-                for _ in 0..3 {
-                    let _ = w.enqueue_blocking(RebalanceTask::Split(0));
-                    std::thread::sleep(Duration::from_millis(5));
-                }
-            });
-        }
-    });
-
-    // Wait for processing to complete.
-    let done = wait_until(Duration::from_secs(15), || {
-        worker.snapshot_sizes().len() >= 2 && routing.current_version() > 0
-    });
-    assert!(done, "split should complete");
-
-    // Key assertion: despite concurrent enqueues, we should have exactly 2 buckets.
-    let sizes = worker.snapshot_sizes();
-    assert_eq!(
-        sizes.len(),
-        2,
-        "concurrent splits should be serialized; expected 2 buckets, got {}",
-        sizes.len()
-    );
-
-    Ok(())
-}

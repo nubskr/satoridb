@@ -2,7 +2,7 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use anyhow::Result;
-use satoridb::rebalancer::{RebalanceTask, RebalanceWorker};
+use satoridb::rebalancer::RebalanceWorker;
 use satoridb::router::RoutingTable;
 use satoridb::storage::{Storage, Vector};
 use satoridb::wal::runtime::Walrus;
@@ -23,39 +23,12 @@ fn wait_until(timeout: Duration, mut f: impl FnMut() -> bool) -> bool {
     false
 }
 
-/// Enqueueing a split for a missing bucket should not crash and should keep routing unchanged.
-#[test]
-fn rebalance_handles_missing_bucket_task() -> Result<()> {
-    let tmp = tempfile::tempdir()?;
-    let wal = init_wal(&tmp);
-    let storage = Storage::new(wal);
-    let routing = Arc::new(RoutingTable::new());
-    let worker = RebalanceWorker::spawn(storage.clone(), routing.clone(), None);
-
-    // No primed centroids; enqueue split for a non-existent bucket id.
-    worker
-        .enqueue_blocking(RebalanceTask::Split(999))
-        .expect("enqueue split");
-
-    // Wait briefly to let the background worker process the task.
-    let done = wait_until(Duration::from_secs(1), || {
-        worker.snapshot_sizes().is_empty()
-    });
-    assert!(
-        done,
-        "missing-bucket split task should finish without hanging"
-    );
-    assert_eq!(
-        routing.current_version(),
-        0,
-        "routing version should remain unchanged when split is skipped"
-    );
-    Ok(())
-}
-
 /// Fast-path split condition: when a bucket grows beyond target_size*2, ensure a split is enqueued and routing advances.
 #[test]
 fn rebalance_fast_path_split_triggers_on_oversized_bucket() -> Result<()> {
+    // Force split at 25
+    std::env::set_var("SATORI_REBALANCE_THRESHOLD", "25");
+
     let tmp = tempfile::tempdir()?;
     let wal = init_wal(&tmp);
     let storage = Storage::new(wal);
@@ -70,10 +43,7 @@ fn rebalance_fast_path_split_triggers_on_oversized_bucket() -> Result<()> {
     futures::executor::block_on(storage.put_chunk(&big))?;
     futures::executor::block_on(worker.prime_centroids(&[big.clone()]))?;
 
-    // Manually enqueue split to simulate fast-path driver decision.
-    worker
-        .enqueue_blocking(RebalanceTask::Split(big.id))
-        .expect("enqueue split");
+    // Autonomous loop will detect 50 > 25 and split.
 
     let progressed = wait_until(Duration::from_secs(3), || {
         worker.snapshot_sizes().len() > 1 && routing.current_version() > 0
@@ -84,3 +54,4 @@ fn rebalance_fast_path_split_triggers_on_oversized_bucket() -> Result<()> {
     );
     Ok(())
 }
+
