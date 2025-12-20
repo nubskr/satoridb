@@ -584,6 +584,16 @@ async fn run_benchmark_mode(
             }
             all_results.sort_by(|a, b| a.1.partial_cmp(&b.1).unwrap_or(std::cmp::Ordering::Equal));
 
+            // Deduplicate results preserving the first (best distance) occurrence
+            let mut unique_results = Vec::with_capacity(all_results.len());
+            let mut seen_ids = std::collections::HashSet::new();
+            for (id, dist) in all_results {
+                if seen_ids.insert(id) {
+                    unique_results.push((id, dist));
+                }
+            }
+            let all_results = unique_results;
+
             if let Some(ref gt) = ground_truth {
                 if i < gt.ground_truth.len() {
                     let true_neighbors = &gt.ground_truth[i];
