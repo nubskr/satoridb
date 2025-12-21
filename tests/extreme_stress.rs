@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::io::Write;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
@@ -802,6 +802,108 @@ fn fetches_remain_consistent_during_rebalance() -> Result<()> {
     Ok(())
 }
 
+/// Large burst of deletes is drained by the rebalance worker without leaving index residue.
+#[test]
+#[ignore]
+fn deletes_remain_consistent_under_burst() -> Result<()> {
+    std::env::set_var("SATORI_REBALANCE_THRESHOLD", "100000");
+
+    let tmp = tempfile::tempdir()?;
+    let wal = init_wal(&tmp);
+    let storage = Storage::new(wal);
+    let vector_index = Arc::new(VectorIndex::open(tmp.path().join("vectors"))?);
+    let bucket_index = Arc::new(BucketIndex::open(tmp.path().join("buckets"))?);
+    let routing = Arc::new(RoutingTable::new());
+    let bucket_locks = Arc::new(BucketLocks::new());
+    let worker = RebalanceWorker::spawn(
+        storage.clone(),
+        vector_index.clone(),
+        bucket_index.clone(),
+        routing,
+        None,
+        bucket_locks,
+    );
+
+    let mut seed = 0xfeed_beefu64;
+    let mut bucket = Bucket::new(0, vec![0.0, 0.0]);
+    for id in 0u64..96 {
+        bucket.add_vector(Vector::new(id, make_vec(&mut seed, 12)));
+    }
+    let ids: Vec<u64> = bucket.vectors.iter().map(|v| v.id).collect();
+    block_on(storage.put_chunk(&bucket))?;
+    vector_index.put_batch(&bucket.vectors)?;
+    bucket_index.put_batch(bucket.id, &ids)?;
+    block_on(worker.prime_centroids(&[bucket.clone()]))?;
+
+    let delete_ids: Vec<u64> = (24u64..84).collect();
+    std::thread::scope(|s| {
+        for chunk in delete_ids.chunks(8) {
+            let worker = worker.clone();
+            let ids = chunk.to_vec();
+            s.spawn(move || {
+                for id in ids {
+                    block_on(worker.delete(id, None)).expect("delete should succeed");
+                }
+            });
+        }
+    });
+
+    let decode = |storage: &Storage, bucket_id: u64| -> Vec<Vector> {
+        let chunks = block_on(storage.get_chunks(bucket_id)).expect("chunks");
+        let Some(chunk) = chunks.last() else {
+            return Vec::new();
+        };
+        if chunk.len() < 16 {
+            return Vec::new();
+        }
+        let mut len_bytes = [0u8; 8];
+        len_bytes.copy_from_slice(&chunk[0..8]);
+        let archive_len = u64::from_le_bytes(len_bytes) as usize;
+        if 8 + archive_len > chunk.len() {
+            return Vec::new();
+        }
+        let mut out = Vec::new();
+        let mut off = 8;
+        while off + 16 <= chunk.len() {
+            let mut id_bytes = [0u8; 8];
+            id_bytes.copy_from_slice(&chunk[off..off + 8]);
+            off += 8;
+            let mut dim_bytes = [0u8; 8];
+            dim_bytes.copy_from_slice(&chunk[off..off + 8]);
+            off += 8;
+            let dim = u64::from_le_bytes(dim_bytes) as usize;
+            let bytes_needed = dim.saturating_mul(4);
+            if off + bytes_needed > chunk.len() {
+                break;
+            }
+            let mut data = Vec::with_capacity(dim);
+            for fb in chunk[off..off + bytes_needed].chunks_exact(4) {
+                let mut buf = [0u8; 4];
+                buf.copy_from_slice(fb);
+                data.push(f32::from_bits(u32::from_le_bytes(buf)));
+            }
+            out.push(Vector {
+                id: u64::from_le_bytes(id_bytes),
+                data,
+            });
+            off += bytes_needed;
+        }
+        out
+    };
+    let remaining_vectors = decode(&storage, bucket.id);
+    let remaining_ids: HashSet<u64> = remaining_vectors.iter().map(|v| v.id).collect();
+    for id in delete_ids {
+        assert!(
+            !remaining_ids.contains(&id),
+            "id {} should be removed after burst delete",
+            id
+        );
+        assert!(vector_index.get_many(&[id])?.is_empty());
+        assert!(bucket_index.get_many(&[id])?.is_empty());
+    }
+    Ok(())
+}
+
 /// Cache eviction correctness: tiny cache must evict but still return results and track version.
 #[test]
 #[ignore]
@@ -1205,7 +1307,7 @@ fn jittery_worker_channel_survives() -> Result<()> {
     let f_thread = std::thread::spawn(move || {
         let mut seed = 0xabcd_0001u64;
         while start.elapsed() < duration {
-            let id = (lcg(&mut seed) % 200) as u64;
+            let id = lcg(&mut seed) % 200;
             let _ = handle_f.fetch_vectors_by_id_blocking(vec![id]);
             std::thread::sleep(Duration::from_millis(1));
         }
@@ -1448,11 +1550,11 @@ fn randomized_op_fuzz_preserves_index() -> Result<()> {
             let next_id = next_id.clone();
             let recorded = recorded.clone();
             s.spawn(move || {
-                let mut seed = 0x9999_5555_c0ffee00u64 ^ (t as u64);
+                let mut seed = 0x9999_5555_c0ff_ee00u64 ^ (t as u64);
                 while start.elapsed() < duration {
                     let roll = lcg(&mut seed) % 10;
                     match roll {
-                        0 | 1 | 2 | 3 | 4 => {
+                        0..=4 => {
                             let id = next_id.fetch_add(1, Ordering::Relaxed);
                             let vec = make_vec(&mut seed, 14);
                             if handle.upsert_blocking(id, vec.clone(), None).is_ok() {

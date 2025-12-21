@@ -35,4 +35,5 @@ jobs:
           cargo test --test restart_routing_persistence
           cargo test --test rebalance_resilience_integration
           cargo test --test rebalance_config_integration
+          cargo test --test rebalance_delete_integration
           cargo test --test extreme_stress -- --ignored --nocapture

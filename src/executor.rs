@@ -405,7 +405,10 @@ fn walk_bucket_slice(data: &[u8], mut f: impl FnMut(u64, &[u8])) {
 }
 
 fn walk_bucket_chunks(chunks: &[Vec<u8>], mut f: impl FnMut(u64, &[u8])) {
-    for chunk in chunks {
+    // Walk from newest to oldest and ignore stale duplicates so rewrites (e.g., deletes)
+    // take effect without truncating the WAL topic.
+    let mut seen = HashSet::new();
+    for chunk in chunks.iter().rev() {
         if chunk.len() < 8 {
             continue;
         }
@@ -416,7 +419,9 @@ fn walk_bucket_chunks(chunks: &[Vec<u8>], mut f: impl FnMut(u64, &[u8])) {
             continue;
         }
         if let Some((id, vec_bytes)) = parse_vector_payload(&chunk[8..8 + payload_len]) {
-            f(id, vec_bytes);
+            if seen.insert(id) {
+                f(id, vec_bytes);
+            }
         }
     }
 }
