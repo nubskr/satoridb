@@ -169,6 +169,7 @@ fn rebalance_split_under_fire() -> Result<()> {
     block_on(storage.put_chunk(&seed_bucket))?;
     let rebalance = RebalanceWorker::spawn(
         storage.clone(),
+        vector_index.clone(),
         bucket_index.clone(),
         routing.clone(),
         None,
@@ -683,6 +684,7 @@ fn fetches_remain_consistent_during_rebalance() -> Result<()> {
     block_on(storage.put_chunk(&b))?;
     let rebalance = RebalanceWorker::spawn(
         storage.clone(),
+        vector_index.clone(),
         bucket_index.clone(),
         routing.clone(),
         None,

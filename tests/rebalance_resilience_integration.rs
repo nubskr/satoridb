@@ -7,6 +7,7 @@ use satoridb::bucket_locks::BucketLocks;
 use satoridb::rebalancer::RebalanceWorker;
 use satoridb::router::RoutingTable;
 use satoridb::storage::{Storage, Vector};
+use satoridb::vector_index::VectorIndex;
 use satoridb::wal::runtime::Walrus;
 use tempfile::TempDir;
 
@@ -34,11 +35,13 @@ fn rebalance_fast_path_split_triggers_on_oversized_bucket() -> Result<()> {
     let tmp = tempfile::tempdir()?;
     let wal = init_wal(&tmp);
     let bucket_index = Arc::new(BucketIndex::open(tmp.path().join("buckets"))?);
+    let vector_index = Arc::new(VectorIndex::open(tmp.path().join("vectors"))?);
     let storage = Storage::new(wal);
     let routing = Arc::new(RoutingTable::new());
     let bucket_locks = Arc::new(BucketLocks::new());
     let worker = RebalanceWorker::spawn(
         storage.clone(),
+        vector_index,
         bucket_index,
         routing.clone(),
         None,

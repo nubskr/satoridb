@@ -5,6 +5,7 @@ use crate::ingest_counter;
 use crate::quantizer::Quantizer;
 use crate::router::{Router, RoutingTable};
 use crate::storage::{Bucket, BucketMeta, BucketMetaStatus, Storage, Vector};
+use crate::vector_index::VectorIndex;
 use crate::wal::runtime::Walrus;
 use anyhow::Result;
 use futures::executor::block_on;
@@ -28,6 +29,13 @@ type RebalanceFailHook = Arc<dyn Fn(RebalanceTaskKind) -> bool + Send + Sync>;
 
 static FAIL_HOOK: StdMutex<Option<RebalanceFailHook>> = StdMutex::new(None);
 
+#[derive(Debug)]
+pub struct DeleteCommand {
+    pub vector_id: u64,
+    pub bucket_hint: Option<u64>,
+    pub respond_to: futures::channel::oneshot::Sender<anyhow::Result<()>>,
+}
+
 pub fn set_rebalance_fail_hook<F>(hook: F)
 where
     F: Fn(RebalanceTaskKind) -> bool + Send + Sync + 'static,
@@ -49,6 +57,7 @@ fn should_fail(kind: RebalanceTaskKind) -> bool {
 
 pub(crate) struct RebalanceState {
     storage: Storage,
+    vector_index: Arc<VectorIndex>,
     bucket_index: Arc<BucketIndex>,
     wal: Arc<Walrus>,
     routing: Arc<RoutingTable>,
@@ -62,6 +71,7 @@ pub(crate) struct RebalanceState {
 impl RebalanceState {
     fn new(
         storage: Storage,
+        vector_index: Arc<VectorIndex>,
         bucket_index: Arc<BucketIndex>,
         routing: Arc<RoutingTable>,
         bucket_locks: Arc<BucketLocks>,
@@ -69,6 +79,7 @@ impl RebalanceState {
         Self {
             wal: storage.wal.clone(),
             storage,
+            vector_index,
             bucket_index,
             routing,
             centroids: RwLock::new(HashMap::new()),
@@ -348,14 +359,15 @@ impl RebalanceState {
     }
 }
 
-#[derive(Clone)]
 pub struct RebalanceWorker {
     state: Arc<RebalanceState>,
+    delete_tx: async_channel::Sender<DeleteCommand>,
 }
 
 impl RebalanceWorker {
     pub fn spawn(
         storage: Storage,
+        vector_index: Arc<VectorIndex>,
         bucket_index: Arc<BucketIndex>,
         routing: Arc<RoutingTable>,
         pin_cpu: Option<usize>,
@@ -363,11 +375,13 @@ impl RebalanceWorker {
     ) -> Self {
         let state = Arc::new(RebalanceState::new(
             storage,
+            vector_index,
             bucket_index,
             routing,
             bucket_locks,
         ));
         let state_clone = state.clone();
+        let (delete_tx, delete_rx) = async_channel::bounded(1024);
         let name = "rebalance-loop".to_string();
 
         match pin_cpu {
@@ -379,7 +393,7 @@ impl RebalanceWorker {
                     builder
                         .make()
                         .expect("failed to create rebalance executor")
-                        .run(run_autonomous_loop(state_clone));
+                        .run(run_autonomous_loop(state_clone, delete_rx));
                 });
             }
             None => {
@@ -391,12 +405,12 @@ impl RebalanceWorker {
                             .name(&name)
                             .make()
                             .expect("failed to create default rebalance executor")
-                            .run(run_autonomous_loop(state_clone));
+                            .run(run_autonomous_loop(state_clone, delete_rx));
                     })
                     .expect("rebalance worker");
             }
         }
-        Self { state }
+        Self { state, delete_tx }
     }
 
     pub async fn prime_centroids(&self, buckets: &[Bucket]) -> Result<()> {
@@ -420,9 +434,35 @@ impl RebalanceWorker {
 
     // No-op for compatibility, loop shuts down with process for now
     pub fn close(&self) {}
+
+    pub async fn delete(&self, vector_id: u64, bucket_hint: Option<u64>) -> anyhow::Result<()> {
+        let (tx, rx) = futures::channel::oneshot::channel();
+        self.delete_tx
+            .send(DeleteCommand {
+                vector_id,
+                bucket_hint,
+                respond_to: tx,
+            })
+            .await
+            .map_err(|_| anyhow::anyhow!("rebalance delete queue closed"))?;
+        rx.await
+            .map_err(|e| anyhow::anyhow!("rebalance delete canceled: {:?}", e))?
+    }
 }
 
-async fn run_autonomous_loop(state: Arc<RebalanceState>) {
+impl Clone for RebalanceWorker {
+    fn clone(&self) -> Self {
+        Self {
+            state: self.state.clone(),
+            delete_tx: self.delete_tx.clone(),
+        }
+    }
+}
+
+async fn run_autonomous_loop(
+    state: Arc<RebalanceState>,
+    delete_rx: async_channel::Receiver<DeleteCommand>,
+) {
     // Configurable threshold: split if bucket has more than N vectors.
     let threshold: usize = std::env::var("SATORI_REBALANCE_THRESHOLD")
         .ok()
@@ -430,6 +470,12 @@ async fn run_autonomous_loop(state: Arc<RebalanceState>) {
         .unwrap_or(2000);
 
     loop {
+        while let Ok(cmd) = delete_rx.try_recv() {
+            if let Err(e) = handle_delete(&state, cmd).await {
+                warn!("rebalance: delete failed: {:?}", e);
+            }
+        }
+
         // 1. Refresh sizes
         let sizes = state.refresh_sizes();
 
@@ -461,6 +507,76 @@ async fn run_autonomous_loop(state: Arc<RebalanceState>) {
             glommio::timer::Timer::new(Duration::from_millis(500)).await;
         }
     }
+}
+
+async fn handle_delete(state: &Arc<RebalanceState>, cmd: DeleteCommand) -> anyhow::Result<()> {
+    let bucket_id = if let Some(b) = cmd.bucket_hint {
+        b
+    } else {
+        let found = state
+            .bucket_index
+            .get_many(&[cmd.vector_id])
+            .map_err(|e| anyhow::anyhow!("bucket index lookup failed: {:?}", e))?;
+        match found.first() {
+            Some((_, b)) => *b,
+            None => {
+                let _ = cmd.respond_to.send(Ok(()));
+                return Ok(());
+            }
+        }
+    };
+
+    let lock = state.lock_for(bucket_id);
+    let _guard = lock.lock().await;
+
+    let vectors = match state.load_bucket_vectors(bucket_id) {
+        Some(v) => v,
+        None => {
+            let _ = cmd.respond_to.send(Ok(()));
+            return Ok(());
+        }
+    };
+    let mut remaining: Vec<Vector> = Vec::with_capacity(vectors.len());
+    let mut removed = false;
+    for v in vectors {
+        if v.id == cmd.vector_id {
+            removed = true;
+        } else {
+            remaining.push(v);
+        }
+    }
+    if !removed {
+        let _ = cmd.respond_to.send(Ok(()));
+        return Ok(());
+    }
+
+    let centroid = state
+        .centroids
+        .read()
+        .get(&bucket_id)
+        .cloned()
+        .unwrap_or_default();
+    let mut bucket = Bucket::new(bucket_id, centroid);
+    bucket.vectors = remaining;
+    block_on(state.storage.put_chunk(&bucket))
+        .map_err(|e| anyhow::anyhow!("rewrite bucket after delete failed: {:?}", e))?;
+
+    let ids = [cmd.vector_id];
+    if let Err(e) = state.vector_index.delete_batch(&ids) {
+        warn!(
+            "rebalance: delete failed from vector index for {}: {:?}",
+            cmd.vector_id, e
+        );
+    }
+    if let Err(e) = state.bucket_index.delete_batch(&ids) {
+        warn!(
+            "rebalance: delete failed from bucket index for {}: {:?}",
+            cmd.vector_id, e
+        );
+    }
+
+    let _ = cmd.respond_to.send(Ok(()));
+    Ok(())
 }
 
 #[cfg(test)]

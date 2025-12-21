@@ -9,6 +9,7 @@ use satoridb::bucket_locks::BucketLocks;
 use satoridb::rebalancer::RebalanceWorker;
 use satoridb::router::RoutingTable;
 use satoridb::storage::{Bucket, Storage, Vector};
+use satoridb::vector_index::VectorIndex;
 use satoridb::wal::runtime::Walrus;
 use tempfile::TempDir;
 
@@ -35,11 +36,13 @@ fn rebalance_split_increases_buckets_and_router_version() -> Result<()> {
     let tmp = tempfile::tempdir()?;
     let wal = init_wal(&tmp);
     let bucket_index = Arc::new(BucketIndex::open(tmp.path().join("buckets"))?);
+    let vector_index = Arc::new(VectorIndex::open(tmp.path().join("vectors"))?);
     let storage = Storage::new(wal);
     let routing = Arc::new(RoutingTable::new());
     let bucket_locks = Arc::new(BucketLocks::new());
     let worker = RebalanceWorker::spawn(
         storage.clone(),
+        vector_index,
         bucket_index,
         routing.clone(),
         None,
