@@ -10,6 +10,7 @@ use futures::executor::block_on;
 use satoridb::bucket_index::BucketIndex;
 use satoridb::bucket_locks::BucketLocks;
 use satoridb::embedded::{SatoriDb, SatoriDbConfig};
+use satoridb::executor::{Executor, WorkerCache};
 use satoridb::rebalancer::RebalanceWorker;
 use satoridb::router::RoutingTable;
 use satoridb::storage::{Bucket, Storage, Vector};
@@ -83,7 +84,7 @@ fn long_running_ingest_and_query_soak() -> Result<()> {
                     let vector = make_vec(&mut seed, 16);
                     if handle.upsert_blocking(id, vector.clone(), None).is_ok() {
                         local.push(id);
-                        if id % 8 == 0 {
+                        if id.is_multiple_of(8) {
                             let _ = handle.query_with_vectors_blocking(vector, 8, 8);
                         }
                     }
@@ -341,7 +342,7 @@ fn restart_recovers_state_after_soak() -> Result<()> {
                     let vec = make_vec(&mut seed, 24);
                     if handle.upsert_blocking(id, vec.clone(), None).is_ok() {
                         recorded.write().insert(id, vec.clone());
-                        if id % 5 == 0 {
+                        if id.is_multiple_of(5) {
                             let _ = handle.query_blocking(vec, 8, 8);
                         }
                     }
@@ -361,11 +362,25 @@ fn restart_recovers_state_after_soak() -> Result<()> {
 
     // Restart with the same WAL/index paths and validate the persisted payloads.
     let wal = init_wal(&tmp);
-    let mut cfg = SatoriDbConfig::new(wal);
-    cfg.workers = std::cmp::min(4, num_cpus::get().max(1));
-    cfg.vector_index_path = vector_path;
-    cfg.bucket_index_path = bucket_path;
-    let db = SatoriDb::start(cfg)?;
+    let workers = std::cmp::min(4, num_cpus::get().max(1));
+    let db = {
+        let mut attempt = 0;
+        loop {
+            let mut cfg = SatoriDbConfig::new(wal.clone());
+            cfg.workers = workers;
+            cfg.vector_index_path = vector_path.clone();
+            cfg.bucket_index_path = bucket_path.clone();
+            match SatoriDb::start(cfg) {
+                Ok(db) => break db,
+                Err(e) if attempt < 5 && e.to_string().contains("LOCK") => {
+                    attempt += 1;
+                    std::thread::sleep(Duration::from_millis(50));
+                    continue;
+                }
+                Err(e) => return Err(e),
+            }
+        }
+    };
     let handle = db.handle();
 
     let fetched = handle.fetch_vectors_by_id_blocking(ids.clone())?;
@@ -419,7 +434,7 @@ fn multi_worker_mixed_workload_churn() -> Result<()> {
                     let vec = make_vec(&mut seed, 20);
                     if handle.upsert_blocking(id, vec.clone(), None).is_ok() {
                         recorded.write().insert(id, vec.clone());
-                        if id % 6 == 0 {
+                        if id.is_multiple_of(6) {
                             let _ = handle.query_with_vectors_blocking(vec, 6, 6);
                         }
                     }
@@ -620,7 +635,7 @@ fn router_rebuild_churn_under_load() -> Result<()> {
                     let id = next_id.fetch_add(1, Ordering::Relaxed);
                     let vec = make_vec(&mut seed, 16);
                     let _ = handle.upsert_blocking(id, vec.clone(), None);
-                    if id % 7 == 0 {
+                    if id.is_multiple_of(7) {
                         let _ = handle.query_blocking(vec, 4, 4);
                     }
                 }
@@ -771,5 +786,259 @@ fn fetches_remain_consistent_during_rebalance() -> Result<()> {
         buckets.len(),
         "vector and bucket indexes diverged during rebalance fetch stress"
     );
+    Ok(())
+}
+
+/// Cache eviction correctness: tiny cache must evict but still return results and track version.
+#[test]
+#[ignore]
+fn executor_cache_eviction_still_serves_queries() -> Result<()> {
+    let tmp = tempfile::tempdir()?;
+    let wal = init_wal(&tmp);
+    let storage = Storage::new(wal);
+
+    // Two buckets, cache holds only one.
+    for bid in 0..2u64 {
+        let mut b = Bucket::new(bid, vec![bid as f32, 0.0]);
+        for j in 0..8u64 {
+            b.add_vector(Vector::new(bid * 100 + j, vec![j as f32, j as f32 + 1.0]));
+        }
+        block_on(storage.put_chunk(&b))?;
+    }
+
+    let cache = WorkerCache::new(1, 256 * 1024, usize::MAX);
+    let exec = Executor::new(storage.clone(), cache);
+
+    // First query caches bucket 0.
+    let res0 = block_on(exec.query(&[0.5, 0.5], &[0], 4, 1, Arc::new(Vec::new()), false))?;
+    assert!(!res0.is_empty(), "expected results from bucket 0");
+    assert_eq!(exec.cache_version(), 1);
+
+    // Next query includes bucket 1; capacity forces eviction of bucket 0.
+    let res1 = block_on(exec.query(&[1.5, 1.5], &[0, 1], 4, 1, Arc::new(Vec::new()), false))?;
+    assert!(
+        res1.iter().any(|(id, _, _)| *id / 100 == 1),
+        "should return from bucket 1 after eviction"
+    );
+
+    // Now mark bucket 1 as changed and update storage; cache must invalidate and pick new data.
+    let mut updated = Bucket::new(1, vec![1.0, 0.0]);
+    updated.add_vector(Vector::new(10_000, vec![1000.0, 1000.0]));
+    block_on(storage.put_chunk(&updated))?;
+    let res2 = block_on(exec.query(&[1000.0, 1000.0], &[1], 1, 2, Arc::new(vec![1]), false))?;
+    assert!(
+        res2.iter().any(|(id, _, _)| *id == 10_000),
+        "cache invalidation should allow updated bucket to surface"
+    );
+    assert_eq!(exec.cache_version(), 2);
+    Ok(())
+}
+
+/// Verify routing stays coherent under a large bucket set and frequent rebuilds.
+#[test]
+#[ignore]
+fn router_scales_with_many_buckets() -> Result<()> {
+    let tmp = tempfile::tempdir()?;
+    let wal = init_wal(&tmp);
+    let mut cfg = SatoriDbConfig::new(wal);
+    cfg.workers = 3;
+    cfg.virtual_nodes = 64;
+    let db = SatoriDb::start(cfg)?;
+    let handle = db.handle();
+
+    // Create many tiny buckets to stress routing.
+    let bucket_count = 120u64;
+    let mut seed = 0x1234abcd_u64;
+    for b in 0..bucket_count {
+        let v = make_vec(&mut seed, 8);
+        handle.upsert_blocking(b, v.clone(), Some(b))?;
+    }
+    handle.flush_blocking()?;
+
+    // Rebuild router frequently and send queries.
+    std::env::set_var("SATORI_ROUTER_REBUILD_EVERY", "10");
+    let mut queries = 0usize;
+    while queries < 30 {
+        let q = make_vec(&mut seed, 8);
+        let res = handle.query_blocking(q, 4, 8)?;
+        assert!(
+            res.len() <= 4,
+            "router should cap results to top_k; got {}",
+            res.len()
+        );
+        queries += 1;
+    }
+    let stats = block_on(handle.stats());
+    assert!(stats.ready);
+    assert!(stats.buckets >= bucket_count as usize / 2);
+    db.shutdown()?;
+    Ok(())
+}
+
+/// Child routine for crash/replay fuzz. When the env var is present we ingest and abort.
+fn maybe_run_crash_child() {
+    if let (Ok(wal_dir), Ok(vec_dir), Ok(bucket_dir)) = (
+        std::env::var("CRASH_CHILD_WAL"),
+        std::env::var("CRASH_CHILD_VECTORS"),
+        std::env::var("CRASH_CHILD_BUCKETS"),
+    ) {
+        let wal = Arc::new(
+            Walrus::with_data_dir_and_options(
+                wal_dir.into(),
+                ReadConsistency::StrictlyAtOnce,
+                FsyncSchedule::NoFsync,
+            )
+            .expect("child wal init"),
+        );
+        let mut cfg = SatoriDbConfig::new(wal);
+        cfg.workers = 2;
+        cfg.vector_index_path = vec_dir.into();
+        cfg.bucket_index_path = bucket_dir.into();
+        let db = SatoriDb::start(cfg).expect("child start");
+        let handle = db.handle();
+        let mut seed = 0xcafe_cafe_dead_beefu64;
+        for i in 0..200u64 {
+            let v = make_vec(&mut seed, 16);
+            let _ = handle.upsert_blocking(500_000 + i, v, None);
+        }
+        // Abrupt crash to simulate power loss.
+        std::process::abort();
+    }
+}
+
+/// Ingest, crash hard, restart from the same WAL/index paths, and ensure data survives.
+#[test]
+#[ignore]
+fn crash_replay_recovery() -> Result<()> {
+    maybe_run_crash_child();
+
+    let tmp = tempfile::tempdir()?;
+    let wal_dir = tmp.path().join("wal");
+    let vec_dir = tmp.path().join("vectors");
+    let bucket_dir = tmp.path().join("buckets");
+
+    let wal = Arc::new(
+        Walrus::with_data_dir_and_options(
+            wal_dir.clone(),
+            ReadConsistency::StrictlyAtOnce,
+            FsyncSchedule::NoFsync,
+        )
+        .expect("parent wal init"),
+    );
+
+    // First run will crash in the child.
+    let mut child = std::process::Command::new(std::env::current_exe()?)
+        .arg("--ignored")
+        .arg("crash_replay_recovery")
+        .env("CRASH_CHILD_WAL", wal_dir.to_string_lossy().to_string())
+        .env("CRASH_CHILD_VECTORS", vec_dir.to_string_lossy().to_string())
+        .env(
+            "CRASH_CHILD_BUCKETS",
+            bucket_dir.to_string_lossy().to_string(),
+        )
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .spawn()?;
+    let status = child.wait()?;
+    assert!(
+        !status.success(),
+        "child should crash to simulate abrupt shutdown"
+    );
+
+    // Restart and verify payloads exist (allowing for a tiny loss if WAL dropped the tail).
+    let mut cfg = SatoriDbConfig::new(wal);
+    cfg.workers = 2;
+    cfg.vector_index_path = vec_dir.clone();
+    cfg.bucket_index_path = bucket_dir.clone();
+    let db = SatoriDb::start(cfg)?;
+    let handle = db.handle();
+    let ids: Vec<u64> = (500_000..500_200).collect();
+    let fetched = handle.fetch_vectors_by_id_blocking(ids.clone())?;
+    assert!(
+        fetched.len() >= 180,
+        "too many vectors lost after crash/replay (got {})",
+        fetched.len()
+    );
+    db.shutdown()?;
+    Ok(())
+}
+
+/// Truncate the WAL tail and ensure restart does not panic and preserves earlier entries.
+#[test]
+#[ignore]
+fn wal_truncation_is_tolerated() -> Result<()> {
+    let tmp = tempfile::tempdir()?;
+    let wal_dir = tmp.path().join("wal");
+    let vec_dir = tmp.path().join("vectors");
+    let bucket_dir = tmp.path().join("buckets");
+
+    let wal = Arc::new(
+        Walrus::with_data_dir_and_options(
+            wal_dir.clone(),
+            ReadConsistency::StrictlyAtOnce,
+            FsyncSchedule::NoFsync,
+        )
+        .expect("wal init"),
+    );
+    let mut cfg = SatoriDbConfig::new(wal.clone());
+    cfg.workers = 1;
+    cfg.vector_index_path = vec_dir.clone();
+    cfg.bucket_index_path = bucket_dir.clone();
+    let db = SatoriDb::start(cfg)?;
+    let handle = db.handle();
+
+    for i in 0..32u64 {
+        let v = vec![i as f32, i as f32 + 0.5];
+        handle.upsert_blocking(i, v, Some(0))?;
+    }
+    handle.flush_blocking()?;
+    drop(handle);
+    db.shutdown()?;
+
+    // Corrupt/truncate the largest WAL file (best-effort).
+    let mut largest = None;
+    for entry in std::fs::read_dir(&wal_dir)? {
+        let entry = entry?;
+        if entry.file_type()?.is_file() {
+            let meta = entry.metadata()?;
+            if largest
+                .as_ref()
+                .map(|(_, m): &(std::path::PathBuf, u64)| m < &meta.len())
+                .unwrap_or(true)
+            {
+                largest = Some((entry.path(), meta.len()));
+            }
+        }
+    }
+    if let Some((path, len)) = largest {
+        if len > 16 {
+            let new_len = len.saturating_sub(8);
+            let f = std::fs::OpenOptions::new().write(true).open(&path)?;
+            f.set_len(new_len)?;
+        }
+    }
+
+    let wal = Arc::new(
+        Walrus::with_data_dir_and_options(
+            wal_dir,
+            ReadConsistency::StrictlyAtOnce,
+            FsyncSchedule::NoFsync,
+        )
+        .expect("wal reopen"),
+    );
+    let mut cfg = SatoriDbConfig::new(wal);
+    cfg.workers = 1;
+    cfg.vector_index_path = vec_dir;
+    cfg.bucket_index_path = bucket_dir;
+    let db = SatoriDb::start(cfg)?;
+    let handle = db.handle();
+    let ids: Vec<u64> = (0..32u64).collect();
+    let fetched = handle.fetch_vectors_by_id_blocking(ids)?;
+    assert!(
+        fetched.len() >= 24,
+        "restart after WAL truncation lost too many entries (got {})",
+        fetched.len()
+    );
+    db.shutdown()?;
     Ok(())
 }

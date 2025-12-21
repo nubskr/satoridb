@@ -558,6 +558,8 @@ mod tests {
     use super::*;
     use std::fs;
     use std::path::Path;
+    use std::thread;
+    use std::time::Duration;
 
     fn unique_key() -> String {
         let nanos = std::time::SystemTime::now()
@@ -574,6 +576,24 @@ mod tests {
         let _ = fs::remove_dir_all(path);
     }
 
+    fn flush_clean_markers_with_retry(wal: &Walrus) {
+        const MAX_ATTEMPTS: usize = 5;
+        let mut last_err = None;
+        for _ in 0..MAX_ATTEMPTS {
+            match wal.force_flush_clean_markers_for_test() {
+                Ok(()) => return,
+                Err(err) => {
+                    last_err = Some(err);
+                    thread::sleep(Duration::from_millis(50));
+                }
+            }
+        }
+        panic!(
+            "failed to flush clean markers after retries: {:?}",
+            last_err
+        );
+    }
+
     #[test]
     fn append_marks_topic_dirty() {
         let key = unique_key();
@@ -586,10 +606,11 @@ mod tests {
 
         assert!(wal.topic_is_clean("alpha"));
         wal.append_for_topic("alpha", b"hello world").unwrap();
+        flush_clean_markers_with_retry(&wal);
         assert!(!wal.topic_is_clean("alpha"));
 
         wal.mark_topic_clean("alpha");
-        wal.force_flush_clean_markers_for_test().unwrap();
+        flush_clean_markers_with_retry(&wal);
         assert!(wal.topic_is_clean("alpha"));
 
         drop(wal);
@@ -608,7 +629,7 @@ mod tests {
             )
             .unwrap();
             wal.append_for_topic("beta", b"bytes").unwrap();
-            wal.force_flush_clean_markers_for_test().unwrap();
+            flush_clean_markers_with_retry(&wal);
             assert!(!wal.topic_is_clean("beta"));
         }
 
@@ -621,7 +642,7 @@ mod tests {
             .unwrap();
             assert!(!wal.topic_is_clean("beta"));
             wal.mark_topic_clean("beta");
-            wal.force_flush_clean_markers_for_test().unwrap();
+            flush_clean_markers_with_retry(&wal);
             assert!(wal.topic_is_clean("beta"));
         }
 

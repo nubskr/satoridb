@@ -24,3 +24,9 @@ impl BucketLocks {
             .clone()
     }
 }
+
+impl Default for BucketLocks {
+    fn default() -> Self {
+        Self::new()
+    }
+}
