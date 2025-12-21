@@ -79,7 +79,6 @@ mod tests {
     #[test]
     fn hash_ring_zero_virtual_nodes() {
         let ring = ConsistentHashRing::new(4, 0);
-        // With virtual_nodes=0, the max(1) ensures we have 1 virtual node per physical node.
         let node = ring.node_for(42);
         assert!(node < 4, "node should be in valid range");
     }
@@ -93,7 +92,6 @@ mod tests {
             let node = ring.node_for(key);
             counts[node] += 1;
         }
-        // Each node should get some keys (roughly 250 each, but at least > 0).
         assert!(
             counts.iter().all(|&c| c > 0),
             "all nodes should receive some keys"
@@ -104,8 +102,6 @@ mod tests {
     #[test]
     fn hash_ring_wraparound() {
         let ring = ConsistentHashRing::new(2, 1);
-        // The ring is sorted by hash. Keys with very high hashes should wrap to first node.
-        // We test with various keys to ensure wraparound works.
         for key in [0, u64::MAX / 2, u64::MAX] {
             let node = ring.node_for(key);
             assert!(node < 2, "node should be valid for key {}", key);

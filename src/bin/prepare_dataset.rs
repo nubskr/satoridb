@@ -26,14 +26,12 @@ fn main() -> Result<()> {
         input.with_extension("f32bin")
     };
 
-    // Optional batch size for buffered parsing.
     let batch_size: usize = env::var("CONVERT_BATCH")
         .ok()
         .and_then(|v| v.parse().ok())
         .unwrap_or(10_000);
 
     let mut writer = BufWriter::new(File::create(&output)?);
-    // Reserve space for header; fill in at the end.
     writer.write_all(&[0u8; 12])?;
 
     let mut total: u64 = 0;
@@ -52,7 +50,6 @@ fn main() -> Result<()> {
 
     writer.flush()?;
 
-    // Backfill header.
     let final_dim = dim.ok_or_else(|| anyhow!("no vectors read"))?;
     let mut f = writer.into_inner()?;
     f.seek(SeekFrom::Start(0))?;
@@ -178,7 +175,6 @@ fn convert_bvecs(
             data_buf.resize(needed, 0);
             reader.read_exact(&mut data_buf)?;
 
-            // Upcast bytes -> f32
             f32_buf.clear();
             f32_buf.reserve(needed * 4);
             for &b in &data_buf {

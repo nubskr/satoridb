@@ -6,7 +6,6 @@ use crate::wal::config::{checksum64, debug_print, MAX_BATCH_ENTRIES, PREFIX_META
 use std::io;
 use std::sync::{Arc, RwLock};
 
-use log::info;
 use rkyv::{AlignedVec, Deserialize};
 
 impl Walrus {
@@ -370,11 +369,6 @@ impl Walrus {
 
         const TAIL_FLAG: u64 = 1u64 << 63;
 
-        info!(
-            "batch_read_for_topic: col_name={}, max_bytes={}, checkpoint={}, start_offset={:?}",
-            col_name, max_bytes, checkpoint, start_offset
-        );
-
         // Pre-snapshot active writer state to avoid lock-order inversion later
         let writer_snapshot: Option<(Block, u64)> = {
             let map = self
@@ -413,11 +407,6 @@ impl Walrus {
                     .read()
                     .map_err(|_| io::Error::other("col info read lock poisoned"))?;
 
-                info!(
-                    "batch_read_for_topic: (stateless) initial chain len: {}",
-                    guard.chain.len()
-                );
-
                 guard.chain.clone()
             } else {
                 Vec::new()
@@ -431,23 +420,10 @@ impl Walrus {
 
             let mut found = false;
 
-            info!(
-                "batch_read_for_topic: (stateless) searching for block with req_offset={}, initial rem={}",
-                req_offset, rem
-            );
-
             for (i, b) in chain.iter().enumerate() {
-                info!(
-                    "batch_read_for_topic: (stateless) iterating block {} (id={}), used={}, rem={}",
-                    i, b.id, b.used, rem
-                );
                 if rem < b.used {
                     c_idx = i;
                     found = true;
-                    info!(
-                        "batch_read_for_topic: (stateless) found block {} (id={}), rem={}",
-                        c_idx, b.id, rem
-                    );
                     break;
                 }
                 rem -= b.used;
@@ -464,20 +440,8 @@ impl Walrus {
                 // Use mmap for fast scanning if possible
                 let mut meta_buf = [0u8; PREFIX_META_SIZE];
 
-                info!(
-                    "batch_read_for_topic: (stateless) scanning block {} (id={}) for entry boundary, blk.used={}, rem={}",
-                    c_idx, blk.id, blk.used, rem
-                );
-
                 while scan_pos < blk.used {
-                    info!(
-                        "batch_read_for_topic: (stateless) scan_pos={}, rem={}",
-                        scan_pos, rem
-                    );
                     if scan_pos + (PREFIX_META_SIZE as u64) > blk.used {
-                        info!(
-                            "batch_read_for_topic: (stateless) breaking scan_pos+PREFIX_META_SIZE > blk.used"
-                        );
                         break; // Should not happen in sealed block
                     }
 
@@ -496,10 +460,6 @@ impl Walrus {
                     }
                     let meta_len = (meta_buf[0] as usize) | ((meta_buf[1] as usize) << 8);
                     if meta_len == 0 || meta_len > PREFIX_META_SIZE - 2 {
-                        info!(
-                            "batch_read_for_topic: (stateless) breaking meta_len invalid: {}",
-                            meta_len
-                        );
                         break; // Corrupt/Zeroed
                     }
 
@@ -510,9 +470,6 @@ impl Walrus {
                     let meta: Metadata = match archived.deserialize(&mut rkyv::Infallible) {
                         Ok(m) => m,
                         Err(_) => {
-                            info!(
-                                "batch_read_for_topic: (stateless) breaking meta deserialize error"
-                            );
                             break;
                         }
                     };
@@ -521,11 +478,6 @@ impl Walrus {
                     let entry_total = (PREFIX_META_SIZE + data_size) as u64;
                     let entry_end = scan_pos + entry_total;
 
-                    info!(
-                        "batch_read_for_topic: (stateless) scanned entry: meta_len={}, data_size={}, entry_total={}, entry_end={}",
-                        meta_len, data_size, entry_total, entry_end
-                    );
-
                     if entry_end > rem {
                         // Found the entry containing 'rem'
                         c_off = scan_pos;
@@ -533,15 +485,6 @@ impl Walrus {
                         let payload_start = scan_pos + (PREFIX_META_SIZE as u64);
                         if rem > payload_start {
                             trim = (rem - payload_start) as usize;
-                            info!(
-                                "batch_read_for_topic: (stateless) found entry containing rem: c_off={}, trim={}",
-                                c_off, trim
-                            );
-                        } else {
-                            info!(
-                                "batch_read_for_topic: (stateless) found entry containing rem (no trim): c_off={}",
-                                c_off
-                            );
                         }
                         break;
                     }
@@ -553,19 +496,11 @@ impl Walrus {
                 // we default to c_off=scan_pos (end of valid data)
                 if scan_pos >= blk.used {
                     c_off = blk.used;
-                    info!(
-                        "batch_read_for_topic: (stateless) scan loop finished, c_off={}",
-                        c_off
-                    );
                 }
             } else {
                 c_idx = chain.len();
                 c_off = 0;
                 // rem is now offset into tail (writer)
-                info!(
-                    "batch_read_for_topic: (stateless) block not found, setting c_idx={}, c_off={}",
-                    c_idx, c_off
-                );
             }
 
             (chain, c_idx, c_off, 0, rem, None, trim, hint)

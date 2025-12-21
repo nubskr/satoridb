@@ -20,9 +20,8 @@ mod tests {
         let routing = Arc::new(RoutingTable::new());
         let state = RebalanceState::new(storage.clone(), routing.clone());
 
-        // Write malformed chunk bytes directly to WAL.
         let topic = crate::storage::Storage::topic_for(123);
-        wal.append_batch(&topic, &[vec![1u8, 2, 3]]).unwrap(); // corrupt payload
+        wal.append_batch(&topic, &[vec![1u8, 2, 3]]).unwrap();
 
         let loaded = state.load_bucket(123);
         assert!(loaded.is_none(), "corrupted chunk should not decode into a bucket");

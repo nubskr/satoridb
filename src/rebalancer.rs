@@ -115,7 +115,6 @@ impl RebalanceState {
         for id in ids {
             let topic = crate::storage::Storage::topic_for(id);
             let count = self.wal.get_topic_entry_count(&topic) as usize;
-            // Make counts monotonic per bucket to avoid temporary regressions when WAL lags.
             let stabilized = count.max(prev_sizes.get(&id).cloned().unwrap_or(0));
             fresh.insert(id, stabilized);
         }
@@ -140,8 +139,6 @@ impl RebalanceState {
 
     pub(crate) fn load_bucket_vectors(&self, bucket_id: u64) -> Option<Vec<Vector>> {
         let chunks = Storage::get_chunks_sync(self.storage.wal.clone(), bucket_id).ok()?;
-        // Use a map to deduplicate IDs, keeping the latest version (append-only log).
-        // This prevents exponential growth when rewriting buckets on delete.
         let mut vector_map: HashMap<u64, Vector> = HashMap::new();
 
         for chunk in chunks {
@@ -178,7 +175,6 @@ impl RebalanceState {
             let id = u64::from_le_bytes(id_bytes);
 
             if data.is_empty() {
-                // Tombstone
                 vector_map.remove(&id);
             } else {
                 vector_map.insert(id, Vector { id, data });
@@ -196,9 +192,6 @@ impl RebalanceState {
         self.centroids.write().remove(&bucket_id);
         self.bucket_sizes.write().remove(&bucket_id);
         self.retired.write().insert(bucket_id);
-        // Keep the lock around - don't remove it. This ensures any concurrent
-        // operations on this bucket_id serialize properly and can check the
-        // retired set while holding the same lock.
     }
 
     fn retire_bucket_io(&self, bucket_id: u64) {
@@ -210,8 +203,7 @@ impl RebalanceState {
 
     fn mark_bucket_checkpointed(&self, bucket_id: u64) {
         let topic = crate::storage::Storage::topic_for(bucket_id);
-        // Drain the topic with checkpoint=true to mark all blocks checkpointed.
-        let max_bytes = 16 * 1024 * 1024; // read in chunks
+        let max_bytes = 16 * 1024 * 1024;
         loop {
             match self.wal.batch_read_for_topic(&topic, max_bytes, true, None) {
                 Ok(entries) => {
@@ -280,7 +272,6 @@ impl RebalanceState {
         let lock = self.lock_for(bucket_id);
         let _guard = block_on(lock.lock());
 
-        // Check if bucket was already retired (e.g., by a prior split/merge).
         if self.retired.read().contains(&bucket_id) {
             debug!(
                 "rebalance: split skipped, bucket {} already retired",
@@ -289,7 +280,6 @@ impl RebalanceState {
             return;
         }
 
-        // 1. Load Vectors
         let vectors = match self.load_bucket_vectors(bucket_id) {
             Some(v) => v,
             None => {
@@ -298,7 +288,6 @@ impl RebalanceState {
             }
         };
 
-        // 2. K-Means Split
         let mut bucket = Bucket::new(bucket_id, Vec::new());
         bucket.vectors = vectors;
         let splits = Indexer::split_bucket_once(bucket);
@@ -306,7 +295,6 @@ impl RebalanceState {
             return;
         }
 
-        // 3. Persist New Buckets
         let mut new_entries = Vec::new();
         let mut bucket_index_updates = Vec::new();
         for mut split in splits {
@@ -332,7 +320,6 @@ impl RebalanceState {
             return;
         }
 
-        // 4b. Update bucket index mappings for the split vectors.
         for (id, ids) in bucket_index_updates {
             if let Err(e) = self.bucket_index.put_batch(id, &ids) {
                 error!(
@@ -342,7 +329,6 @@ impl RebalanceState {
             }
         }
 
-        // 4. Retire Old Bucket & Update Router
         self.retire_bucket_local(bucket_id);
         self.retire_bucket_io(bucket_id);
 
@@ -360,7 +346,6 @@ impl RebalanceState {
         drop(centroids);
         self.rebuild_router(changed);
 
-        // 5. Checkpoint (Cleanup) - Inline
         self.mark_bucket_checkpointed(bucket_id);
 
         log::info!(
@@ -417,7 +402,6 @@ impl RebalanceWorker {
 
         match pin_cpu {
             Some(cpu) => {
-                // Run on a dedicated Glommio executor pinned to a reserved core.
                 let builder =
                     glommio::LocalExecutorBuilder::new(glommio::Placement::Fixed(cpu)).name(&name);
                 std::thread::spawn(move || {
@@ -431,7 +415,6 @@ impl RebalanceWorker {
                 thread::Builder::new()
                     .name(name.clone())
                     .spawn(move || {
-                        // FIX: Run inside a Glommio executor to support spawn_blocking and timers
                         glommio::LocalExecutorBuilder::default()
                             .name(&name)
                             .make()
@@ -497,7 +480,6 @@ impl RebalanceWorker {
         self.state.refresh_sizes()
     }
 
-    // No-op for compatibility, loop shuts down with process for now
     pub fn close(&self) {}
 
     pub async fn delete(&self, vector_id: u64, bucket_hint: Option<u64>) -> anyhow::Result<()> {
@@ -556,7 +538,6 @@ async fn run_autonomous_loop(
     state: Arc<RebalanceState>,
     delete_rx: async_channel::Receiver<DeleteCommand>,
 ) {
-    // Configurable threshold: split if bucket has more than N vectors.
     let threshold: usize = std::env::var("SATORI_REBALANCE_THRESHOLD")
         .ok()
         .and_then(|v| v.parse().ok())
@@ -569,10 +550,8 @@ async fn run_autonomous_loop(
             }
         }
 
-        // 1. Refresh sizes
         let sizes = state.refresh_sizes();
 
-        // 2. Find biggest bucket
         let mut max_id = 0;
         let mut max_size = 0;
         for (id, size) in sizes {
@@ -582,13 +561,7 @@ async fn run_autonomous_loop(
             }
         }
 
-        // 3. Decide
         if max_size > threshold {
-            // 4. Execute Split (Synchronously)
-            // Note: Since this function is async but handle_split_sync is blocking (uses block_on internally),
-            // we wrap it in spawn_blocking if we were in a strictly async context.
-            // But here we are the only thing running on this thread/executor.
-            // Using spawn_blocking is safer for Glommio integration.
             let state_ref = state.clone();
             let _ = glommio::executor()
                 .spawn_blocking(move || {
@@ -596,7 +569,6 @@ async fn run_autonomous_loop(
                 })
                 .await;
         } else {
-            // Nothing urgent, sleep a bit
             glommio::timer::Timer::new(Duration::from_millis(500)).await;
         }
     }
@@ -653,7 +625,6 @@ async fn perform_delete(
     let topic = crate::storage::Storage::topic_for(bucket_id);
     Storage::put_chunk_raw_sync(state.storage.wal.clone(), bucket_id, &topic, &remaining)
         .map_err(|e| anyhow::anyhow!("rewrite bucket after delete failed: {:?}", e))?;
-    // Write a tombstone entry so downstream readers that walk newest->oldest stop at the delete.
     let tombstone = Vector::new(vector_id, Vec::new());
     if let Err(e) =
         Storage::put_chunk_raw_sync(state.storage.wal.clone(), bucket_id, &topic, &[tombstone])
@@ -745,7 +716,6 @@ mod tests {
             .map(|i| Vector::new(i as u64, vec![i as f32, (i * 2) as f32]))
             .collect();
         let centroid = compute_centroid(&vectors);
-        // Mean of 0..999 = 499.5, mean of 0..1998 (step 2) = 999
         let expected_x = (0..n).sum::<usize>() as f32 / n as f32;
         let expected_y = (0..n).map(|i| (i * 2) as f32).sum::<f32>() / n as f32;
         assert!((centroid[0] - expected_x).abs() < 0.01);

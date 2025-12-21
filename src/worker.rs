@@ -75,22 +75,16 @@ pub async fn run_worker(
     let cache_total_bytes = cache_max_buckets
         .saturating_mul(cache_bucket_bytes)
         .max(cache_bucket_bytes);
-    let cache = WorkerCache::new(cache_max_buckets, cache_bucket_bytes, cache_total_bytes); // Local cache: preallocates buckets * bucket_bytes
+    let cache = WorkerCache::new(cache_max_buckets, cache_bucket_bytes, cache_total_bytes);
     let executor = Rc::new(Executor::new(storage.clone(), cache));
-    // Shared topic cache not easily safe for concurrent access across spawns without RefCell,
-    // but computing topic string is cheap. Let's drop the cache for simplicity in concurrent model.
-    // Prewarm ingestion thread-local buffers to avoid growth reallocs on the hot path.
     Storage::prewarm_thread_locals(2048, 1024);
 
     const MAX_CONCURRENCY: usize = 32;
-    // Use channel as a semaphore. Capacity = max concurrency.
-    // Loop sends (acquires), Task receives (releases).
     let (limit_tx, limit_rx) = async_channel::bounded(MAX_CONCURRENCY);
 
     while let Ok(msg) = receiver.recv().await {
         match msg {
             WorkerMessage::Query(req) => {
-                // Acquire permit (blocks if full)
                 limit_tx.send(()).await.unwrap();
                 let limit_rx = limit_rx.clone();
                 let executor = executor.clone();
@@ -108,7 +102,6 @@ pub async fn run_worker(
                     if req.respond_to.send(result).is_err() {
                         error!("Worker {} failed to send response back.", id);
                     }
-                    // Release permit
                     let _ = limit_rx.recv().await;
                 })
                 .detach();
@@ -247,13 +240,11 @@ pub async fn run_worker(
                             }
                         }
                     }
-                    // Release permit
                     let _ = limit_rx.recv().await;
                 })
                 .detach();
             }
             WorkerMessage::Flush { respond_to } => {
-                // Wait for all active tasks to drain
                 while !limit_rx.is_empty() {
                     glommio::timer::Timer::new(Duration::from_millis(10)).await;
                 }

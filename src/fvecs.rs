@@ -58,7 +58,6 @@ mod tests {
     #[test]
     fn reads_fvecs_records() {
         let mut tmp = NamedTempFile::new().unwrap();
-        // Two vectors, dim=2
         tmp.write_all(&2u32.to_le_bytes()).unwrap();
         for f in [1.5f32, 2.5f32] {
             tmp.write_all(&f.to_le_bytes()).unwrap();

@@ -66,18 +66,14 @@ impl Indexer {
             return vec![];
         }
 
-        // If ragged dims are possible in your pipeline, keep this.
-        // If you're guaranteed fixed-dim, remove for speed.
         if vectors.iter().any(|v| v.data.len() != dim) {
             return vec![];
         }
 
         let rng = SplitMix64::seeded_from_time();
 
-        // Detect SIMD once. Never do is_x86_feature_detected!() inside the inner loops.
         let simd = SimdCaps::detect();
 
-        // Centroids: flat AoS layout, k * dim
         let mut centroids = vec![0.0f32; k * dim];
         match opts.init {
             InitMode::FarthestPairK2 if k == 2 && n >= 2 => {
@@ -127,17 +123,13 @@ impl Indexer {
             }
         }
 
-        // Force first iter to count as "changed" so we do at least one update.
         let mut assignments = vec![usize::MAX; n];
 
-        // Reused accumulators
         let mut sums = vec![0.0f32; k * dim];
         let mut counts = vec![0u32; k];
 
-        // For k>=8 block kernel (SoA)
         let mut centroids_t = Vec::<f32>::new();
 
-        // Iter knobs
         let max_iters = opts.max_iters.max(1);
 
         for iter in 0..max_iters {
@@ -148,7 +140,6 @@ impl Indexer {
             sums.fill(0.0);
             counts.fill(0);
 
-            // Choose assignment kernel
             let use_block8 = simd.avx2_fma && k >= 8;
             let use_k2 = simd.avx2_fma && k == 2;
 
@@ -162,10 +153,8 @@ impl Indexer {
                 let x = &v.data;
 
                 let best = if use_k2 {
-                    // Special-case k=2: compute both distances in one pass (point streamed once)
                     unsafe { nearest_centroid_k2_avx2_fma(x, &centroids, dim) }
                 } else if use_block8 {
-                    // k>=8: 8 centroids at once (SoA transposed centroids)
                     unsafe { nearest_centroid_block8_avx2_fma(x, &centroids_t, k, dim) }
                 } else if simd.avx2 {
                     unsafe { nearest_centroid_pairwise_avx2(x, &centroids, k, dim, simd.avx2_fma) }
@@ -178,16 +167,13 @@ impl Indexer {
                     changed = true;
                 }
 
-                // Accumulate sums
                 let base = best * dim;
-                // Tight loop, no iterators
                 for (d, sum) in sums[base..base + dim].iter_mut().enumerate() {
                     *sum += x[d];
                 }
                 counts[best] += 1;
             }
 
-            // Update centroids
             let mut reseeded = false;
             for j in 0..k {
                 if counts[j] > 0 {
@@ -208,7 +194,6 @@ impl Indexer {
             }
         }
 
-        // Build Buckets (reserve exact sizes to avoid realloc churn)
         let mut final_counts = vec![0usize; k];
         for &a in &assignments {
             final_counts[a] += 1;
@@ -219,7 +204,6 @@ impl Indexer {
             && n >= 2
             && (final_counts[0] == 0 || final_counts[1] == 0)
         {
-            // Deterministic fallback: split in half to avoid returning a single bucket.
             let mid = n / 2;
             let mut b0 = Vec::with_capacity(mid);
             let mut b1 = Vec::with_capacity(n - mid);
@@ -266,7 +250,6 @@ impl Indexer {
             out = Self::rebalance_buckets(out);
         }
 
-        // Reindex buckets to ensure unique, dense IDs after rebalancing/splitting.
         if opts.reindex {
             let mut reindexed = Vec::with_capacity(out.len());
             for (i, b) in out.into_iter().enumerate() {
@@ -637,7 +620,6 @@ mod tests {
         assert_eq!(splits.len(), 2, "two vectors should split into two buckets");
         let total: usize = splits.iter().map(|s| s.vectors.len()).sum();
         assert_eq!(total, 2);
-        // Each bucket should have exactly one vector.
         assert!(
             splits.iter().all(|s| s.vectors.len() == 1),
             "each bucket should have one vector"
@@ -651,9 +633,6 @@ mod tests {
         let mut b = Bucket::new(0, vec![5.0, 5.0]);
         b.vectors = vec![Vector::new(0, vec![5.0, 5.0])];
         let splits = Indexer::split_bucket_once(b);
-        // force_two_buckets_k2 requires n >= 2, so with n=1 we get empty or single.
-        // The current implementation returns empty for n=1, k=2 (see lines 60-68).
-        // This is acceptable behavior; the key invariant is that it doesn't panic.
         assert!(
             splits.is_empty() || splits.len() == 1,
             "single vector cannot be split into two"
@@ -676,7 +655,7 @@ mod tests {
     fn ragged_dimensions_returns_empty() {
         let vectors = vec![
             Vector::new(0, vec![0.0, 0.0]),
-            Vector::new(1, vec![1.0, 1.0, 1.0]), // different dimension
+            Vector::new(1, vec![1.0, 1.0, 1.0]),
         ];
         let buckets = Indexer::build_clusters(vectors, 2);
         assert!(buckets.is_empty(), "ragged dimensions should return empty");

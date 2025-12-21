@@ -131,7 +131,6 @@ fn detect_dataset() -> anyhow::Result<Option<DatasetConfig>> {
     let bigann_gnd = PathBuf::from("bigann_gnd.tar.gz");
     let prepared_bigann = bigann_base.with_extension("f32bin");
 
-    // Prefer already-prepared base even if the original archive was removed.
     if prepared_bigann.exists() && bigann_query.exists() {
         return Ok(Some(DatasetConfig {
             kind: DatasetKind::Bigann,
@@ -176,7 +175,6 @@ fn main() -> anyhow::Result<()> {
         .ok()
         .and_then(|v| v.parse().ok())
         .unwrap_or_else(|| num_cpus::get().max(1));
-    // Reserve two cores for background threads (rebalance driver/worker, logging, etc.).
     let usable_cores = satori_cores.saturating_sub(2).max(1);
     let total_cpus = num_cpus::get().max(1);
     let reserved_start = usable_cores.min(total_cpus);
@@ -203,7 +201,6 @@ fn main() -> anyhow::Result<()> {
     let bucket_index = Arc::new(BucketIndex::open(&bucket_index_path)?);
     let bucket_locks = Arc::new(BucketLocks::new());
 
-    // Create Worker Channels (async for backpressure)
     let mut senders = Vec::new();
     let mut worker_handles = Vec::new();
 
@@ -236,7 +233,6 @@ fn main() -> anyhow::Result<()> {
 
     let ring = ConsistentHashRing::new(executor_shards, 8);
 
-    // Router pool using crossbeam MPMC; router is installed after clustering.
     let (router_tx, router_rx) = unbounded::<RouterTask>();
     let router_shared = Arc::new(RoutingTable::new());
     let rebalance_worker = RebalanceWorker::spawn(
@@ -253,13 +249,11 @@ fn main() -> anyhow::Result<()> {
         info!("Rebalance worker running without dedicated core (only one CPU visible)");
     }
 
-    // Monitoring loop: print global state periodically.
     {
         let worker = rebalance_worker.clone();
         std::thread::spawn(move || {
             let mut tick: u64 = 0;
             loop {
-                // Check every 5 seconds (approx 10 ticks of 500ms)
                 std::thread::sleep(std::time::Duration::from_secs(5));
                 tick += 1;
 
@@ -329,12 +323,8 @@ fn main() -> anyhow::Result<()> {
         ))?;
     } else {
         info!("Benchmark logic is disabled (set SATORI_RUN_BENCH=1 to enable).");
-        // Keep main alive if not benchmarking (e.g. if net server was running)
-        // But net server is removed. So we just exit?
-        // The user specifically wants to run benchmark.
     }
 
-    // Cleanup
     drop(router_tx);
     for sender in senders {
         sender.close();
@@ -389,10 +379,7 @@ async fn run_benchmark_mode(
         }
     }
 
-    // Dataset-specific knobs
-    // Start with a larger number of buckets; background rebalance can adjust.
     let (initial_batch_size, stream_batch_size, k, router_top_k) = match dataset.kind {
-        // For BigANN, route to fewer buckets to keep query latency down.
         DatasetKind::Bigann => (100_000, 100_000, 100, 20),
         DatasetKind::Gist => (50_000, 100_000, 100, 400),
     };
@@ -441,7 +428,6 @@ async fn run_benchmark_mode(
             buckets.len()
         );
 
-        // Streaming Ingestion
         let mut total_processed = initial_batch_size;
         let mut ingest_waiters = Vec::new();
 
@@ -510,7 +496,6 @@ async fn run_benchmark_mode(
                 flush_waiters.push(rx);
             }
         }
-        // Wait for all workers to confirm flush so queries see every vector.
         for rx in flush_waiters {
             let _ = rx.await;
         }
@@ -530,7 +515,6 @@ async fn run_benchmark_mode(
     }
 
     if dataset.query_path.exists() {
-        // Allow manual indexing trigger before queries.
         trigger_indexing(&router_shared)?;
 
         let mut reader = match dataset.kind {
@@ -624,7 +608,6 @@ async fn run_benchmark_mode(
             }
             all_results.sort_by(|a, b| a.1.partial_cmp(&b.1).unwrap_or(std::cmp::Ordering::Equal));
 
-            // Deduplicate results preserving the first (best distance) occurrence
             let mut unique_results = Vec::with_capacity(all_results.len());
             let mut seen_ids = std::collections::HashSet::new();
             for (id, dist, _) in all_results {

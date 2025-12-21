@@ -20,7 +20,6 @@ impl SplitMix64 {
             .duration_since(UNIX_EPOCH)
             .map(|d| d.as_nanos() as u64)
             .unwrap_or(0);
-        // Mix in address of self to reduce collision chance across threads.
         let addr = (&nanos as *const u64 as usize) as u64;
         Self::with_seed(nanos ^ addr)
     }
@@ -38,7 +37,7 @@ impl SplitMix64 {
 
     #[inline(always)]
     pub fn next_f32(&self) -> f32 {
-        let bits = (self.next_u64() >> 40) as u32; // take high 24 bits
+        let bits = (self.next_u64() >> 40) as u32;
         bits as f32 / (1u32 << 24) as f32
     }
 

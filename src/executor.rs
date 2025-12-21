@@ -262,7 +262,6 @@ impl Executor {
             return Ok(Vec::new());
         }
 
-        // Try cache first
         if let Some(hits) = {
             let mut cache = self.cache.lock();
             cache
@@ -272,7 +271,6 @@ impl Executor {
             return Ok(hits);
         }
 
-        // Load and populate cache
         let chunks = self.load_bucket_chunks(bucket_id).await?;
         let hits = collect_vectors_from_chunks(&chunks, &wanted);
 
@@ -316,7 +314,6 @@ impl Executor {
         let mut candidates: Vec<(u64, f32, Option<Vec<f32>>)> = Vec::new();
 
         for &id in bucket_ids {
-            // First try cache under a short lock.
             let mut handled = false;
             {
                 let mut cache = self.cache.lock();
@@ -330,7 +327,6 @@ impl Executor {
                 continue;
             }
 
-            // Cache miss: load from storage without holding the lock.
             match self.load_bucket_chunks(id).await {
                 Ok(chunks) => {
                     if chunks.is_empty() {
@@ -357,10 +353,8 @@ impl Executor {
             }
         }
 
-        // Sort by distance (ascending)
         candidates.sort_by(|a, b| a.1.partial_cmp(&b.1).unwrap_or(std::cmp::Ordering::Equal));
 
-        // Take top_k
         if candidates.len() > top_k {
             candidates.truncate(top_k);
         }
@@ -405,8 +399,6 @@ fn walk_bucket_slice(data: &[u8], mut f: impl FnMut(u64, &[u8])) {
 }
 
 fn walk_bucket_chunks(chunks: &[Vec<u8>], mut f: impl FnMut(u64, &[u8])) {
-    // Walk from newest to oldest and ignore stale duplicates so rewrites (e.g., deletes)
-    // take effect without truncating the WAL topic.
     let mut seen = HashSet::new();
     for chunk in chunks.iter().rev() {
         if chunk.len() < 8 {
@@ -520,7 +512,6 @@ fn scan_bucket_chunks(
 #[cfg(test)]
 fn l2_distance_f32(a: &[f32], b: &[f32]) -> f32 {
     if cfg!(target_arch = "x86_64") && std::arch::is_x86_feature_detected!("avx2") {
-        // Prefer the FMA path when available; it gives a small bump on AVX2 hardware.
         if std::arch::is_x86_feature_detected!("fma") {
             unsafe { l2_distance_f32_avx2_fma(a, b) }
         } else {
@@ -549,7 +540,6 @@ unsafe fn l2_distance_f32_avx2(a: &[f32], b: &[f32]) -> f32 {
     let mut sum1 = _mm256_setzero_ps();
     let mut i = 0;
 
-    // Unroll by 2x to reduce loop overhead.
     while i + 16 <= len {
         let va0 = _mm256_loadu_ps(a.as_ptr().add(i));
         let vb0 = _mm256_loadu_ps(b.as_ptr().add(i));
@@ -639,7 +629,6 @@ mod tests {
         let a = vec![1.0f32, 2.0, 3.0];
         let b = vec![1.0f32, 2.0];
         let dist = l2_distance_f32(&a, &b);
-        // Should only consider the min length (2 elements)
         let expected = ((0.0f32).powi(2) + (0.0f32).powi(2)).sqrt();
         assert!((dist - expected).abs() < 1e-5);
     }
@@ -676,7 +665,6 @@ mod tests {
         let n = 1024;
         let a: Vec<f32> = (0..n).map(|i| i as f32).collect();
         let b: Vec<f32> = (0..n).map(|i| (i + 1) as f32).collect();
-        // Each element differs by 1, so sum of squares = n, sqrt = sqrt(n)
         let expected = (n as f32).sqrt();
         let dist = l2_distance_f32(&a, &b);
         assert!(
@@ -692,7 +680,6 @@ mod tests {
     fn l2_distance_negative_values() {
         let a = vec![-1.0f32, -2.0, -3.0];
         let b = vec![1.0f32, 2.0, 3.0];
-        // Differences: -2, -4, -6 → squares: 4, 16, 36 → sum: 56 → sqrt ≈ 7.483
         let expected = 56.0f32.sqrt();
         let dist = l2_distance_f32(&a, &b);
         assert!((dist - expected).abs() < 1e-4);
@@ -705,7 +692,6 @@ mod tests {
         cache.put_bytes(0, &[0u8; 8]);
         cache.put_bytes(1, &[1u8; 8]);
         cache.put_bytes(2, &[2u8; 8]);
-        // LRU should have evicted bucket 0
         assert!(cache.get(0).is_none(), "bucket 0 should be evicted");
         assert!(cache.get(1).is_some(), "bucket 1 should still be cached");
         assert!(cache.get(2).is_some(), "bucket 2 should still be cached");
@@ -714,9 +700,9 @@ mod tests {
     /// WorkerCache skips buckets exceeding byte limit.
     #[test]
     fn worker_cache_rejects_oversized() {
-        let mut cache = WorkerCache::new(10, 100, usize::MAX); // max 100 bytes per bucket
+        let mut cache = WorkerCache::new(10, 100, usize::MAX);
         cache.put_bytes(0, &[0u8; 50]);
-        cache.put_bytes(1, &[0u8; 200]); // too big
+        cache.put_bytes(1, &[0u8; 200]);
         assert!(cache.get(0).is_some(), "small bucket should be cached");
         assert!(
             cache.get(1).is_none(),

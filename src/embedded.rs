@@ -56,8 +56,6 @@ fn default_vector_index_path() -> PathBuf {
         return PathBuf::from(p);
     }
 
-    // Use a per-process unique temp directory to avoid lock contention when multiple instances run
-    // concurrently (tests/benchmarks). Set SATORI_VECTOR_INDEX_PATH for a stable location.
     static COUNTER: AtomicU64 = AtomicU64::new(0);
     let n = COUNTER.fetch_add(1, Ordering::Relaxed);
     std::env::temp_dir().join(format!("vector_index_{}_{}", std::process::id(), n))
@@ -80,8 +78,6 @@ pub struct SatoriDb {
     router_handle: thread::JoinHandle<()>,
     worker_senders: Vec<async_channel::Sender<WorkerMessage>>,
     worker_handles: Vec<thread::JoinHandle<()>>,
-    // We hold the rebalancer here to keep the background thread alive (if we implemented shutdown later).
-    // For now it just runs detached in background via spawn().
     #[allow(dead_code)]
     rebalance_worker: RebalanceWorker,
     rebalance_thread: Option<thread::JoinHandle<()>>,
@@ -137,10 +133,8 @@ impl SatoriDb {
         let (router_tx, router_rx) = unbounded::<RouterCommand>();
         let router_handle = spawn_router_manager(cfg.wal.clone(), router_rx);
 
-        // RoutingTable shared with rebalancer
         let routing_table = Arc::new(RoutingTable::new());
 
-        // Spawn Rebalancer in delete-only mode
         let (rebalance_worker, rebalance_thread) = RebalanceWorker::spawn_delete_only(
             Storage::new(cfg.wal.clone()),
             vector_index.clone(),
@@ -176,7 +170,6 @@ impl SatoriDb {
 
     /// Flush state (best-effort) and shut down router/workers.
     pub fn shutdown(mut self) -> Result<()> {
-        // Best-effort: persist a router snapshot so startup can skip replaying the full update log.
         let (flush_tx, flush_rx) = oneshot::channel();
         let _ = self.router_tx.send(RouterCommand::Flush(
             crate::router_manager::RouterFlushRequest {
@@ -202,7 +195,6 @@ impl SatoriDb {
             let _ = block_on(rx);
         }
 
-        // Close delete channel to signal rebalancer to stop
         self.rebalance_worker.delete_tx.close();
 
         for sender in &self.worker_senders {

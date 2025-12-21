@@ -10,11 +10,8 @@ use thread_local::ThreadLocal;
 pub struct Router {
     index: HnswIndex,
 
-    // Per-thread scratch for HNSW search to avoid contention.
     scratch: ThreadLocal<RefCell<crate::router_hnsw::SearchScratch>>,
-    // Per-thread flat scratch for small-index scans.
     flat_scratch: ThreadLocal<RefCell<Vec<(f32, usize)>>>,
-    // Per-thread quant buffers to avoid contention on the hot path.
     quant_bufs: ThreadLocal<RefCell<Vec<u8>>>,
 
     quant_min: f32,
@@ -26,7 +23,6 @@ pub struct Router {
 
 impl Router {
     pub fn new(_max_elements: usize, quantizer: Quantizer) -> Self {
-        // Cheaper construction tuned for latency.
         let index = HnswIndex::new(24, 180);
 
         let range = quantizer.max - quantizer.min;
@@ -49,7 +45,6 @@ impl Router {
     }
 
     pub fn add_centroid(&mut self, id: u64, vector: &[f32]) {
-        // Leave unpadded here; HnswIndex pads internally (currently with 0s).
         let mut buf = Vec::with_capacity(vector.len());
         self.quantize_into_unpadded(vector, &mut buf);
         self.index.insert(id as usize, buf);
@@ -70,20 +65,15 @@ impl Router {
         }
 
         let neighbors = {
-            // Per-thread buffer: no locks, no allocs in steady state.
             let q_local = self.quant_bufs.get_or(|| RefCell::new(Vec::new()));
             let mut q_buf = q_local.borrow_mut();
 
-            // IMPORTANT: must match index-side padding semantics.
-            // Your HnswIndex pads inserted vectors with 0, so query must pad with 0 too.
             self.quantize_into_padded_zero(vector, pad, &mut q_buf);
 
             let n = self.index.len();
 
-            // Flat path is exact and deterministic; tests rely on it for small sets.
-            // Work guard prevents accidental O(N*D) explosions if D is huge.
             const FLAT_N_CUTOFF: usize = 20_000;
-            const FLAT_WORK_THRESHOLD: usize = 2_000_000; // tune on your box
+            const FLAT_WORK_THRESHOLD: usize = 2_000_000;
             let work = n.saturating_mul(pad);
 
             #[cfg(test)]
@@ -96,11 +86,7 @@ impl Router {
                 let mut buf = local.borrow_mut();
                 self.index.flat_search_with_scratch(&q_buf, top_k, &mut buf)
             } else {
-                // --- KEY CHANGE: special-case top_k == 1 ---
-                // Streaming ingestion calls router.query(..., 1) extremely often.
-                // Do NOT use the same ef_search policy as multi-bucket routing.
                 let ef_search = if top_k <= 1 {
-                    // Keep this small; bump only if routing quality becomes unacceptable.
                     if n <= 50_000 {
                         64
                     } else if n <= 200_000 {
@@ -109,7 +95,6 @@ impl Router {
                         128
                     }
                 } else {
-                    // Keep your existing multi-bucket routing policy (including a high floor if you want it).
                     let base = if n <= 50_000 {
                         top_k.saturating_mul(60)
                     } else if n <= 200_000 {
@@ -117,8 +102,6 @@ impl Router {
                     } else {
                         top_k.saturating_mul(100)
                     };
-                    // If you previously forced a huge minimum (e.g. 1200), keep it here
-                    // so query routing quality doesn't regress.
                     let min_ef = 1_200usize;
                     let max_ef = 4_000usize;
                     std::cmp::min(std::cmp::max(base, min_ef), max_ef)
@@ -136,10 +119,6 @@ impl Router {
 
         Ok(neighbors.into_iter().map(|id| id as u64).collect())
     }
-
-    // ----------------------------
-    // Quantization hot path
-    // ----------------------------
 
     #[inline(always)]
     #[allow(clippy::uninit_vec)]
@@ -168,7 +147,6 @@ impl Router {
     }
 
     /// Core quantization into an already-sized output slice.
-    /// Avoids `resize(.., 0)` (memset) and avoids `clamp()` (often slower than two compares).
     #[inline(always)]
     fn quantize_core(&self, src: &[f32], out: &mut [u8]) {
         let scale = self.quant_scale;
@@ -323,7 +301,6 @@ mod tests {
         router.add_centroid(0, &[0.0, 0.0]);
         router.add_centroid(1, &[10.0, 10.0]);
 
-        // Query near (0,0) should return centroid 0 first
         let result = router.query(&[0.1, 0.1], 2).unwrap();
         assert!(!result.is_empty());
         assert_eq!(result[0], 0, "should find centroid 0 first");

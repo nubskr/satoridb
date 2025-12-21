@@ -16,10 +16,8 @@ pub struct HnswIndex {
     dim: usize,
     pad_dim: usize,
 
-    // Optional: keep original padded u8 vectors for compatibility / debugging.
     vectors: Vec<Vec<u8>>,
 
-    // Contiguous storage: traversal[id * pad_dim .. (id+1)*pad_dim]
     traversal: Vec<i8>,
     inv_norms: Vec<f32>,
     level_of: Vec<i32>,
@@ -29,7 +27,6 @@ pub struct HnswIndex {
     max_level: i32,
     rng: SplitMix64,
 
-    // Dispatch chosen once per index to avoid per-call CPUID branching.
     dot_fn: DotFn,
     center_fn: CenterFn,
 
@@ -140,14 +137,12 @@ impl HnswIndex {
         let q_inv = self.inv_norm_i8(&q_buf);
         let q_slice: &[i8] = &q_buf;
 
-        // Greedy descent on upper layers.
         if max_level >= 1 {
             for level in (1..=max_level as usize).rev() {
                 entry = self.greedy_search_layer(q_slice, q_inv, entry, level as i32);
             }
         }
 
-        // Layer 0: best-first search with ef_search beam.
         let results = self.layer_search(q_slice, q_inv, entry, 0, ef_search, scratch);
         let mut res: Vec<_> = results.into_iter().take(top_k).collect();
         res.truncate(top_k);
@@ -177,21 +172,17 @@ impl HnswIndex {
         let level = self.sample_level();
         self.ensure_node(id, level);
 
-        // Keep original padded bytes if you need them.
         self.vectors[id] = padded.clone();
 
-        // Center into traversal slab using a raw pointer (avoids borrow conflicts).
         let pad = self.pad_dim;
         let center_fn = self.center_fn;
         let src_ptr = padded.as_ptr();
         let dst_ptr = unsafe { self.traversal.as_mut_ptr().add(id * pad) };
         unsafe { (center_fn)(src_ptr, dst_ptr, pad) };
 
-        // Compute inv-norm from centered traversal slice.
         let inv = self.inv_norm_i8(self.trav(id));
         self.inv_norms[id] = inv;
 
-        // First element short-circuits.
         if self.entry.is_none() {
             self.entry = Some(id);
             self.max_level = level;
@@ -205,11 +196,9 @@ impl HnswIndex {
             self.entry = Some(id);
         }
 
-        // Use a raw slice for the inserted vector so we can mutably borrow self elsewhere.
         let v_ptr = unsafe { self.traversal.as_ptr().add(id * self.pad_dim) };
         let v_len = self.pad_dim;
 
-        // Greedy descent until one level above the node's level.
         if prev_max > level {
             for l in ((level + 1) as usize..=prev_max as usize).rev() {
                 let v_id = unsafe { std::slice::from_raw_parts(v_ptr, v_len) };
@@ -217,7 +206,6 @@ impl HnswIndex {
             }
         }
 
-        // Connect on all levels down to 0.
         for l in (0..=level as usize).rev() {
             let level_i32 = l as i32;
             let beam = if level_i32 == 0 {
@@ -227,7 +215,6 @@ impl HnswIndex {
             };
             let ef = self.ef_construction.max(beam);
 
-            // Move scratch out, do the search, move it back (no lingering borrows).
             let mut scratch = std::mem::take(&mut self.insert_scratch);
             let v_id = unsafe { std::slice::from_raw_parts(v_ptr, v_len) };
             let mut candidates = self.layer_search(v_id, inv, entry, level_i32, ef, &mut scratch);
@@ -507,7 +494,6 @@ impl HnswIndex {
             return;
         }
 
-        // Take out, sort without holding a mutable borrow of self.neighbors, then put back.
         let mut vec: SmallVec<[usize; 16]> =
             std::mem::take(&mut self.neighbors[id][level as usize]);
         vec.sort_by(|&a, &b| {
@@ -545,7 +531,6 @@ impl HnswIndex {
             self.level_of.resize(new_n, -1);
             self.neighbors.resize_with(new_n, Vec::new);
 
-            // traversal slab grows to new_n * pad_dim
             self.traversal.resize(new_n * self.pad_dim, 0);
         }
         self.level_of[id] = level;
@@ -661,7 +646,6 @@ fn round_up_32(v: usize) -> usize {
 }
 
 fn pick_kernels() -> (DotFn, CenterFn) {
-    // Defaults
     let mut dot: DotFn = dot_i8_scalar_i32;
     let mut center: CenterFn = center_bytes_scalar_xor_0x80;
 
@@ -730,7 +714,6 @@ unsafe fn dot_i8_avx2_i32(a: &[i8], b: &[i8]) -> i32 {
     let mut acc1 = _mm256_setzero_si256();
 
     while i + 64 <= len {
-        // first 32
         let va0 = _mm256_loadu_si256(a.as_ptr().add(i) as *const __m256i);
         let vb0 = _mm256_loadu_si256(b.as_ptr().add(i) as *const __m256i);
 
@@ -742,7 +725,6 @@ unsafe fn dot_i8_avx2_i32(a: &[i8], b: &[i8]) -> i32 {
         let b0_hi = _mm256_cvtepi8_epi16(_mm256_extracti128_si256::<1>(vb0));
         acc0 = _mm256_add_epi32(acc0, _mm256_madd_epi16(a0_hi, b0_hi));
 
-        // next 32
         let va1 = _mm256_loadu_si256(a.as_ptr().add(i + 32) as *const __m256i);
         let vb1 = _mm256_loadu_si256(b.as_ptr().add(i + 32) as *const __m256i);
 
@@ -759,7 +741,6 @@ unsafe fn dot_i8_avx2_i32(a: &[i8], b: &[i8]) -> i32 {
 
     acc0 = _mm256_add_epi32(acc0, acc1);
 
-    // reduce 8x i32 -> scalar
     let hi = _mm256_extracti128_si256::<1>(acc0);
     let lo = _mm256_castsi256_si128(acc0);
     let mut s = _mm_add_epi32(lo, hi);

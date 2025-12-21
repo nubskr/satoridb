@@ -15,7 +15,6 @@ impl BucketIndex {
         opts.create_if_missing(true);
         opts.set_compression_type(rocksdb::DBCompressionType::Zstd);
         opts.optimize_level_style_compaction(64 * 1024 * 1024);
-        // Keep memory bounded: ~64MB block cache + two 16MB memtables ≈ 96MB.
         let cache = Cache::new_lru_cache(64 * 1024 * 1024);
         let mut block_opts = BlockBasedOptions::default();
         block_opts.set_block_cache(&cache);
