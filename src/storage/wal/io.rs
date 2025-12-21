@@ -1,4 +1,5 @@
 use async_trait::async_trait;
+use futures::executor::block_on;
 use std::io::Result;
 
 /// Abstract interface for file I/O operations.
@@ -10,28 +11,28 @@ pub trait WalrusFile: std::fmt::Debug {
     async fn read_at(&self, offset: u64, len: usize) -> Result<Vec<u8>>;
 
     fn read_at_sync(&self, offset: u64, len: usize) -> Result<Vec<u8>> {
-        pollster::block_on(self.read_at(offset, len))
+        block_on(self.read_at(offset, len))
     }
 
     /// Write the provided buffer to the file at the specified `offset`.
     async fn write_at(&self, offset: u64, buf: &[u8]) -> Result<usize>;
 
     fn write_at_sync(&self, offset: u64, buf: &[u8]) -> Result<usize> {
-        pollster::block_on(self.write_at(offset, buf))
+        block_on(self.write_at(offset, buf))
     }
 
     /// Sync all changes to disk (fdatasync/fsync).
     async fn sync_all(&self) -> Result<()>;
 
     fn sync_all_sync(&self) -> Result<()> {
-        pollster::block_on(self.sync_all())
+        block_on(self.sync_all())
     }
 
     /// Get the current file length.
     async fn len(&self) -> Result<u64>;
 
     fn len_sync(&self) -> Result<u64> {
-        pollster::block_on(self.len())
+        block_on(self.len())
     }
 
     async fn is_empty(&self) -> Result<bool> {

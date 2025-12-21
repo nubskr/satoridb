@@ -1,6 +1,6 @@
 use std::sync::Arc;
 
-use pollster::block_on;
+use futures::executor::block_on;
 use satoridb::wal::runtime::Walrus;
 use satoridb::wal::{FsyncSchedule, ReadConsistency};
 use satoridb::{SatoriDb, SatoriDbConfig};

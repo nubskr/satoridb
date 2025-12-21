@@ -6,8 +6,8 @@ use crate::wal::config::{checksum64, debug_print, MAX_BATCH_ENTRIES, PREFIX_META
 use std::io;
 use std::sync::{Arc, RwLock};
 
+use log::info;
 use rkyv::{AlignedVec, Deserialize};
-use tracing::info;
 
 impl Walrus {
     pub fn read_next(&self, col_name: &str, checkpoint: bool) -> io::Result<Option<Entry>> {
