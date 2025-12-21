@@ -77,6 +77,21 @@ impl VectorIndex {
         }
         Ok(out)
     }
+
+    /// Return the first id that already exists in the index, if any.
+    pub fn first_existing(&self, ids: &[u64]) -> Result<Option<u64>> {
+        for id in ids {
+            if self
+                .db
+                .get(id.to_le_bytes())
+                .with_context(|| format!("read id {} from vector index", id))?
+                .is_some()
+            {
+                return Ok(Some(*id));
+            }
+        }
+        Ok(None)
+    }
 }
 
 #[cfg(test)]

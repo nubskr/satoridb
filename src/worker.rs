@@ -33,6 +33,7 @@ pub enum WorkerMessage {
     Ingest {
         bucket_id: u64,
         vectors: Vec<Vector>,
+        respond_to: oneshot::Sender<anyhow::Result<()>>,
     },
     Flush {
         respond_to: oneshot::Sender<()>,
@@ -137,12 +138,48 @@ pub async fn run_worker(
                     .map(|vectors| vectors.into_iter().map(|v| (v.id, v.data)).collect());
                 let _ = respond_to.send(res);
             }
-            WorkerMessage::Ingest { bucket_id, vectors } => {
+            WorkerMessage::Ingest {
+                bucket_id,
+                vectors,
+                respond_to,
+            } => {
+                let mut ids = Vec::with_capacity(vectors.len());
+                let mut seen = std::collections::HashSet::with_capacity(vectors.len());
+                let mut duplicate_in_batch = None;
+                for v in &vectors {
+                    if !seen.insert(v.id) {
+                        duplicate_in_batch = Some(v.id);
+                        break;
+                    }
+                    ids.push(v.id);
+                }
+
                 limit_tx.send(()).await.unwrap();
                 let limit_rx = limit_rx.clone();
                 let storage = storage.clone();
                 let vector_index = vector_index.clone();
                 glommio::spawn_local(async move {
+                    if let Some(dup) = duplicate_in_batch {
+                        let _ = respond_to
+                            .send(Err(anyhow::anyhow!("duplicate id {} in batch", dup)));
+                        let _ = limit_rx.recv().await;
+                        return;
+                    }
+                    match vector_index.first_existing(&ids) {
+                        Ok(Some(existing)) => {
+                            let _ = respond_to
+                                .send(Err(anyhow::anyhow!("id {} already exists", existing)));
+                            let _ = limit_rx.recv().await;
+                            return;
+                        }
+                        Err(e) => {
+                            let _ = respond_to.send(Err(e));
+                            let _ = limit_rx.recv().await;
+                            return;
+                        }
+                        Ok(None) => {}
+                    }
+
                     let topic = Storage::topic_for(bucket_id);
                     loop {
                         match storage
@@ -151,11 +188,17 @@ pub async fn run_worker(
                         {
                             Ok(_) => {
                                 ingest_counter::add(vectors.len() as u64);
-                                if let Err(e) = vector_index.put_batch(&vectors) {
-                                    error!(
-                                        "Worker {} failed to update vector index for bucket {}: {:?}",
-                                        id, bucket_id, e
-                                    );
+                                match vector_index.put_batch(&vectors) {
+                                    Ok(_) => {
+                                        let _ = respond_to.send(Ok(()));
+                                    }
+                                    Err(e) => {
+                                        error!(
+                                            "Worker {} failed to update vector index for bucket {}: {:?}",
+                                            id, bucket_id, e
+                                        );
+                                        let _ = respond_to.send(Err(e));
+                                    }
                                 }
                                 break;
                             }
@@ -174,6 +217,7 @@ pub async fn run_worker(
                                     "Worker {} failed to persist chunk for bucket {}: {:?}",
                                     id, bucket_id, e
                                 );
+                                let _ = respond_to.send(Err(e));
                                 break;
                             }
                         }

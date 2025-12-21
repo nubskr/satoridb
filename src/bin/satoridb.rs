@@ -425,6 +425,7 @@ async fn run_benchmark_mode(
 
         // Streaming Ingestion
         let mut total_processed = initial_batch_size;
+        let mut ingest_waiters = Vec::new();
 
         while total_processed < dataset.max_vectors {
             let batch = reader.read_batch(stream_batch_size)?;
@@ -454,15 +455,32 @@ async fn run_benchmark_mode(
 
             for (bucket_id, new_vectors) in updates {
                 let shard = ring.node_for(bucket_id);
+                let (tx, rx) = oneshot::channel();
                 let msg = WorkerMessage::Ingest {
                     bucket_id,
                     vectors: new_vectors,
+                    respond_to: tx,
                 };
                 if let Err(e) = senders[shard].send(msg).await {
                     log::error!("Failed to send ingest to shard {}: {:?}", shard, e);
+                } else {
+                    ingest_waiters.push(rx);
                 }
             }
             total_processed += stream_batch_size;
+        }
+
+        let ingest_results = join_all(ingest_waiters).await;
+        for res in ingest_results {
+            match res {
+                Ok(Ok(())) => {}
+                Ok(Err(e)) => {
+                    log::error!("Ingest failed: {:?}", e);
+                }
+                Err(e) => {
+                    log::error!("Ingest channel closed: {:?}", e);
+                }
+            }
         }
         info!("Flushing all workers before queries...");
         let mut flush_waiters = Vec::new();

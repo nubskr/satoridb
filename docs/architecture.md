@@ -217,7 +217,7 @@ pub async fn run_worker(
         match msg {
             WorkerMessage::Query(req) => { /* dispatch to executor */ }
             WorkerMessage::Upsert { .. } => { /* append to WAL + update vector index */ }
-            WorkerMessage::Ingest { .. } => { /* batch append + update vector index */ }
+            WorkerMessage::Ingest { respond_to, .. } => { /* batch append + update vector index, ack via respond_to */ }
             ...
         }
     }
