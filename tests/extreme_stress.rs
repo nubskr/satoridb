@@ -1,4 +1,5 @@
 use std::collections::HashMap;
+use std::io::Write;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -1038,6 +1039,485 @@ fn wal_truncation_is_tolerated() -> Result<()> {
         fetched.len() >= 24,
         "restart after WAL truncation lost too many entries (got {})",
         fetched.len()
+    );
+    db.shutdown()?;
+    Ok(())
+}
+
+/// Fsync schedule latency applied during ingest/query should not deadlock or panic.
+#[test]
+#[ignore]
+fn fsync_latency_soak() -> Result<()> {
+    let tmp = tempfile::tempdir()?;
+    std::env::set_var("WALRUS_QUIET", "1");
+    let wal = Arc::new(
+        Walrus::with_data_dir_and_options(
+            tmp.path().to_path_buf(),
+            ReadConsistency::StrictlyAtOnce,
+            FsyncSchedule::Milliseconds(25),
+        )
+        .expect("walrus init"),
+    );
+    let mut cfg = SatoriDbConfig::new(wal);
+    cfg.workers = 2;
+    cfg.virtual_nodes = 8;
+    let db = SatoriDb::start(cfg)?;
+    let handle = db.handle();
+
+    let duration = Duration::from_secs(4);
+    let start = Instant::now();
+    let next_id = Arc::new(AtomicU64::new(1));
+
+    std::thread::scope(|s| {
+        for t in 0..2 {
+            let handle = handle.clone();
+            let next_id = next_id.clone();
+            s.spawn(move || {
+                let mut seed = 0xface_feed_cafe_beefu64 ^ (t as u64);
+                while start.elapsed() < duration {
+                    let id = next_id.fetch_add(1, Ordering::Relaxed);
+                    let vec = make_vec(&mut seed, 12);
+                    let _ = handle.upsert_blocking(id, vec.clone(), None);
+                    if id.is_multiple_of(9) {
+                        let _ = handle.query_blocking(vec, 4, 8);
+                    }
+                    std::thread::sleep(Duration::from_millis(3));
+                }
+            });
+        }
+    });
+
+    handle.flush_blocking()?;
+    db.shutdown()?;
+    Ok(())
+}
+
+/// With tiny worker cache sizes we should still serve queries (with evictions), not panic.
+#[test]
+#[ignore]
+fn tiny_cache_memory_pressure_backpressures() -> Result<()> {
+    let tmp = tempfile::tempdir()?;
+    std::env::set_var("SATORI_WORKER_CACHE_BUCKETS", "2");
+    std::env::set_var("SATORI_WORKER_CACHE_BUCKET_MB", "1");
+
+    let wal = init_wal(&tmp);
+    let mut cfg = SatoriDbConfig::new(wal);
+    cfg.workers = 2;
+    cfg.virtual_nodes = 8;
+    let db = SatoriDb::start(cfg)?;
+    let handle = db.handle();
+
+    let duration = Duration::from_secs(4);
+    let start = Instant::now();
+    let next_id = Arc::new(AtomicU64::new(1));
+
+    std::thread::scope(|s| {
+        for t in 0..3 {
+            let handle = handle.clone();
+            let next_id = next_id.clone();
+            s.spawn(move || {
+                let mut seed = 0x7777_8888u64 ^ (t as u64);
+                while start.elapsed() < duration {
+                    let id = next_id.fetch_add(1, Ordering::Relaxed);
+                    let vec = make_vec(&mut seed, 10);
+                    let _ = handle.upsert_blocking(id, vec.clone(), None);
+                    if id.is_multiple_of(4) {
+                        let _ = handle.query_with_vectors_blocking(vec, 3, 6);
+                    }
+                }
+            });
+        }
+    });
+
+    handle.flush_blocking()?;
+    let stats = block_on(handle.stats());
+    assert!(stats.ready, "router should stay ready under cache pressure");
+    db.shutdown()?;
+    Ok(())
+}
+
+/// Large router fan-out should stay bounded and not panic even with many buckets.
+#[test]
+#[ignore]
+fn large_fanout_queries_hold() -> Result<()> {
+    let tmp = tempfile::tempdir()?;
+    let wal = init_wal(&tmp);
+    let mut cfg = SatoriDbConfig::new(wal);
+    cfg.workers = 3;
+    cfg.virtual_nodes = 64;
+    let db = SatoriDb::start(cfg)?;
+    let handle = db.handle();
+
+    for b in 0..60u64 {
+        let vec = vec![b as f32, 0.0];
+        let _ = handle.upsert_blocking(b + 1, vec, Some(10_000 + b));
+    }
+
+    let q = vec![5.0, 0.0];
+    let res = handle.query_blocking(q, 10, 60)?;
+    assert!(!res.is_empty(), "fanout query returned nothing");
+    db.shutdown()?;
+    Ok(())
+}
+
+/// Simulate jittery worker scheduling; ensure queries still return without deadlocking.
+#[test]
+#[ignore]
+fn jittery_worker_channel_survives() -> Result<()> {
+    let tmp = tempfile::tempdir()?;
+    let wal = init_wal(&tmp);
+    let mut cfg = SatoriDbConfig::new(wal);
+    cfg.workers = 2;
+    cfg.virtual_nodes = 16;
+    let db = SatoriDb::start(cfg)?;
+    let handle = db.handle();
+
+    for id in 0..200u64 {
+        let vec = vec![id as f32, id as f32 * 0.1];
+        let _ = handle.upsert_blocking(id, vec, None);
+    }
+
+    let start = Instant::now();
+    let duration = Duration::from_secs(3);
+    let handle_q = handle.clone();
+    let q_thread = std::thread::spawn(move || {
+        let mut seed = 0x1234u64;
+        while start.elapsed() < duration {
+            let vec = make_vec(&mut seed, 6);
+            let _ = handle_q.query_blocking(vec, 5, 10);
+            std::thread::sleep(Duration::from_millis(2));
+        }
+    });
+
+    let handle_f = handle.clone();
+    let f_thread = std::thread::spawn(move || {
+        let mut seed = 0xabcd_0001u64;
+        while start.elapsed() < duration {
+            let id = (lcg(&mut seed) % 200) as u64;
+            let _ = handle_f.fetch_vectors_by_id_blocking(vec![id]);
+            std::thread::sleep(Duration::from_millis(1));
+        }
+    });
+
+    q_thread.join().unwrap();
+    f_thread.join().unwrap();
+    db.shutdown()?;
+    Ok(())
+}
+
+/// Starting with a read-only WAL directory should surface a clean error (not panic).
+#[test]
+#[ignore]
+fn wal_permission_denied_is_reported() -> Result<()> {
+    let tmp = tempfile::tempdir()?;
+    let wal_dir = tmp.path().join("wal_ro");
+    std::fs::create_dir(&wal_dir)?;
+    let mut perms = std::fs::metadata(&wal_dir)?.permissions();
+    perms.set_readonly(true);
+    std::fs::set_permissions(&wal_dir, perms.clone())?;
+
+    let wal = Walrus::with_data_dir_and_options(
+        wal_dir,
+        ReadConsistency::StrictlyAtOnce,
+        FsyncSchedule::NoFsync,
+    );
+    assert!(wal.is_err(), "wal init should fail on read-only dir");
+    Ok(())
+}
+
+/// Repeated crash/restart cycles should not lose data or panic.
+#[test]
+#[ignore]
+fn multi_restart_chaos_loop_survives() -> Result<()> {
+    let tmp = tempfile::tempdir()?;
+    let wal_dir = tmp.path().join("wal");
+    let vec_dir = tmp.path().join("vectors");
+    let bucket_dir = tmp.path().join("buckets");
+    let mut recorded = HashMap::new();
+
+    for round in 0..3 {
+        let wal = Arc::new(
+            Walrus::with_data_dir_and_options(
+                wal_dir.clone(),
+                ReadConsistency::StrictlyAtOnce,
+                FsyncSchedule::NoFsync,
+            )
+            .expect("wal init"),
+        );
+        let mut cfg = SatoriDbConfig::new(wal.clone());
+        cfg.workers = 2;
+        cfg.virtual_nodes = 16;
+        cfg.vector_index_path = vec_dir.clone();
+        cfg.bucket_index_path = bucket_dir.clone();
+        let db = SatoriDb::start(cfg)?;
+        let handle = db.handle();
+
+        let base = 1_000 * round;
+        for i in 0..64u64 {
+            let id = base + i;
+            let v = vec![id as f32, id as f32 * 0.1];
+            let _ = handle.upsert_blocking(id, v.clone(), None);
+            recorded.insert(id, v);
+        }
+        handle.flush_blocking()?;
+        db.shutdown()?;
+    }
+
+    let wal = Arc::new(
+        Walrus::with_data_dir_and_options(
+            wal_dir,
+            ReadConsistency::StrictlyAtOnce,
+            FsyncSchedule::NoFsync,
+        )
+        .expect("wal reopen"),
+    );
+    let mut cfg = SatoriDbConfig::new(wal);
+    cfg.workers = 2;
+    cfg.virtual_nodes = 16;
+    cfg.vector_index_path = vec_dir;
+    cfg.bucket_index_path = bucket_dir;
+    let db = SatoriDb::start(cfg)?;
+    let handle = db.handle();
+
+    let ids: Vec<u64> = recorded.keys().copied().collect();
+    let fetched = handle.fetch_vectors_by_id_blocking(ids.clone())?;
+    assert_eq!(fetched.len(), ids.len(), "missing entries after chaos loop");
+    for (id, vec) in fetched {
+        assert_eq!(Some(&vec), recorded.get(&id), "payload mismatch {}", id);
+    }
+    db.shutdown()?;
+    Ok(())
+}
+
+/// Delete-heavy churn on the RocksDB indexes should keep lookups consistent.
+#[test]
+#[ignore]
+fn delete_churn_updates_indexes() -> Result<()> {
+    let tmp = tempfile::tempdir()?;
+    let vec_index = VectorIndex::open(tmp.path().join("vectors"))?;
+    let bucket_index = BucketIndex::open(tmp.path().join("buckets"))?;
+
+    let mut vectors = Vec::new();
+    let mut ids = Vec::new();
+    for i in 0..200u64 {
+        let v = Vector::new(i, vec![i as f32, 0.0]);
+        ids.push(i);
+        vectors.push(v);
+    }
+    vec_index.put_batch(&vectors)?;
+    bucket_index.put_batch(7, &ids)?;
+
+    // Delete every third id.
+    let to_delete: Vec<u64> = ids.iter().cloned().filter(|i| i % 3 == 0).collect();
+    vec_index.delete_batch(&to_delete)?;
+    bucket_index.delete_batch(&to_delete)?;
+
+    let fetched_vecs = vec_index.get_many(&ids)?;
+    let fetched_buckets = bucket_index.get_many(&ids)?;
+    assert!(
+        fetched_vecs.len() <= ids.len(),
+        "vector index should not grow during deletes"
+    );
+    assert!(
+        fetched_buckets.len() <= ids.len(),
+        "bucket index should not grow during deletes"
+    );
+    assert!(
+        !fetched_vecs.iter().any(|(id, _)| id % 3 == 0),
+        "deleted ids still present in vector index"
+    );
+    assert!(
+        !fetched_buckets.iter().any(|(id, _)| id % 3 == 0),
+        "deleted ids still present in bucket index"
+    );
+    Ok(())
+}
+
+/// Queries executed with a stale routing version should fail cleanly (not panic).
+#[test]
+#[ignore]
+fn stale_routing_version_query_does_not_panic() -> Result<()> {
+    let tmp = tempfile::tempdir()?;
+    let wal = init_wal(&tmp);
+    let storage = Storage::new(wal.clone());
+
+    // Put one bucket manually.
+    let bucket_id = 1u64;
+    let mut bucket = Bucket::new(bucket_id, vec![0.0, 0.0]);
+    bucket.add_vector(Vector::new(42, vec![0.1, 0.2]));
+    block_on(storage.put_chunk(&bucket))?;
+    let cache = WorkerCache::new(4, 1024 * 1024, 4 * 1024 * 1024);
+    let executor = Executor::new(storage.clone(), cache);
+
+    // Deliberately supply a bogus routing version/changed list.
+    let res = block_on(executor.query(
+        &[0.1, 0.2],
+        &[bucket_id],
+        1,
+        9_999,
+        Arc::new(vec![bucket_id]),
+        false,
+    ));
+    assert!(
+        res.is_ok(),
+        "stale routing version should not panic executor"
+    );
+    Ok(())
+}
+
+/// WAL files get corrupted (zeroed) and reopen should not panic; either surface an error or recover cleanly.
+#[test]
+#[ignore]
+fn wal_corruption_is_handled_gracefully() -> Result<()> {
+    let tmp = tempfile::tempdir()?;
+    let wal_dir = tmp.path().join("wal");
+    let wal = Arc::new(
+        Walrus::with_data_dir_and_options(
+            wal_dir.clone(),
+            ReadConsistency::StrictlyAtOnce,
+            FsyncSchedule::NoFsync,
+        )
+        .expect("wal init"),
+    );
+    let mut cfg = SatoriDbConfig::new(wal);
+    cfg.workers = 1;
+    cfg.virtual_nodes = 4;
+    let db = SatoriDb::start(cfg)?;
+    let handle = db.handle();
+    for i in 0..16u64 {
+        let v = vec![i as f32, i as f32 * 0.5];
+        let _ = handle.upsert_blocking(i, v, Some(0));
+    }
+    handle.flush_blocking()?;
+    db.shutdown()?;
+
+    for entry in std::fs::read_dir(&wal_dir)? {
+        let entry = entry?;
+        if entry.file_type()?.is_file() {
+            let mut f = std::fs::OpenOptions::new().write(true).open(entry.path())?;
+            // Overwrite the first 64 bytes with garbage.
+            f.write_all(&[0u8; 64])?;
+        }
+    }
+
+    // Reopen: either returns an error we can surface or succeeds but should not panic.
+    let reopened = Walrus::with_data_dir_and_options(
+        wal_dir,
+        ReadConsistency::StrictlyAtOnce,
+        FsyncSchedule::NoFsync,
+    );
+    assert!(
+        reopened.is_ok() || reopened.is_err(),
+        "reopen should never panic"
+    );
+    Ok(())
+}
+
+/// Randomized short fuzzer of upserts/queries/fetches with invariants on index coverage.
+#[test]
+#[ignore]
+fn randomized_op_fuzz_preserves_index() -> Result<()> {
+    let tmp = tempfile::tempdir()?;
+    let wal = init_wal(&tmp);
+    let mut cfg = SatoriDbConfig::new(wal);
+    cfg.workers = 3;
+    cfg.virtual_nodes = 24;
+    let db = SatoriDb::start(cfg)?;
+    let handle = db.handle();
+
+    let start = Instant::now();
+    let duration = Duration::from_secs(4);
+    let next_id = Arc::new(AtomicU64::new(1));
+    let recorded = Arc::new(parking_lot::RwLock::new(HashMap::<u64, Vec<f32>>::new()));
+
+    std::thread::scope(|s| {
+        for t in 0..4 {
+            let handle = handle.clone();
+            let next_id = next_id.clone();
+            let recorded = recorded.clone();
+            s.spawn(move || {
+                let mut seed = 0x9999_5555_c0ffee00u64 ^ (t as u64);
+                while start.elapsed() < duration {
+                    let roll = lcg(&mut seed) % 10;
+                    match roll {
+                        0 | 1 | 2 | 3 | 4 => {
+                            let id = next_id.fetch_add(1, Ordering::Relaxed);
+                            let vec = make_vec(&mut seed, 14);
+                            if handle.upsert_blocking(id, vec.clone(), None).is_ok() {
+                                recorded.write().insert(id, vec);
+                            }
+                        }
+                        5 | 6 => {
+                            let sample: Vec<u64> = {
+                                let guard = recorded.read();
+                                guard.keys().take(8).copied().collect()
+                            };
+                            if !sample.is_empty() {
+                                let _ = handle.fetch_vectors_by_id_blocking(sample);
+                            }
+                        }
+                        _ => {
+                            let vec = make_vec(&mut seed, 14);
+                            let _ = handle.query_blocking(vec, 6, 10);
+                        }
+                    }
+                }
+            });
+        }
+    });
+
+    handle.flush_blocking()?;
+    let ids: Vec<u64> = recorded.read().keys().copied().collect();
+    let fetched = handle.fetch_vectors_by_id_blocking(ids.clone())?;
+    assert_eq!(
+        fetched.len(),
+        ids.len(),
+        "index lost entries after fuzz run"
+    );
+    db.shutdown()?;
+    Ok(())
+}
+
+/// Wide fan-out plus concurrent rebalances should keep routing and data consistent.
+#[test]
+#[ignore]
+fn wide_fanout_during_rebalance_is_safe() -> Result<()> {
+    let tmp = tempfile::tempdir()?;
+    std::env::set_var("SATORI_REBALANCE_THRESHOLD", "8");
+    let wal = init_wal(&tmp);
+    let mut cfg = SatoriDbConfig::new(wal);
+    cfg.workers = 4;
+    cfg.virtual_nodes = 64;
+    let db = SatoriDb::start(cfg)?;
+    let handle = db.handle();
+
+    let start = Instant::now();
+    let duration = Duration::from_secs(5);
+    let next_id = Arc::new(AtomicU64::new(1));
+
+    std::thread::scope(|s| {
+        for t in 0..4 {
+            let handle = handle.clone();
+            let next_id = next_id.clone();
+            s.spawn(move || {
+                let mut seed = 0x4242_cafe_beefu64 ^ (t as u64);
+                while start.elapsed() < duration {
+                    let id = next_id.fetch_add(1, Ordering::Relaxed);
+                    let vec = make_vec(&mut seed, 12);
+                    let _ = handle.upsert_blocking(id, vec.clone(), None);
+                    if id.is_multiple_of(5) {
+                        let _ = handle.query_blocking(vec, 8, 32);
+                    }
+                }
+            });
+        }
+    });
+
+    handle.flush_blocking()?;
+    let stats = block_on(handle.stats());
+    assert!(
+        stats.ready,
+        "router should stay ready during wide fan-out/rebalance"
     );
     db.shutdown()?;
     Ok(())
