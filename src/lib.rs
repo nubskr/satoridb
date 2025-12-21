@@ -59,6 +59,8 @@ pub mod quantizer;
 #[doc(hidden)]
 pub mod rebalancer;
 #[doc(hidden)]
+pub mod rng;
+#[doc(hidden)]
 pub mod router;
 #[doc(hidden)]
 pub mod router_hnsw;

@@ -1,5 +1,4 @@
-use rand::rngs::StdRng;
-use rand::{Rng, SeedableRng};
+use crate::rng::SplitMix64;
 use smallvec::SmallVec;
 use std::cmp::Ordering;
 use std::collections::BinaryHeap;
@@ -28,7 +27,7 @@ pub struct HnswIndex {
 
     entry: Option<usize>,
     max_level: i32,
-    rng: StdRng,
+    rng: SplitMix64,
 
     // Dispatch chosen once per index to avoid per-call CPUID branching.
     dot_fn: DotFn,
@@ -55,7 +54,7 @@ impl HnswIndex {
 
             entry: None,
             max_level: -1,
-            rng: StdRng::seed_from_u64(0x0BAD_5EED),
+            rng: SplitMix64::with_seed(0x0BAD_5EED),
 
             dot_fn,
             center_fn,
@@ -572,7 +571,7 @@ impl HnswIndex {
         const P: f32 = 0.25;
         const MAX_LEVEL: i32 = 12;
         let mut level = 0;
-        while self.rng.gen::<f32>() < P && level < MAX_LEVEL {
+        while self.rng.next_f32() < P && level < MAX_LEVEL {
             level += 1;
         }
         level

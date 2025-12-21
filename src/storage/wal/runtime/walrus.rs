@@ -556,12 +556,17 @@ impl Walrus {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use rand::random;
     use std::fs;
     use std::path::Path;
 
     fn unique_key() -> String {
-        format!("topic_clean_test_{}", random::<u64>())
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_nanos() as u64)
+            .unwrap_or(0);
+        static COUNTER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        let c = COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        format!("topic_clean_test_{}_{}", nanos, c)
     }
 
     fn cleanup_key(key: &str) {

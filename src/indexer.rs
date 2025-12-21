@@ -1,7 +1,6 @@
+use crate::rng::{sample_k_indices, shuffle, SplitMix64};
 use crate::storage::{Bucket, Vector};
 use log::debug;
-use rand::prelude::*;
-use rand::seq::SliceRandom;
 
 pub struct Indexer;
 
@@ -73,7 +72,7 @@ impl Indexer {
             return vec![];
         }
 
-        let mut rng = rand::thread_rng();
+        let rng = SplitMix64::seeded_from_time();
 
         // Detect SIMD once. Never do is_x86_feature_detected!() inside the inner loops.
         let simd = SimdCaps::detect();
@@ -114,21 +113,16 @@ impl Indexer {
                 centroids[dim..2 * dim].copy_from_slice(&vectors[b].data);
             }
             _ => {
-                let chosen: Vec<&Vector> = vectors.choose_multiple(&mut rng, k).collect();
-                let mut c = 0usize;
-
-                for v in chosen {
-                    centroids[c * dim..(c + 1) * dim].copy_from_slice(&v.data);
-                    c += 1;
+                let mut chosen_idx = sample_k_indices(&rng, vectors.len(), k);
+                shuffle(&rng, &mut chosen_idx);
+                for (c, idx) in chosen_idx.into_iter().take(k).enumerate() {
+                    centroids[c * dim..(c + 1) * dim].copy_from_slice(&vectors[idx].data);
                 }
-
-                while c < k {
-                    // fallback: random centroid
+                for c in vectors.len()..k {
                     let base = c * dim;
                     for d in 0..dim {
-                        centroids[base + d] = rng.gen::<f32>();
+                        centroids[base + d] = rng.next_f32();
                     }
-                    c += 1;
                 }
             }
         }
@@ -202,12 +196,10 @@ impl Indexer {
                     for d in 0..dim {
                         centroids[base + d] = sums[base + d] * inv;
                     }
-                } else {
-                    // Re-seed empty cluster
-                    if let Some(v) = vectors.choose(&mut rng) {
-                        centroids[j * dim..(j + 1) * dim].copy_from_slice(&v.data);
-                        reseeded = true;
-                    }
+                } else if !vectors.is_empty() {
+                    let idx = rng.gen_range(vectors.len());
+                    centroids[j * dim..(j + 1) * dim].copy_from_slice(&vectors[idx].data);
+                    reseeded = true;
                 }
             }
 

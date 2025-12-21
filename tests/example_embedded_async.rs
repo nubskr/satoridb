@@ -1,6 +1,5 @@
 use std::sync::Arc;
 
-use futures::executor::block_on;
 use satoridb::wal::runtime::Walrus;
 use satoridb::wal::{FsyncSchedule, ReadConsistency};
 use satoridb::{SatoriDb, SatoriDbConfig};
@@ -26,7 +25,7 @@ fn embedded_async_example_works() {
     let db = SatoriDb::start(cfg).expect("db start");
     let api = db.handle();
 
-    block_on(async {
+    futures::executor::block_on(async {
         api.upsert(42, vec![0.05, 0.05, 0.05], Some(7))
             .await
             .expect("upsert with hint");
