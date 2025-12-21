@@ -2,7 +2,7 @@
 
 All notable changes to SatoriDB will be documented in this file.
 
-## [0.1.0] - 2024-12-21
+## [0.1.0] - 2025-12-21
 
 Initial release.
 
