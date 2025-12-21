@@ -167,8 +167,13 @@ fn rebalance_split_under_fire() -> Result<()> {
         seed_bucket.add_vector(Vector::new(i, vec![i as f32, i as f32 + 0.25]));
     }
     block_on(storage.put_chunk(&seed_bucket))?;
-    let rebalance =
-        RebalanceWorker::spawn(storage.clone(), routing.clone(), None, bucket_locks.clone());
+    let rebalance = RebalanceWorker::spawn(
+        storage.clone(),
+        bucket_index.clone(),
+        routing.clone(),
+        None,
+        bucket_locks.clone(),
+    );
     block_on(rebalance.prime_centroids(&[seed_bucket]))?;
 
     let (tx, rx) = unbounded();
@@ -676,8 +681,13 @@ fn fetches_remain_consistent_during_rebalance() -> Result<()> {
         b.add_vector(Vector::new(i, vec![i as f32, i as f32 * 0.5]));
     }
     block_on(storage.put_chunk(&b))?;
-    let rebalance =
-        RebalanceWorker::spawn(storage.clone(), routing.clone(), None, bucket_locks.clone());
+    let rebalance = RebalanceWorker::spawn(
+        storage.clone(),
+        bucket_index.clone(),
+        routing.clone(),
+        None,
+        bucket_locks.clone(),
+    );
     block_on(rebalance.prime_centroids(&[b]))?;
 
     let (tx, rx) = unbounded();

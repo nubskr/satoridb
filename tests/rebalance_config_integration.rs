@@ -2,6 +2,7 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use anyhow::Result;
+use satoridb::bucket_index::BucketIndex;
 use satoridb::bucket_locks::BucketLocks;
 use satoridb::rebalancer::RebalanceWorker;
 use satoridb::router::RoutingTable;
@@ -32,10 +33,17 @@ fn rebalance_respects_target_size_threshold() -> Result<()> {
 
     let tmp = tempfile::tempdir()?;
     let wal = init_wal(&tmp);
+    let bucket_index = Arc::new(BucketIndex::open(tmp.path().join("buckets"))?);
     let storage = Storage::new(wal);
     let routing = Arc::new(RoutingTable::new());
     let bucket_locks = Arc::new(BucketLocks::new());
-    let worker = RebalanceWorker::spawn(storage.clone(), routing.clone(), None, bucket_locks);
+    let worker = RebalanceWorker::spawn(
+        storage.clone(),
+        bucket_index,
+        routing.clone(),
+        None,
+        bucket_locks,
+    );
 
     // Build a bucket just over a custom target size.
     let target = 20;

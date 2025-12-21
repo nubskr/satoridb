@@ -1,3 +1,4 @@
+use crate::bucket_index::BucketIndex;
 use crate::bucket_locks::BucketLocks;
 use crate::indexer::Indexer;
 use crate::ingest_counter;
@@ -48,6 +49,7 @@ fn should_fail(kind: RebalanceTaskKind) -> bool {
 
 pub(crate) struct RebalanceState {
     storage: Storage,
+    bucket_index: Arc<BucketIndex>,
     wal: Arc<Walrus>,
     routing: Arc<RoutingTable>,
     centroids: RwLock<HashMap<u64, Vec<f32>>>,
@@ -58,10 +60,16 @@ pub(crate) struct RebalanceState {
 }
 
 impl RebalanceState {
-    fn new(storage: Storage, routing: Arc<RoutingTable>, bucket_locks: Arc<BucketLocks>) -> Self {
+    fn new(
+        storage: Storage,
+        bucket_index: Arc<BucketIndex>,
+        routing: Arc<RoutingTable>,
+        bucket_locks: Arc<BucketLocks>,
+    ) -> Self {
         Self {
             wal: storage.wal.clone(),
             storage,
+            bucket_index,
             routing,
             centroids: RwLock::new(HashMap::new()),
             bucket_sizes: RwLock::new(HashMap::new()),
@@ -276,6 +284,7 @@ impl RebalanceState {
 
         // 3. Persist New Buckets
         let mut new_entries = Vec::new();
+        let mut bucket_index_updates = Vec::new();
         for mut split in splits {
             let new_id = self.allocate_bucket_id();
             split.id = new_id;
@@ -290,11 +299,23 @@ impl RebalanceState {
                 bucket_id: new_id,
                 status: BucketMetaStatus::Active,
             }));
+            let ids: Vec<u64> = split.vectors.iter().map(|v| v.id).collect();
+            bucket_index_updates.push((new_id, ids));
             new_entries.push((new_id, split.centroid, split.vectors.len()));
         }
 
         if new_entries.is_empty() {
             return;
+        }
+
+        // 4b. Update bucket index mappings for the split vectors.
+        for (id, ids) in bucket_index_updates {
+            if let Err(e) = self.bucket_index.put_batch(id, &ids) {
+                error!(
+                    "rebalance: failed to update bucket index for split bucket {}: {:?}",
+                    id, e
+                );
+            }
         }
 
         // 4. Retire Old Bucket & Update Router
@@ -335,11 +356,17 @@ pub struct RebalanceWorker {
 impl RebalanceWorker {
     pub fn spawn(
         storage: Storage,
+        bucket_index: Arc<BucketIndex>,
         routing: Arc<RoutingTable>,
         pin_cpu: Option<usize>,
         bucket_locks: Arc<BucketLocks>,
     ) -> Self {
-        let state = Arc::new(RebalanceState::new(storage, routing, bucket_locks));
+        let state = Arc::new(RebalanceState::new(
+            storage,
+            bucket_index,
+            routing,
+            bucket_locks,
+        ));
         let state_clone = state.clone();
         let name = "rebalance-loop".to_string();
 

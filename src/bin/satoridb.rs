@@ -241,6 +241,7 @@ fn main() -> anyhow::Result<()> {
     let router_shared = Arc::new(RoutingTable::new());
     let rebalance_worker = RebalanceWorker::spawn(
         Storage::new(wal.clone()),
+        bucket_index.clone(),
         router_shared.clone(),
         rebalance_core,
         bucket_locks.clone(),
