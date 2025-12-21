@@ -22,7 +22,7 @@ fn executor_handles_concurrent_queries_and_version_bumps() -> Result<()> {
     let storage = Storage::new(wal.clone());
 
     // Seed bucket 0 with an initial far vector.
-    let cache = WorkerCache::new(16, usize::MAX);
+    let cache = WorkerCache::new(16, 1024 * 1024, 1024 * 1024);
     let executor = Arc::new(Executor::new(storage.clone(), cache));
     let base_vec = Vector::new(1, vec![0.0, 0.0]);
     block_on(storage.put_chunk_raw(0, &[base_vec]))?;

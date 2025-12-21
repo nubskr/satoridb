@@ -45,7 +45,10 @@ fn flat_reader_round_trips_through_storage_and_executor() -> Result<()> {
     block_on(storage.put_chunk_raw(0, &vectors))?;
 
     // Query through executor to ensure decode path returns the same IDs.
-    let executor = Executor::new(storage.clone(), WorkerCache::new(4, usize::MAX));
+    let executor = Executor::new(
+        storage.clone(),
+        WorkerCache::new(4, 1024 * 1024, 1024 * 1024),
+    );
     let res = block_on(executor.query(&[0.0f32; 3], &[0], 10, 0, Arc::new(Vec::new()), false))?;
     let ids: Vec<u64> = res.iter().map(|(id, _, _)| *id).collect();
     assert_eq!(ids.len(), vectors.len());
@@ -84,7 +87,10 @@ fn bvecs_reader_round_trip_pipeline() -> Result<()> {
     let storage = Storage::new(wal);
     block_on(storage.put_chunk_raw(0, &vectors))?;
 
-    let executor = Executor::new(storage.clone(), WorkerCache::new(4, usize::MAX));
+    let executor = Executor::new(
+        storage.clone(),
+        WorkerCache::new(4, 1024 * 1024, 1024 * 1024),
+    );
     let res = block_on(executor.query(&[0.0, 0.0], &[0], 10, 0, Arc::new(Vec::new()), false))?;
     let ids: Vec<u64> = res.iter().map(|(id, _, _)| *id).collect();
     assert_eq!(ids.len(), 2);
@@ -120,7 +126,10 @@ fn fvecs_reader_round_trip_pipeline() -> Result<()> {
     let storage = Storage::new(wal);
     block_on(storage.put_chunk_raw(0, &vectors))?;
 
-    let executor = Executor::new(storage.clone(), WorkerCache::new(4, usize::MAX));
+    let executor = Executor::new(
+        storage.clone(),
+        WorkerCache::new(4, 1024 * 1024, 1024 * 1024),
+    );
     let res = block_on(executor.query(&[0.0, 0.0, 0.0], &[0], 10, 0, Arc::new(Vec::new()), false))?;
     let ids: Vec<u64> = res.iter().map(|(id, _, _)| *id).collect();
     assert_eq!(ids.len(), 2);

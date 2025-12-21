@@ -63,7 +63,10 @@ fn split_updates_routing_and_executor_results() -> Result<()> {
     );
 
     // Use executor to query near cluster A and ensure we get the small ids.
-    let executor = Executor::new(storage.clone(), WorkerCache::new(8, usize::MAX));
+    let executor = Executor::new(
+        storage.clone(),
+        WorkerCache::new(8, 1024 * 1024, 1024 * 1024),
+    );
     let bucket_ids = snap.router.query(&[0.0, 0.0], 2)?;
     let sizes = worker.snapshot_sizes();
     let total_after: usize = sizes.values().sum();

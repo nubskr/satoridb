@@ -202,7 +202,7 @@ Each worker runs on a dedicated thread with a Glommio async executor (`worker.rs
 ```rust
 pub async fn run_worker(id: usize, receiver: Receiver<WorkerMessage>, wal: Arc<Walrus>) {
     let storage = Storage::new(wal.clone());
-    let cache = WorkerCache::new(512, 64 * 1024 * 1024);  // 512 buckets, 64MB each
+    let cache = WorkerCache::new(64, 64 * 1024 * 1024, 64 * 64 * 1024 * 1024);  // prealloc 64 buckets × 64MB each
     let executor = Rc::new(Executor::new(storage, cache));
 
     // Semaphore for concurrency control (max 32 concurrent ops)

@@ -46,7 +46,10 @@ fn storage_executor_pipeline_finds_nearest_vectors() -> Result<()> {
     let snap = routing.snapshot().expect("router installed");
 
     // Executor should route each query to the correct cluster and fetch from WAL.
-    let executor = Executor::new(storage.clone(), WorkerCache::new(8, usize::MAX));
+    let executor = Executor::new(
+        storage.clone(),
+        WorkerCache::new(8, 1024 * 1024, 1024 * 1024),
+    );
 
     let res_a = block_on(executor.query(
         &[0.05, 0.05],
@@ -95,7 +98,10 @@ fn storage_put_and_read_keeps_all_vectors() -> Result<()> {
     block_on(storage.put_chunk(&bucket))?;
 
     // Re-read via executor, which exercises the decoding path used in production.
-    let executor = Executor::new(storage.clone(), WorkerCache::new(4, usize::MAX));
+    let executor = Executor::new(
+        storage.clone(),
+        WorkerCache::new(4, 1024 * 1024, 1024 * 1024),
+    );
     let res = block_on(executor.query(
         &[0.0, 0.0],
         &[bucket.id],

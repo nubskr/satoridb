@@ -74,7 +74,7 @@ fn executor_cache_survives_version_churn() -> Result<()> {
     let tmp = tempfile::tempdir()?;
     let wal = init_wal(&tmp);
     let storage = Storage::new(wal);
-    let cache = WorkerCache::new(32, 4 * 1024 * 1024);
+    let cache = WorkerCache::new(32, 4 * 1024 * 1024, usize::MAX);
     let executor = Arc::new(Executor::new(storage.clone(), cache));
 
     // Seed a few buckets.
@@ -137,7 +137,7 @@ fn executor_load_failures_do_not_panic() -> Result<()> {
     let tmp = tempfile::tempdir()?;
     let wal = init_wal(&tmp);
     let storage = Storage::new(wal);
-    let cache = WorkerCache::new(8, 2 * 1024 * 1024);
+    let cache = WorkerCache::new(8, 2 * 1024 * 1024, usize::MAX);
     let executor = Executor::new(storage.clone(), cache);
 
     // Seed one bucket.

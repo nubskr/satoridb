@@ -28,7 +28,7 @@ fn oversized_bucket_is_not_cached() -> Result<()> {
     }
     block_on(storage.put_chunk_raw(0, &big_vectors))?;
 
-    let cache = WorkerCache::new(4, 2 * 1024); // 2 KB max per bucket; bucket 0 should not cache.
+    let cache = WorkerCache::new(4, 2 * 1024, usize::MAX); // 2 KB max per bucket; bucket 0 should not cache.
     let executor = Executor::new(storage.clone(), cache);
 
     let q = vec![0.0f32; 1024];
@@ -59,7 +59,7 @@ fn small_bucket_stays_cached_until_version_bump() -> Result<()> {
     let v0 = Vector::new(1, vec![0.0f32; 4]);
     block_on(storage.put_chunk_raw(1, &[v0]))?;
 
-    let cache = WorkerCache::new(4, 16 * 1024);
+    let cache = WorkerCache::new(4, 16 * 1024, usize::MAX);
     let executor = Executor::new(storage.clone(), cache);
 
     let q = vec![0.0f32; 4];

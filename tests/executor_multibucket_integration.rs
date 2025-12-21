@@ -33,7 +33,7 @@ fn executor_across_buckets_returns_global_topk() -> Result<()> {
     ];
     block_on(storage.put_chunk_raw(1, &near))?;
 
-    let cache = WorkerCache::new(4, 64 * 1024);
+    let cache = WorkerCache::new(4, 64 * 1024, usize::MAX);
     let executor = Executor::new(storage.clone(), cache);
 
     let query = vec![1.0, 1.0];
@@ -56,7 +56,7 @@ fn executor_handles_missing_bucket_gracefully() -> Result<()> {
     let wal = init_wal(&tmp);
     let storage = Storage::new(wal);
 
-    let cache = WorkerCache::new(2, 8 * 1024);
+    let cache = WorkerCache::new(2, 8 * 1024, usize::MAX);
     let executor = Executor::new(storage.clone(), cache);
 
     let query = vec![0.0f32, 0.0f32];

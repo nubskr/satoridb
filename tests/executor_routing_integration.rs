@@ -19,7 +19,7 @@ fn executor_respects_routing_versions_and_cache_invalidation() -> Result<()> {
     let storage = Storage::new(wal);
 
     // Seed bucket 0 with a single far-away vector and warm the executor cache.
-    let cache = WorkerCache::new(8, usize::MAX);
+    let cache = WorkerCache::new(8, 1024 * 1024, 1024 * 1024);
     let executor = Executor::new(storage.clone(), cache);
     let v1 = Vector::new(1, vec![0.0, 0.0]);
     block_on(storage.put_chunk_raw(0, &[v1]))?;

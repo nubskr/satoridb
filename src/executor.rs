@@ -1,10 +1,7 @@
 use crate::storage::{Storage, Vector};
 use anyhow::Result;
-use lru::LruCache;
 use parking_lot::Mutex;
-use std::collections::HashSet;
-use std::convert::TryInto;
-use std::num::NonZeroUsize;
+use std::collections::{HashMap, HashSet};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::sync::Mutex as StdMutex;
@@ -14,11 +11,6 @@ pub struct Executor {
     cache: Mutex<WorkerCache>,
     cache_version: AtomicU64,
     last_changed: Mutex<Arc<Vec<u64>>>,
-}
-
-pub(crate) struct CachedBucket {
-    vectors: Vec<Vector>,
-    byte_size: usize,
 }
 
 type FailLoadHook = Arc<dyn Fn(u64) -> bool + Send + Sync>;
@@ -36,38 +28,216 @@ pub fn clear_executor_fail_load_hook() {
     *FAIL_LOAD_HOOK.lock().expect("fail hook poisoned") = None;
 }
 
+#[derive(Clone, Copy, Debug)]
+struct Link {
+    prev: Option<usize>,
+    next: Option<usize>,
+}
+
+#[derive(Debug)]
+struct Slot {
+    key: u64,
+    occupied: bool,
+    link: Link,
+    off: usize,
+    len: usize,
+}
+
 pub struct WorkerCache {
-    buckets: LruCache<u64, CachedBucket>,
+    slots: Vec<Slot>,
+    map: HashMap<u64, usize>,
+    head: Option<usize>,
+    tail: Option<usize>,
+    free: Vec<usize>,
+    arena: Vec<u8>,
     bucket_max_bytes: usize,
 }
 
 impl WorkerCache {
-    pub fn new(max_buckets: usize, bucket_max_bytes: usize) -> Self {
-        let cap = NonZeroUsize::new(max_buckets.max(1)).unwrap();
+    pub fn new(max_buckets: usize, bucket_max_bytes: usize, _total_max_bytes: usize) -> Self {
+        let max_buckets = max_buckets.max(1);
+        let bucket_max_bytes = bucket_max_bytes.max(1);
+        let arena_bytes = max_buckets
+            .checked_mul(bucket_max_bytes)
+            .expect("arena too large");
+        let arena = vec![0u8; arena_bytes];
+
+        let mut slots = Vec::with_capacity(max_buckets);
+        for i in 0..max_buckets {
+            slots.push(Slot {
+                key: 0,
+                occupied: false,
+                link: Link {
+                    prev: None,
+                    next: None,
+                },
+                off: i * bucket_max_bytes,
+                len: 0,
+            });
+        }
+
+        let mut free = Vec::with_capacity(max_buckets);
+        for i in (0..max_buckets).rev() {
+            free.push(i);
+        }
+
+        let map = HashMap::with_capacity((max_buckets * 2).max(16));
+
         Self {
-            buckets: LruCache::new(cap),
+            slots,
+            map,
+            head: None,
+            tail: None,
+            free,
+            arena,
             bucket_max_bytes,
         }
     }
 
-    fn get(&mut self, bucket_id: u64) -> Option<&CachedBucket> {
-        self.buckets.get(&bucket_id)
+    fn get(&mut self, bucket_id: u64) -> Option<&[u8]> {
+        let idx = *self.map.get(&bucket_id)?;
+        self.touch(idx);
+        let slot = &self.slots[idx];
+        Some(&self.arena[slot.off..slot.off + slot.len])
     }
 
-    fn put(&mut self, bucket_id: u64, bucket: CachedBucket) {
-        if bucket.byte_size <= self.bucket_max_bytes {
-            self.buckets.put(bucket_id, bucket);
+    #[cfg(test)]
+    fn put_bytes(&mut self, bucket_id: u64, data: &[u8]) -> Option<&[u8]> {
+        if data.is_empty() || data.len() > self.bucket_max_bytes {
+            return None;
         }
+        let idx = self.prepare_slot(bucket_id);
+        let slot = &mut self.slots[idx];
+        let start = slot.off;
+        let end = start + data.len();
+        self.arena[start..end].copy_from_slice(data);
+        slot.len = data.len();
+        slot.key = bucket_id;
+        slot.occupied = true;
+        Some(&self.arena[self.slots[idx].off..self.slots[idx].off + self.slots[idx].len])
+    }
+
+    fn put_from_chunks(&mut self, bucket_id: u64, chunks: &[Vec<u8>]) -> Option<&[u8]> {
+        let total: usize = chunks.iter().map(|c| c.len()).sum();
+        if total == 0 || total > self.bucket_max_bytes {
+            return None;
+        }
+
+        let idx = self.prepare_slot(bucket_id);
+        let mut write_off = self.slots[idx].off;
+        for chunk in chunks {
+            let end = write_off + chunk.len();
+            self.arena[write_off..end].copy_from_slice(chunk);
+            write_off = end;
+        }
+        self.slots[idx].len = total;
+        Some(&self.arena[self.slots[idx].off..self.slots[idx].off + self.slots[idx].len])
     }
 
     fn clear(&mut self) {
-        self.buckets.clear();
+        self.map.clear();
+        self.head = None;
+        self.tail = None;
+        self.free.clear();
+
+        for (i, slot) in self.slots.iter_mut().enumerate() {
+            slot.occupied = false;
+            slot.key = 0;
+            slot.len = 0;
+            slot.link = Link {
+                prev: None,
+                next: None,
+            };
+            self.free.push(i);
+        }
     }
 
     fn invalidate_many(&mut self, ids: &[u64]) {
         for id in ids {
-            self.buckets.pop(id);
+            if let Some(idx) = self.map.remove(id) {
+                self.detach(idx);
+                let slot = &mut self.slots[idx];
+                slot.occupied = false;
+                slot.key = 0;
+                slot.len = 0;
+                self.free.push(idx);
+            }
         }
+    }
+
+    fn prepare_slot(&mut self, bucket_id: u64) -> usize {
+        if let Some(&idx) = self.map.get(&bucket_id) {
+            self.touch(idx);
+            return idx;
+        }
+
+        let idx = if let Some(idx) = self.free.pop() {
+            idx
+        } else {
+            let victim = self.tail.expect("cache has no tail on eviction");
+            self.evict_slot(victim);
+            victim
+        };
+
+        self.slots[idx].occupied = true;
+        self.slots[idx].key = bucket_id;
+        self.slots[idx].len = 0;
+        self.attach_head(idx);
+        self.map.insert(bucket_id, idx);
+        idx
+    }
+
+    fn evict_slot(&mut self, idx: usize) {
+        if self.slots[idx].occupied {
+            self.map.remove(&self.slots[idx].key);
+        }
+        self.detach(idx);
+        self.slots[idx].occupied = false;
+        self.slots[idx].key = 0;
+        self.slots[idx].len = 0;
+    }
+
+    fn touch(&mut self, idx: usize) {
+        if self.head == Some(idx) {
+            return;
+        }
+        self.detach(idx);
+        self.attach_head(idx);
+    }
+
+    fn attach_head(&mut self, idx: usize) {
+        self.slots[idx].link.prev = None;
+        self.slots[idx].link.next = self.head;
+
+        if let Some(h) = self.head {
+            self.slots[h].link.prev = Some(idx);
+        } else {
+            self.tail = Some(idx);
+        }
+
+        self.head = Some(idx);
+    }
+
+    fn detach(&mut self, idx: usize) {
+        let (p, n) = {
+            let l = self.slots[idx].link;
+            (l.prev, l.next)
+        };
+
+        if let Some(prev) = p {
+            self.slots[prev].link.next = n;
+        } else if self.head == Some(idx) {
+            self.head = n;
+        }
+
+        if let Some(next) = n {
+            self.slots[next].link.prev = p;
+        } else if self.tail == Some(idx) {
+            self.tail = p;
+        }
+
+        self.slots[idx].link.prev = None;
+        self.slots[idx].link.next = None;
     }
 }
 
@@ -93,77 +263,34 @@ impl Executor {
         }
 
         // Try cache first
-        if let Some(cached_vectors) = {
+        if let Some(hits) = {
             let mut cache = self.cache.lock();
-            cache.get(bucket_id).map(|b| b.vectors.clone())
+            cache
+                .get(bucket_id)
+                .map(|data| collect_vectors_from_slice(data, &wanted))
         } {
-            let hits = cached_vectors
-                .into_iter()
-                .filter(|v| wanted.contains(&v.id))
-                .collect();
             return Ok(hits);
         }
 
         // Load and populate cache
-        let loaded = self.load_bucket(bucket_id).await?;
-        let hits = loaded
-            .vectors
-            .iter()
-            .filter(|v| wanted.contains(&v.id))
-            .cloned()
-            .collect::<Vec<_>>();
+        let chunks = self.load_bucket_chunks(bucket_id).await?;
+        let hits = collect_vectors_from_chunks(&chunks, &wanted);
 
-        let mut cache = self.cache.lock();
-        cache.put(bucket_id, loaded);
+        if !chunks.is_empty() {
+            let mut cache = self.cache.lock();
+            let _ = cache.put_from_chunks(bucket_id, &chunks);
+        }
 
         Ok(hits)
     }
 
-    pub(crate) async fn load_bucket(&self, bucket_id: u64) -> Result<CachedBucket> {
+    pub(crate) async fn load_bucket_chunks(&self, bucket_id: u64) -> Result<Vec<Vec<u8>>> {
         if let Some(h) = FAIL_LOAD_HOOK.lock().expect("fail hook poisoned").as_ref() {
             if h(bucket_id) {
                 anyhow::bail!("executor load hook injected failure");
             }
         }
-        let chunks = self.storage.get_chunks(bucket_id).await.unwrap_or_default();
-        let mut vectors = Vec::new();
-        let mut total_bytes = 0usize;
-
-        for chunk in chunks {
-            total_bytes += chunk.len();
-            if chunk.len() < 8 {
-                continue;
-            }
-            let len_bytes: [u8; 8] = chunk[0..8].try_into().unwrap_or([0; 8]);
-            let archive_len = u64::from_le_bytes(len_bytes) as usize;
-
-            if 8 + archive_len > chunk.len() || archive_len < 16 {
-                continue;
-            }
-            let data_slice = &chunk[8..8 + archive_len];
-            // Format: [id: u64][len: u64][data: len * f32]
-            if data_slice.len() < 16 {
-                continue;
-            }
-            let id = u64::from_le_bytes(data_slice[0..8].try_into().unwrap_or([0; 8]));
-            let count = u64::from_le_bytes(data_slice[8..16].try_into().unwrap_or([0; 8])) as usize;
-            if 16 + count * 4 > data_slice.len() {
-                continue;
-            }
-            let mut data = Vec::with_capacity(count);
-            let mut offset = 16;
-            for _ in 0..count {
-                let bytes: [u8; 4] = data_slice[offset..offset + 4].try_into().unwrap_or([0; 4]);
-                data.push(f32::from_bits(u32::from_le_bytes(bytes)));
-                offset += 4;
-            }
-            vectors.push(Vector { id, data });
-        }
-
-        Ok(CachedBucket {
-            vectors,
-            byte_size: total_bytes,
-        })
+        Ok(self.storage.get_chunks(bucket_id).await.unwrap_or_default())
     }
 
     pub async fn query(
@@ -187,42 +314,41 @@ impl Executor {
         }
 
         let mut candidates: Vec<(u64, f32, Option<Vec<f32>>)> = Vec::new();
-        let mut push_candidate = |vector: &Vector| {
-            if vector.data.len() != query_vec.len() {
-                return;
-            }
-            let dist = l2_distance_f32(&vector.data, query_vec);
-            let payload = if include_vectors {
-                Some(vector.data.clone())
-            } else {
-                None
-            };
-            candidates.push((vector.id, dist, payload));
-        };
 
         for &id in bucket_ids {
             // First try cache under a short lock.
-            let cached_vectors = {
+            let mut handled = false;
+            {
                 let mut cache = self.cache.lock();
-                cache.get(id).map(|c| c.vectors.clone())
-            };
-
-            if let Some(vectors) = cached_vectors {
-                for vector in &vectors {
-                    push_candidate(vector);
+                if let Some(data) = cache.get(id) {
+                    scan_bucket_slice(data, query_vec, include_vectors, &mut candidates);
+                    handled = true;
                 }
+            }
+
+            if handled {
                 continue;
             }
 
             // Cache miss: load from storage without holding the lock.
-            match self.load_bucket(id).await {
-                Ok(loaded) => {
-                    for vector in &loaded.vectors {
-                        push_candidate(vector);
+            match self.load_bucket_chunks(id).await {
+                Ok(chunks) => {
+                    if chunks.is_empty() {
+                        continue;
                     }
-                    // Insert into cache after use.
-                    let mut cache = self.cache.lock();
-                    cache.put(id, loaded);
+
+                    let mut cached = false;
+                    {
+                        let mut cache = self.cache.lock();
+                        if let Some(data) = cache.put_from_chunks(id, &chunks) {
+                            scan_bucket_slice(data, query_vec, include_vectors, &mut candidates);
+                            cached = true;
+                        }
+                    }
+
+                    if !cached {
+                        scan_bucket_chunks(&chunks, query_vec, include_vectors, &mut candidates);
+                    }
                 }
                 Err(e) => {
                     log::debug!("executor: load failed for bucket {}: {:?}", id, e);
@@ -243,6 +369,150 @@ impl Executor {
     }
 }
 
+fn parse_vector_payload(payload: &[u8]) -> Option<(u64, &[u8])> {
+    if payload.len() < 16 {
+        return None;
+    }
+    let mut id_bytes = [0u8; 8];
+    id_bytes.copy_from_slice(&payload[0..8]);
+    let mut dim_bytes = [0u8; 8];
+    dim_bytes.copy_from_slice(&payload[8..16]);
+    let dim = u64::from_le_bytes(dim_bytes) as usize;
+    let data_len = dim.checked_mul(4)?;
+    let data_end = 16usize.checked_add(data_len)?;
+    let data = payload.get(16..data_end)?;
+    Some((u64::from_le_bytes(id_bytes), data))
+}
+
+fn walk_bucket_slice(data: &[u8], mut f: impl FnMut(u64, &[u8])) {
+    let mut offset = 0usize;
+    while offset + 8 <= data.len() {
+        let mut len_bytes = [0u8; 8];
+        len_bytes.copy_from_slice(&data[offset..offset + 8]);
+        let payload_len = u64::from_le_bytes(len_bytes) as usize;
+        if payload_len < 16 {
+            break;
+        }
+        let end = offset + 8 + payload_len;
+        if end > data.len() {
+            break;
+        }
+        if let Some((id, vec_bytes)) = parse_vector_payload(&data[offset + 8..end]) {
+            f(id, vec_bytes);
+        }
+        offset = end;
+    }
+}
+
+fn walk_bucket_chunks(chunks: &[Vec<u8>], mut f: impl FnMut(u64, &[u8])) {
+    for chunk in chunks {
+        if chunk.len() < 8 {
+            continue;
+        }
+        let mut len_bytes = [0u8; 8];
+        len_bytes.copy_from_slice(&chunk[0..8]);
+        let payload_len = u64::from_le_bytes(len_bytes) as usize;
+        if payload_len < 16 || 8 + payload_len > chunk.len() {
+            continue;
+        }
+        if let Some((id, vec_bytes)) = parse_vector_payload(&chunk[8..8 + payload_len]) {
+            f(id, vec_bytes);
+        }
+    }
+}
+
+fn decode_vector_bytes(raw: &[u8]) -> Option<Vec<f32>> {
+    if !raw.len().is_multiple_of(4) {
+        return None;
+    }
+    let mut data = Vec::with_capacity(raw.len() / 4);
+    for chunk in raw.chunks_exact(4) {
+        data.push(f32::from_bits(u32::from_le_bytes([
+            chunk[0], chunk[1], chunk[2], chunk[3],
+        ])));
+    }
+    Some(data)
+}
+
+fn l2_distance_bytes(raw: &[u8], query: &[f32]) -> Option<f32> {
+    if !raw.len().is_multiple_of(4) {
+        return None;
+    }
+    let dim = raw.len() / 4;
+    if dim != query.len() {
+        return None;
+    }
+
+    let mut sum_sq = 0f32;
+    for (chunk, q) in raw.chunks_exact(4).zip(query.iter()) {
+        let val = f32::from_bits(u32::from_le_bytes([chunk[0], chunk[1], chunk[2], chunk[3]]));
+        let diff = val - q;
+        sum_sq += diff * diff;
+    }
+    Some(sum_sq.sqrt())
+}
+
+fn collect_vectors_from_slice(data: &[u8], wanted: &HashSet<u64>) -> Vec<Vector> {
+    let mut hits = Vec::new();
+    walk_bucket_slice(data, |id, vec_bytes| {
+        if wanted.contains(&id) {
+            if let Some(data) = decode_vector_bytes(vec_bytes) {
+                hits.push(Vector { id, data });
+            }
+        }
+    });
+    hits
+}
+
+fn collect_vectors_from_chunks(chunks: &[Vec<u8>], wanted: &HashSet<u64>) -> Vec<Vector> {
+    let mut hits = Vec::new();
+    walk_bucket_chunks(chunks, |id, vec_bytes| {
+        if wanted.contains(&id) {
+            if let Some(data) = decode_vector_bytes(vec_bytes) {
+                hits.push(Vector { id, data });
+            }
+        }
+    });
+    hits
+}
+
+fn scan_bucket_slice(
+    data: &[u8],
+    query_vec: &[f32],
+    include_vectors: bool,
+    candidates: &mut Vec<(u64, f32, Option<Vec<f32>>)>,
+) {
+    walk_bucket_slice(data, |id, vec_bytes| {
+        if let Some(dist) = l2_distance_bytes(vec_bytes, query_vec) {
+            let payload = if include_vectors {
+                decode_vector_bytes(vec_bytes)
+            } else {
+                None
+            };
+            candidates.push((id, dist, payload));
+        }
+    });
+}
+
+fn scan_bucket_chunks(
+    chunks: &[Vec<u8>],
+    query_vec: &[f32],
+    include_vectors: bool,
+    candidates: &mut Vec<(u64, f32, Option<Vec<f32>>)>,
+) {
+    walk_bucket_chunks(chunks, |id, vec_bytes| {
+        if let Some(dist) = l2_distance_bytes(vec_bytes, query_vec) {
+            let payload = if include_vectors {
+                decode_vector_bytes(vec_bytes)
+            } else {
+                None
+            };
+            candidates.push((id, dist, payload));
+        }
+    });
+}
+
+#[cfg(test)]
 fn l2_distance_f32(a: &[f32], b: &[f32]) -> f32 {
     if cfg!(target_arch = "x86_64") && std::arch::is_x86_feature_detected!("avx2") {
         // Prefer the FMA path when available; it gives a small bump on AVX2 hardware.
@@ -264,6 +534,7 @@ fn l2_distance_f32(a: &[f32], b: &[f32]) -> f32 {
     }
 }
 
+#[cfg(test)]
 #[target_feature(enable = "avx2")]
 unsafe fn l2_distance_f32_avx2(a: &[f32], b: &[f32]) -> f32 {
     use std::arch::x86_64::*;
@@ -312,6 +583,7 @@ unsafe fn l2_distance_f32_avx2(a: &[f32], b: &[f32]) -> f32 {
     total.sqrt()
 }
 
+#[cfg(test)]
 #[target_feature(enable = "avx2,fma")]
 unsafe fn l2_distance_f32_avx2_fma(a: &[f32], b: &[f32]) -> f32 {
     use std::arch::x86_64::*;
@@ -424,28 +696,10 @@ mod tests {
     /// WorkerCache respects max_buckets limit.
     #[test]
     fn worker_cache_evicts_on_limit() {
-        let mut cache = WorkerCache::new(2, usize::MAX);
-        cache.put(
-            0,
-            CachedBucket {
-                vectors: vec![],
-                byte_size: 10,
-            },
-        );
-        cache.put(
-            1,
-            CachedBucket {
-                vectors: vec![],
-                byte_size: 10,
-            },
-        );
-        cache.put(
-            2,
-            CachedBucket {
-                vectors: vec![],
-                byte_size: 10,
-            },
-        );
+        let mut cache = WorkerCache::new(2, 16, usize::MAX);
+        cache.put_bytes(0, &[0u8; 8]);
+        cache.put_bytes(1, &[1u8; 8]);
+        cache.put_bytes(2, &[2u8; 8]);
         // LRU should have evicted bucket 0
         assert!(cache.get(0).is_none(), "bucket 0 should be evicted");
         assert!(cache.get(1).is_some(), "bucket 1 should still be cached");
@@ -455,21 +709,9 @@ mod tests {
     /// WorkerCache skips buckets exceeding byte limit.
     #[test]
     fn worker_cache_rejects_oversized() {
-        let mut cache = WorkerCache::new(10, 100); // max 100 bytes per bucket
-        cache.put(
-            0,
-            CachedBucket {
-                vectors: vec![],
-                byte_size: 50,
-            },
-        );
-        cache.put(
-            1,
-            CachedBucket {
-                vectors: vec![],
-                byte_size: 200,
-            },
-        ); // too big
+        let mut cache = WorkerCache::new(10, 100, usize::MAX); // max 100 bytes per bucket
+        cache.put_bytes(0, &[0u8; 50]);
+        cache.put_bytes(1, &[0u8; 200]); // too big
         assert!(cache.get(0).is_some(), "small bucket should be cached");
         assert!(
             cache.get(1).is_none(),
@@ -480,21 +722,9 @@ mod tests {
     /// WorkerCache clear removes all entries.
     #[test]
     fn worker_cache_clear() {
-        let mut cache = WorkerCache::new(10, usize::MAX);
-        cache.put(
-            0,
-            CachedBucket {
-                vectors: vec![],
-                byte_size: 10,
-            },
-        );
-        cache.put(
-            1,
-            CachedBucket {
-                vectors: vec![],
-                byte_size: 10,
-            },
-        );
+        let mut cache = WorkerCache::new(10, 32, usize::MAX);
+        cache.put_bytes(0, &[0u8; 8]);
+        cache.put_bytes(1, &[1u8; 8]);
         cache.clear();
         assert!(cache.get(0).is_none());
         assert!(cache.get(1).is_none());
@@ -503,28 +733,10 @@ mod tests {
     /// WorkerCache invalidate_many removes specific entries.
     #[test]
     fn worker_cache_invalidate_many() {
-        let mut cache = WorkerCache::new(10, usize::MAX);
-        cache.put(
-            0,
-            CachedBucket {
-                vectors: vec![],
-                byte_size: 10,
-            },
-        );
-        cache.put(
-            1,
-            CachedBucket {
-                vectors: vec![],
-                byte_size: 10,
-            },
-        );
-        cache.put(
-            2,
-            CachedBucket {
-                vectors: vec![],
-                byte_size: 10,
-            },
-        );
+        let mut cache = WorkerCache::new(10, 32, usize::MAX);
+        cache.put_bytes(0, &[0u8; 8]);
+        cache.put_bytes(1, &[1u8; 8]);
+        cache.put_bytes(2, &[2u8; 8]);
         cache.invalidate_many(&[0, 2]);
         assert!(cache.get(0).is_none(), "bucket 0 should be invalidated");
         assert!(cache.get(1).is_some(), "bucket 1 should remain");

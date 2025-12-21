@@ -50,7 +50,21 @@ pub async fn run_worker(id: usize, receiver: Receiver<WorkerMessage>, wal: Arc<W
     info!("Worker {} started.", id);
 
     let storage = Storage::new(wal.clone()).with_mode(StorageExecMode::Offload);
-    let cache = WorkerCache::new(128, 64 * 1024 * 1024); // Local cache: 128 buckets, 64MB each
+    let cache_max_buckets: usize = std::env::var("SATORI_WORKER_CACHE_BUCKETS")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .filter(|v| *v > 0)
+        .unwrap_or(64);
+    let cache_bucket_mb: usize = std::env::var("SATORI_WORKER_CACHE_BUCKET_MB")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .filter(|v| *v > 0)
+        .unwrap_or(64);
+    let cache_bucket_bytes = cache_bucket_mb * 1024 * 1024;
+    let cache_total_bytes = cache_max_buckets
+        .saturating_mul(cache_bucket_bytes)
+        .max(cache_bucket_bytes);
+    let cache = WorkerCache::new(cache_max_buckets, cache_bucket_bytes, cache_total_bytes); // Local cache: preallocates buckets * bucket_bytes
     let executor = Rc::new(Executor::new(storage.clone(), cache));
     // Shared topic cache not easily safe for concurrent access across spawns without RefCell,
     // but computing topic string is cheap. Let's drop the cache for simplicity in concurrent model.
