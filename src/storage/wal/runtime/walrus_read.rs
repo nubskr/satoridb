@@ -990,10 +990,10 @@ impl Walrus {
                         let mut c_idx_bytes = [0u8; 8];
                         c_idx_bytes.copy_from_slice(&final_data[1..9]);
                         let c_idx = u64::from_be_bytes(c_idx_bytes); // Big-endian
-                        info!(
-                            "batch_read_for_topic: (stateless) pushing entry with t_idx={}, c_idx={}",
-                            t_idx, c_idx
-                        );
+                        // info!(
+                        //     "batch_read_for_topic: (stateless) pushing entry with t_idx={}, c_idx={}",
+                        //     t_idx, c_idx
+                        // );
                     }
                     entries.push(Entry { data: final_data });
                 }
