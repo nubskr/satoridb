@@ -1,7 +1,6 @@
 /.tmp
 /vector_index
 *.f32bin
-*.png
 *.svg
 perf.*
 wal_files/
