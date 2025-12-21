@@ -139,7 +139,7 @@ impl RebalanceState {
     }
 
     pub(crate) fn load_bucket_vectors(&self, bucket_id: u64) -> Option<Vec<Vector>> {
-        let chunks = block_on(self.storage.get_chunks(bucket_id)).ok()?;
+        let chunks = Storage::get_chunks_sync(self.storage.wal.clone(), bucket_id).ok()?;
         let mut vectors: Vec<Vector> = Vec::new();
         for chunk in chunks {
             if chunk.len() < 8 {
@@ -365,6 +365,24 @@ pub struct RebalanceWorker {
 }
 
 impl RebalanceWorker {
+    pub fn new_for_tests(
+        storage: Storage,
+        vector_index: Arc<VectorIndex>,
+        bucket_index: Arc<BucketIndex>,
+        routing: Arc<RoutingTable>,
+        bucket_locks: Arc<BucketLocks>,
+    ) -> Self {
+        let state = Arc::new(RebalanceState::new(
+            storage,
+            vector_index,
+            bucket_index,
+            routing,
+            bucket_locks,
+        ));
+        let (delete_tx, _delete_rx) = async_channel::bounded(1024);
+        Self { state, delete_tx }
+    }
+
     pub fn spawn(
         storage: Storage,
         vector_index: Arc<VectorIndex>,
@@ -448,6 +466,23 @@ impl RebalanceWorker {
         rx.await
             .map_err(|e| anyhow::anyhow!("rebalance delete canceled: {:?}", e))?
     }
+
+    /// Synchronous delete helper primarily for tests to bypass the async loop.
+    pub fn delete_inline_blocking(
+        &self,
+        vector_id: u64,
+        bucket_hint: Option<u64>,
+    ) -> anyhow::Result<()> {
+        let (tx, rx) = futures::channel::oneshot::channel();
+        let cmd = DeleteCommand {
+            vector_id,
+            bucket_hint,
+            respond_to: tx,
+        };
+        futures::executor::block_on(handle_delete(&self.state, cmd))?;
+        futures::executor::block_on(rx)
+            .map_err(|e| anyhow::anyhow!("rebalance delete canceled: {:?}", e))?
+    }
 }
 
 impl Clone for RebalanceWorker {
@@ -509,18 +544,21 @@ async fn run_autonomous_loop(
     }
 }
 
-async fn handle_delete(state: &Arc<RebalanceState>, cmd: DeleteCommand) -> anyhow::Result<()> {
-    let bucket_id = if let Some(b) = cmd.bucket_hint {
+async fn perform_delete(
+    state: &Arc<RebalanceState>,
+    vector_id: u64,
+    bucket_hint: Option<u64>,
+) -> anyhow::Result<()> {
+    let bucket_id = if let Some(b) = bucket_hint {
         b
     } else {
         let found = state
             .bucket_index
-            .get_many(&[cmd.vector_id])
+            .get_many(&[vector_id])
             .map_err(|e| anyhow::anyhow!("bucket index lookup failed: {:?}", e))?;
         match found.first() {
             Some((_, b)) => *b,
             None => {
-                let _ = cmd.respond_to.send(Ok(()));
                 return Ok(());
             }
         }
@@ -532,51 +570,67 @@ async fn handle_delete(state: &Arc<RebalanceState>, cmd: DeleteCommand) -> anyho
     let vectors = match state.load_bucket_vectors(bucket_id) {
         Some(v) => v,
         None => {
-            let _ = cmd.respond_to.send(Ok(()));
             return Ok(());
         }
     };
     let mut remaining: Vec<Vector> = Vec::with_capacity(vectors.len());
     let mut removed = false;
     for v in vectors {
-        if v.id == cmd.vector_id {
+        if v.id == vector_id {
             removed = true;
         } else {
             remaining.push(v);
         }
     }
     if !removed {
-        let _ = cmd.respond_to.send(Ok(()));
         return Ok(());
     }
 
-    let centroid = state
+    let _centroid = state
         .centroids
         .read()
         .get(&bucket_id)
         .cloned()
         .unwrap_or_default();
-    let mut bucket = Bucket::new(bucket_id, centroid);
-    bucket.vectors = remaining;
-    block_on(state.storage.put_chunk(&bucket))
+    let topic = crate::storage::Storage::topic_for(bucket_id);
+    Storage::put_chunk_raw_sync(state.storage.wal.clone(), bucket_id, &topic, &remaining)
         .map_err(|e| anyhow::anyhow!("rewrite bucket after delete failed: {:?}", e))?;
+    // Write a tombstone entry so downstream readers that walk newest->oldest stop at the delete.
+    let tombstone = Vector::new(vector_id, Vec::new());
+    if let Err(e) =
+        Storage::put_chunk_raw_sync(state.storage.wal.clone(), bucket_id, &topic, &[tombstone])
+    {
+        warn!(
+            "rebalance: failed to append delete tombstone for {}: {:?}",
+            vector_id, e
+        );
+    }
 
-    let ids = [cmd.vector_id];
+    let ids = [vector_id];
     if let Err(e) = state.vector_index.delete_batch(&ids) {
         warn!(
             "rebalance: delete failed from vector index for {}: {:?}",
-            cmd.vector_id, e
+            vector_id, e
         );
     }
     if let Err(e) = state.bucket_index.delete_batch(&ids) {
         warn!(
             "rebalance: delete failed from bucket index for {}: {:?}",
-            cmd.vector_id, e
+            vector_id, e
         );
     }
 
-    let _ = cmd.respond_to.send(Ok(()));
     Ok(())
+}
+
+async fn handle_delete(state: &Arc<RebalanceState>, cmd: DeleteCommand) -> anyhow::Result<()> {
+    let result = perform_delete(state, cmd.vector_id, cmd.bucket_hint).await;
+    let send_payload = result
+        .as_ref()
+        .map(|_| ())
+        .map_err(|e| anyhow::anyhow!("{:?}", e));
+    let _ = cmd.respond_to.send(send_payload);
+    result
 }
 
 #[cfg(test)]

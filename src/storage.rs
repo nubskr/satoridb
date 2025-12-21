@@ -161,7 +161,7 @@ impl Storage {
         }
     }
 
-    fn put_chunk_raw_sync(
+    pub(crate) fn put_chunk_raw_sync(
         wal: Arc<Walrus>,
         bucket_id: u64,
         topic: &str,
@@ -247,7 +247,7 @@ impl Storage {
         }
     }
 
-    fn get_chunks_sync(wal: Arc<Walrus>, bucket_id: u64) -> Result<Vec<Vec<u8>>> {
+    pub(crate) fn get_chunks_sync(wal: Arc<Walrus>, bucket_id: u64) -> Result<Vec<Vec<u8>>> {
         let topic = Self::topic_for(bucket_id);
         let topic_size = wal.get_topic_size(&topic) as usize;
         if topic_size == 0 {
