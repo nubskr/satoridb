@@ -10,6 +10,7 @@ use futures::channel::oneshot;
 use futures::executor::block_on;
 use glommio::{LocalExecutorBuilder, Placement};
 use std::path::PathBuf;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::thread;
 
@@ -27,9 +28,7 @@ pub struct SatoriDbConfig {
 impl SatoriDbConfig {
     /// Create a config with sane defaults.
     pub fn new(wal: Arc<Walrus>) -> Self {
-        let vector_index_path = std::env::var("SATORI_VECTOR_INDEX_PATH")
-            .map(PathBuf::from)
-            .unwrap_or_else(|_| PathBuf::from("vector_index"));
+        let vector_index_path = default_vector_index_path();
         Self {
             wal,
             workers: num_cpus::get().max(1),
@@ -37,6 +36,18 @@ impl SatoriDbConfig {
             vector_index_path,
         }
     }
+}
+
+fn default_vector_index_path() -> PathBuf {
+    if let Ok(p) = std::env::var("SATORI_VECTOR_INDEX_PATH") {
+        return PathBuf::from(p);
+    }
+
+    // Use a per-process unique temp directory to avoid lock contention when multiple instances run
+    // concurrently (tests/benchmarks). Set SATORI_VECTOR_INDEX_PATH for a stable location.
+    static COUNTER: AtomicU64 = AtomicU64::new(0);
+    let n = COUNTER.fetch_add(1, Ordering::Relaxed);
+    std::env::temp_dir().join(format!("vector_index_{}_{}", std::process::id(), n))
 }
 
 /// An embedded `satoridb` instance (router manager + worker shards).
