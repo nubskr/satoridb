@@ -254,10 +254,8 @@ impl Storage {
             return Ok(Vec::new());
         }
 
-        // Use stateful read (start_offset=None) so the active writer block is also included.
-        // Stateless reads with start_offset=Some(0) can miss in-flight data still in the writer.
         let entries: Vec<Entry> = wal
-            .batch_read_for_topic(&topic, topic_size + 1024, false, None)
+            .batch_read_for_topic(&topic, topic_size + 1024, false, Some(0))
             .map_err(|e| anyhow::anyhow!("Walrus read failed for {}: {:?}", topic, e))?;
 
         Ok(entries.into_iter().map(|e| e.data).collect())

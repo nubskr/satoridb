@@ -623,6 +623,7 @@ async fn perform_delete(
         .cloned()
         .unwrap_or_default();
     let topic = crate::storage::Storage::topic_for(bucket_id);
+    let entries_before = state.storage.wal.get_topic_entry_count(&topic);
     Storage::put_chunk_raw_sync(state.storage.wal.clone(), bucket_id, &topic, &remaining)
         .map_err(|e| anyhow::anyhow!("rewrite bucket after delete failed: {:?}", e))?;
     let tombstone = Vector::new(vector_id, Vec::new());
@@ -647,6 +648,39 @@ async fn perform_delete(
             "rebalance: delete failed from bucket index for {}: {:?}",
             vector_id, e
         );
+    }
+
+    // Advance WAL checkpoints for the entries that existed prior to this rewrite so old blocks can
+    // be reclaimed without consuming the newly written replacement/tombstone. Read in bounded
+    // batches to avoid sweeping the fresh entries that were just appended.
+    let mut remaining = entries_before;
+    while remaining > 0 {
+        const MIN_ENTRY_BYTES: usize = 24; // len prefix + id + dim (no payload)
+        let max_entries = remaining.min(2000) as usize;
+        let max_bytes = max_entries
+            .saturating_mul(MIN_ENTRY_BYTES)
+            .max(MIN_ENTRY_BYTES);
+
+        match state
+            .storage
+            .wal
+            .batch_read_for_topic(&topic, max_bytes, true, None)
+        {
+            Ok(batch) => {
+                if batch.is_empty() {
+                    break;
+                }
+                let consumed = batch.len().min(max_entries) as u64;
+                remaining = remaining.saturating_sub(consumed);
+                if consumed == 0 {
+                    break;
+                }
+            }
+            Err(e) => {
+                warn!("rebalance: checkpoint drain failed for {}: {:?}", topic, e);
+                break;
+            }
+        }
     }
 
     Ok(())

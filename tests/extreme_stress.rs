@@ -885,10 +885,8 @@ fn deletes_remain_consistent_under_burst() -> Result<()> {
                 }
                 let id = u64::from_le_bytes(id_bytes);
 
-                if seen.insert(id) {
-                    if !data.is_empty() {
-                        out.push(Vector { id, data });
-                    }
+                if seen.insert(id) && !data.is_empty() {
+                    out.push(Vector { id, data });
                 }
                 off += bytes_needed;
             }
