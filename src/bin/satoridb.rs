@@ -141,7 +141,7 @@ fn detect_dataset() -> anyhow::Result<Option<DatasetConfig>> {
             } else {
                 None
             },
-            max_vectors: 300_000_000usize,
+            max_vectors: 1_000_000_000usize,
             base_is_prepared: true,
         }));
     }
@@ -160,7 +160,7 @@ fn detect_dataset() -> anyhow::Result<Option<DatasetConfig>> {
             } else {
                 None
             },
-            max_vectors: 300_000_000usize,
+            max_vectors: 1_000_000_000usize,
             base_is_prepared: prepared_bigann.exists(),
         }));
     }
