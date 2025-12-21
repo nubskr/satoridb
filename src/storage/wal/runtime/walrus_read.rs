@@ -986,14 +986,14 @@ impl Walrus {
                 if !final_data.is_empty() {
                     // Extract topic_id and chunk_idx from the payload prefix for logging
                     if final_data.len() >= 9 {
-                        let t_idx = final_data[0];
+                        let _t_idx = final_data[0];
                         let mut c_idx_bytes = [0u8; 8];
                         c_idx_bytes.copy_from_slice(&final_data[1..9]);
-                        let c_idx = u64::from_be_bytes(c_idx_bytes); // Big-endian
-                        // info!(
-                        //     "batch_read_for_topic: (stateless) pushing entry with t_idx={}, c_idx={}",
-                        //     t_idx, c_idx
-                        // );
+                        let _c_idx = u64::from_be_bytes(c_idx_bytes); // Big-endian
+                                                                      // info!(
+                                                                      //     "batch_read_for_topic: (stateless) pushing entry with t_idx={}, c_idx={}",
+                                                                      //     t_idx, c_idx
+                                                                      // );
                     }
                     entries.push(Entry { data: final_data });
                 }
