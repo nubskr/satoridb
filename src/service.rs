@@ -1,3 +1,4 @@
+use crate::bucket_index::BucketIndex;
 use crate::router_manager::{BucketMeta, RouterCommand, RouterStats};
 use crate::tasks::ConsistentHashRing;
 use crate::vector_index::VectorIndex;
@@ -17,6 +18,7 @@ pub struct SatoriHandle {
     ring: ConsistentHashRing,
     worker_senders: Vec<AsyncSender<WorkerMessage>>,
     vector_index: Arc<VectorIndex>,
+    bucket_index: Arc<BucketIndex>,
 }
 
 impl SatoriHandle {
@@ -25,12 +27,14 @@ impl SatoriHandle {
         ring: ConsistentHashRing,
         worker_senders: Vec<AsyncSender<WorkerMessage>>,
         vector_index: Arc<VectorIndex>,
+        bucket_index: Arc<BucketIndex>,
     ) -> Self {
         Self {
             router_tx,
             ring,
             worker_senders,
             vector_index,
+            bucket_index,
         }
     }
 
@@ -139,6 +143,13 @@ impl SatoriHandle {
     pub async fn fetch_vectors_by_id(&self, ids: Vec<u64>) -> Result<Vec<(u64, Vec<f32>)>> {
         let vectors = self.vector_index.get_many(&ids)?;
         Ok(vectors.into_iter().map(|(id, v)| (id, v.data)).collect())
+    }
+
+    /// Resolve vector ids to their buckets via the RocksDB-backed bucket index.
+    ///
+    /// Missing ids are skipped in the response.
+    pub async fn resolve_buckets_by_id(&self, ids: Vec<u64>) -> Result<Vec<(u64, u64)>> {
+        self.bucket_index.get_many(&ids)
     }
 
     /// Flush worker state and write a router snapshot.

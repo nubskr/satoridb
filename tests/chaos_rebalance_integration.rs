@@ -3,6 +3,7 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use anyhow::Result;
+use satoridb::bucket_locks::BucketLocks;
 use satoridb::executor::{
     clear_executor_fail_load_hook, set_executor_fail_load_hook, Executor, WorkerCache,
 };
@@ -38,7 +39,8 @@ fn rebalance_survives_split_failures() -> Result<()> {
     let wal = init_wal(&tmp);
     let storage = Storage::new(wal);
     let routing = Arc::new(RoutingTable::new());
-    let worker = RebalanceWorker::spawn(storage.clone(), routing.clone(), None);
+    let bucket_locks = Arc::new(BucketLocks::new());
+    let worker = RebalanceWorker::spawn(storage.clone(), routing.clone(), None, bucket_locks);
 
     // Seed one bucket with enough vectors to split (32 > 10).
     let mut bucket = Bucket::new(0, vec![0.0, 0.0]);

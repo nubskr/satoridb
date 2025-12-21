@@ -4,6 +4,7 @@ use std::time::{Duration, Instant};
 
 use anyhow::Result;
 use futures::executor::block_on;
+use satoridb::bucket_locks::BucketLocks;
 use satoridb::rebalancer::RebalanceWorker;
 use satoridb::router::RoutingTable;
 use satoridb::storage::{Bucket, Storage, Vector};
@@ -34,7 +35,8 @@ fn rebalance_split_increases_buckets_and_router_version() -> Result<()> {
     let wal = init_wal(&tmp);
     let storage = Storage::new(wal);
     let routing = Arc::new(RoutingTable::new());
-    let worker = RebalanceWorker::spawn(storage.clone(), routing.clone(), None);
+    let bucket_locks = Arc::new(BucketLocks::new());
+    let worker = RebalanceWorker::spawn(storage.clone(), routing.clone(), None, bucket_locks);
 
     // Persist a bucket with enough vectors to split.
     let mut bucket = Bucket::new(0, vec![0.0, 0.0]);

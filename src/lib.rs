@@ -41,6 +41,10 @@
 
 // Public library exports so integration tests and external tooling can use the same modules.
 #[doc(hidden)]
+pub mod bucket_index;
+#[doc(hidden)]
+pub mod bucket_locks;
+#[doc(hidden)]
 pub mod bvecs;
 #[doc(hidden)]
 pub mod executor;

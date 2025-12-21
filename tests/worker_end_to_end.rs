@@ -4,6 +4,8 @@ use std::thread;
 use async_channel::unbounded;
 use futures::channel::oneshot;
 use futures::executor::block_on;
+use satoridb::bucket_index::BucketIndex;
+use satoridb::bucket_locks::BucketLocks;
 use satoridb::ingest_counter;
 use satoridb::storage::wal::runtime::Walrus;
 use satoridb::storage::Vector;
@@ -28,7 +30,11 @@ fn worker_ingests_and_answers_queries() {
     let tmp = tempfile::tempdir().unwrap();
     let wal = init_wal(&tmp);
     let index = Arc::new(VectorIndex::open(tmp.path().join("vectors")).expect("index init"));
+    let bucket_index =
+        Arc::new(BucketIndex::open(tmp.path().join("buckets")).expect("bucket index init"));
+    let bucket_locks = Arc::new(BucketLocks::new());
     let index_reader = index.clone();
+    let bucket_index_reader = bucket_index.clone();
 
     let (tx, rx) = unbounded();
     let handle = thread::spawn(move || {
@@ -36,7 +42,7 @@ fn worker_ingests_and_answers_queries() {
             .name("test-worker")
             .make()
             .expect("make executor");
-        ex.run(run_worker(0, rx, wal, index));
+        ex.run(run_worker(0, rx, wal, index, bucket_index, bucket_locks));
     });
 
     // Ingest a small batch into bucket 0.
@@ -94,6 +100,11 @@ fn worker_ingests_and_answers_queries() {
         .map(|(id, v)| (id, v.data))
         .collect::<Vec<_>>();
     assert_eq!(indexed.len(), 2);
+    let bucket_mappings = bucket_index_reader
+        .get_many(&[1, 2])
+        .expect("bucket index read");
+    assert_eq!(bucket_mappings.len(), 2);
+    assert!(bucket_mappings.iter().all(|(_, b)| *b == 0));
 
     let (shutdown_tx, shutdown_rx) = oneshot::channel();
     tx.send_blocking(WorkerMessage::Shutdown {
@@ -109,6 +120,9 @@ fn worker_rejects_duplicate_ingest_ids() {
     let tmp = tempfile::tempdir().unwrap();
     let wal = init_wal(&tmp);
     let index = Arc::new(VectorIndex::open(tmp.path().join("vectors")).expect("index init"));
+    let bucket_index =
+        Arc::new(BucketIndex::open(tmp.path().join("buckets")).expect("bucket index init"));
+    let bucket_locks = Arc::new(BucketLocks::new());
 
     let (tx, rx) = unbounded();
     let handle = thread::spawn(move || {
@@ -116,7 +130,7 @@ fn worker_rejects_duplicate_ingest_ids() {
             .name("test-worker-dup")
             .make()
             .expect("make executor");
-        ex.run(run_worker(2, rx, wal, index));
+        ex.run(run_worker(2, rx, wal, index, bucket_index, bucket_locks));
     });
 
     let vecs = vec![Vector::new(42, vec![1.0, 2.0])];
@@ -161,6 +175,9 @@ fn worker_flushes_and_shuts_down_cleanly() {
     let tmp = tempfile::tempdir().unwrap();
     let wal = init_wal(&tmp);
     let index = Arc::new(VectorIndex::open(tmp.path().join("vectors")).expect("index init"));
+    let bucket_index =
+        Arc::new(BucketIndex::open(tmp.path().join("buckets")).expect("bucket index init"));
+    let bucket_locks = Arc::new(BucketLocks::new());
 
     let (tx, rx) = unbounded();
     let handle = thread::spawn(move || {
@@ -168,7 +185,7 @@ fn worker_flushes_and_shuts_down_cleanly() {
             .name("test-worker2")
             .make()
             .expect("make executor");
-        ex.run(run_worker(1, rx, wal, index));
+        ex.run(run_worker(1, rx, wal, index, bucket_index, bucket_locks));
     });
 
     let (flush_tx, flush_rx) = oneshot::channel();

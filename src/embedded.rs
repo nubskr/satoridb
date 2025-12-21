@@ -1,3 +1,5 @@
+use crate::bucket_index::BucketIndex;
+use crate::bucket_locks::BucketLocks;
 use crate::router_manager::{spawn_router_manager, RouterCommand, RouterShutdownRequest};
 use crate::service::SatoriHandle;
 use crate::tasks::ConsistentHashRing;
@@ -23,17 +25,25 @@ pub struct SatoriDbConfig {
     pub virtual_nodes: usize,
     /// Path for the RocksDB-backed vector index (id -> serialized vector payload).
     pub vector_index_path: PathBuf,
+    /// Path for the RocksDB-backed bucket index (id -> bucket mapping).
+    pub bucket_index_path: PathBuf,
+    /// Shared per-bucket locks to serialize writes vs. rebalances.
+    pub bucket_locks: Arc<BucketLocks>,
 }
 
 impl SatoriDbConfig {
     /// Create a config with sane defaults.
     pub fn new(wal: Arc<Walrus>) -> Self {
         let vector_index_path = default_vector_index_path();
+        let bucket_index_path = default_bucket_index_path();
+        let bucket_locks = Arc::new(BucketLocks::new());
         Self {
             wal,
             workers: num_cpus::get().max(1),
             virtual_nodes: 8,
             vector_index_path,
+            bucket_index_path,
+            bucket_locks,
         }
     }
 }
@@ -48,6 +58,16 @@ fn default_vector_index_path() -> PathBuf {
     static COUNTER: AtomicU64 = AtomicU64::new(0);
     let n = COUNTER.fetch_add(1, Ordering::Relaxed);
     std::env::temp_dir().join(format!("vector_index_{}_{}", std::process::id(), n))
+}
+
+fn default_bucket_index_path() -> PathBuf {
+    if let Ok(p) = std::env::var("SATORI_BUCKET_INDEX_PATH") {
+        return PathBuf::from(p);
+    }
+
+    static COUNTER: AtomicU64 = AtomicU64::new(0);
+    let n = COUNTER.fetch_add(1, Ordering::Relaxed);
+    std::env::temp_dir().join(format!("bucket_index_{}_{}", std::process::id(), n))
 }
 
 /// An embedded `satoridb` instance (router manager + worker shards).
@@ -71,6 +91,8 @@ impl SatoriDb {
         }
         let workers = cfg.workers;
         let vector_index = Arc::new(VectorIndex::open(&cfg.vector_index_path)?);
+        let bucket_index = Arc::new(BucketIndex::open(&cfg.bucket_index_path)?);
+        let bucket_locks = cfg.bucket_locks.clone();
 
         let mut worker_senders = Vec::new();
         let mut worker_handles = Vec::new();
@@ -80,6 +102,8 @@ impl SatoriDb {
 
             let wal_clone = cfg.wal.clone();
             let index_clone = vector_index.clone();
+            let bucket_index_clone = bucket_index.clone();
+            let bucket_locks_clone = bucket_locks.clone();
             let pin_cpu = i % num_cpus::get().max(1);
             let handle = thread::spawn(move || {
                 let builder = LocalExecutorBuilder::new(Placement::Fixed(pin_cpu))
@@ -87,7 +111,14 @@ impl SatoriDb {
                 builder
                     .make()
                     .expect("failed to create executor")
-                    .run(run_worker(i, receiver, wal_clone, index_clone));
+                    .run(run_worker(
+                        i,
+                        receiver,
+                        wal_clone,
+                        index_clone,
+                        bucket_index_clone,
+                        bucket_locks_clone,
+                    ));
             });
             worker_handles.push(handle);
         }
@@ -114,6 +145,7 @@ impl SatoriDb {
             ring,
             worker_senders.clone(),
             vector_index.clone(),
+            bucket_index.clone(),
         );
 
         Ok(Self {

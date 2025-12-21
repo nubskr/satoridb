@@ -131,7 +131,14 @@ pub fn start(cfg: SatoriDbConfig) -> Result<Self> {
         let handle = thread::spawn(move || {
             LocalExecutorBuilder::new(Placement::Fixed(pin_cpu))
                 .make()
-                .run(run_worker(i, receiver, wal_clone, vector_index.clone()));
+                .run(run_worker(
+                    i,
+                    receiver,
+                    wal_clone,
+                    vector_index.clone(),
+                    bucket_index.clone(),
+                    bucket_locks.clone(),
+                ));
         });
     }
     // Spawn router manager
@@ -205,6 +212,8 @@ pub async fn run_worker(
     receiver: Receiver<WorkerMessage>,
     wal: Arc<Walrus>,
     vector_index: Arc<VectorIndex>,
+    bucket_index: Arc<BucketIndex>,
+    bucket_locks: Arc<BucketLocks>,
 ) {
     let storage = Storage::new(wal.clone());
     let cache = WorkerCache::new(64, 64 * 1024 * 1024, 64 * 64 * 1024 * 1024);  // prealloc 64 buckets × 64MB each
@@ -216,8 +225,8 @@ pub async fn run_worker(
     while let Ok(msg) = receiver.recv().await {
         match msg {
             WorkerMessage::Query(req) => { /* dispatch to executor */ }
-            WorkerMessage::Upsert { .. } => { /* append to WAL + update vector index */ }
-            WorkerMessage::Ingest { respond_to, .. } => { /* batch append + update vector index, ack via respond_to */ }
+            WorkerMessage::Upsert { .. } => { /* append to WAL + update vector/bucket indexes */ }
+            WorkerMessage::Ingest { respond_to, .. } => { /* batch append + update vector/bucket indexes, ack via respond_to */ }
             ...
         }
     }
@@ -638,6 +647,7 @@ On startup (`router_manager.rs:364-391`):
 | `SATORI_ROUTER_REBUILD_EVERY` | 1000 | Rebuild HNSW after N upserts |
 | `SATORI_REBALANCE_THRESHOLD` | 2000 | Split buckets larger than this |
 | `SATORI_VECTOR_INDEX_PATH` | `vector_index` | RocksDB-backed `id -> vector` index location |
+| `SATORI_BUCKET_INDEX_PATH` | `bucket_index` | RocksDB-backed `id -> bucket` index location |
 | `WALRUS_DATA_DIR` | `./wal_files` | WAL storage directory |
 
 ---

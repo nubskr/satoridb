@@ -13,6 +13,8 @@ use std::sync::Arc;
 use std::thread;
 use tar::Archive;
 
+use satoridb::bucket_index::BucketIndex;
+use satoridb::bucket_locks::BucketLocks;
 use satoridb::bvecs::BvecsReader;
 use satoridb::flatbin::FlatF32Reader;
 use satoridb::fvecs::FvecsReader;
@@ -196,6 +198,10 @@ fn main() -> anyhow::Result<()> {
     let vector_index_path =
         std::env::var("SATORI_VECTOR_INDEX_PATH").unwrap_or_else(|_| "vector_index".to_string());
     let vector_index = Arc::new(VectorIndex::open(&vector_index_path)?);
+    let bucket_index_path =
+        std::env::var("SATORI_BUCKET_INDEX_PATH").unwrap_or_else(|_| "bucket_index".to_string());
+    let bucket_index = Arc::new(BucketIndex::open(&bucket_index_path)?);
+    let bucket_locks = Arc::new(BucketLocks::new());
 
     // Create Worker Channels (async for backpressure)
     let mut senders = Vec::new();
@@ -206,6 +212,8 @@ fn main() -> anyhow::Result<()> {
         senders.push(sender);
         let wal_clone = wal.clone();
         let index_clone = vector_index.clone();
+        let bucket_index_clone = bucket_index.clone();
+        let bucket_locks_clone = bucket_locks.clone();
         let pin_cpu = i % usable_cores;
         let handle = thread::spawn(move || {
             let builder =
@@ -214,7 +222,14 @@ fn main() -> anyhow::Result<()> {
             builder
                 .make()
                 .expect("failed to create executor")
-                .run(run_worker(i, receiver, wal_clone, index_clone));
+                .run(run_worker(
+                    i,
+                    receiver,
+                    wal_clone,
+                    index_clone,
+                    bucket_index_clone,
+                    bucket_locks_clone,
+                ));
         });
         worker_handles.push(handle);
     }
@@ -228,6 +243,7 @@ fn main() -> anyhow::Result<()> {
         Storage::new(wal.clone()),
         router_shared.clone(),
         rebalance_core,
+        bucket_locks.clone(),
     );
     if let Some(core) = rebalance_core {
         info!("Rebalance worker pinned to reserved core {}", core);

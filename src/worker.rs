@@ -1,3 +1,5 @@
+use crate::bucket_index::BucketIndex;
+use crate::bucket_locks::BucketLocks;
 use crate::executor::{Executor, WorkerCache};
 use crate::ingest_counter;
 use crate::storage::wal::runtime::Walrus;
@@ -53,6 +55,8 @@ pub async fn run_worker(
     receiver: Receiver<WorkerMessage>,
     wal: Arc<Walrus>,
     vector_index: Arc<VectorIndex>,
+    bucket_index: Arc<BucketIndex>,
+    bucket_locks: Arc<BucketLocks>,
 ) {
     info!("Worker {} started.", id);
 
@@ -114,6 +118,8 @@ pub async fn run_worker(
                 vector,
                 respond_to,
             } => {
+                let lock = bucket_locks.lock_for(bucket_id);
+                let _guard = lock.lock().await;
                 let mut bucket = Bucket::new(bucket_id, Vec::new());
                 bucket.vectors = vec![vector];
                 let result = storage.put_chunk(&bucket).await;
@@ -121,6 +127,12 @@ pub async fn run_worker(
                     if let Err(e) = vector_index.put_batch(&bucket.vectors) {
                         error!(
                             "Worker {} failed to update vector index for bucket {}: {:?}",
+                            id, bucket_id, e
+                        );
+                    }
+                    if let Err(e) = bucket_index.put_batch(bucket_id, &[bucket.vectors[0].id]) {
+                        error!(
+                            "Worker {} failed to update bucket index for bucket {}: {:?}",
                             id, bucket_id, e
                         );
                     }
@@ -158,7 +170,11 @@ pub async fn run_worker(
                 let limit_rx = limit_rx.clone();
                 let storage = storage.clone();
                 let vector_index = vector_index.clone();
+                let bucket_index = bucket_index.clone();
+                let bucket_locks = bucket_locks.clone();
                 glommio::spawn_local(async move {
+                    let lock = bucket_locks.lock_for(bucket_id);
+                    let _guard = lock.lock().await;
                     if let Some(dup) = duplicate_in_batch {
                         let _ = respond_to
                             .send(Err(anyhow::anyhow!("duplicate id {} in batch", dup)));
@@ -189,9 +205,18 @@ pub async fn run_worker(
                             Ok(_) => {
                                 ingest_counter::add(vectors.len() as u64);
                                 match vector_index.put_batch(&vectors) {
-                                    Ok(_) => {
-                                        let _ = respond_to.send(Ok(()));
-                                    }
+                                    Ok(_) => match bucket_index.put_batch(bucket_id, &ids) {
+                                        Ok(_) => {
+                                            let _ = respond_to.send(Ok(()));
+                                        }
+                                        Err(e) => {
+                                            error!(
+                                                "Worker {} failed to update bucket index for bucket {}: {:?}",
+                                                id, bucket_id, e
+                                            );
+                                            let _ = respond_to.send(Err(e));
+                                        }
+                                    },
                                     Err(e) => {
                                         error!(
                                             "Worker {} failed to update vector index for bucket {}: {:?}",

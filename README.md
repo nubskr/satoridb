@@ -84,6 +84,7 @@ for (id, vec) in stored {
 - `SATORI_WORKER_CACHE_BUCKETS`: max cached buckets per worker executor (default `64`; cache arena is preallocated at startup).
 - `SATORI_WORKER_CACHE_BUCKET_MB`: max size (MB) per cached bucket (default `64`; buckets larger than this are served uncached, and total preallocation is `buckets * MB`).
 - `SATORI_VECTOR_INDEX_PATH`: filesystem path for the RocksDB-backed `id -> vector` index (default `vector_index` in the working directory).
+- `SATORI_BUCKET_INDEX_PATH`: filesystem path for the RocksDB-backed `id -> bucket` index (default `bucket_index` in the working directory).
 - `SATORI_ROUTER_REBUILD_EVERY`: how many router updates before rebuilding the in-memory router (default `1000`).
 - `SATORI_REBALANCE_THRESHOLD`: vectors per bucket before triggering a split (default `4`).
 

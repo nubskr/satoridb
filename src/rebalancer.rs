@@ -1,3 +1,4 @@
+use crate::bucket_locks::BucketLocks;
 use crate::indexer::Indexer;
 use crate::ingest_counter;
 use crate::quantizer::Quantizer;
@@ -7,7 +8,7 @@ use crate::wal::runtime::Walrus;
 use anyhow::Result;
 use futures::executor::block_on;
 use log::{debug, error, warn};
-use parking_lot::{Mutex, RwLock};
+use parking_lot::RwLock;
 use std::collections::{HashMap, HashSet};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
@@ -53,11 +54,11 @@ pub(crate) struct RebalanceState {
     bucket_sizes: RwLock<HashMap<u64, usize>>,
     retired: RwLock<HashSet<u64>>,
     next_bucket_id: AtomicU64,
-    locks: Mutex<HashMap<u64, Arc<Mutex<()>>>>,
+    bucket_locks: Arc<BucketLocks>,
 }
 
 impl RebalanceState {
-    fn new(storage: Storage, routing: Arc<RoutingTable>) -> Self {
+    fn new(storage: Storage, routing: Arc<RoutingTable>, bucket_locks: Arc<BucketLocks>) -> Self {
         Self {
             wal: storage.wal.clone(),
             storage,
@@ -66,7 +67,7 @@ impl RebalanceState {
             bucket_sizes: RwLock::new(HashMap::new()),
             retired: RwLock::new(HashSet::new()),
             next_bucket_id: AtomicU64::new(0),
-            locks: Mutex::new(HashMap::new()),
+            bucket_locks,
         }
     }
 
@@ -114,12 +115,8 @@ impl RebalanceState {
         sizes.clone()
     }
 
-    fn lock_for(&self, bucket_id: u64) -> Arc<Mutex<()>> {
-        let mut guard = self.locks.lock();
-        guard
-            .entry(bucket_id)
-            .or_insert_with(|| Arc::new(Mutex::new(())))
-            .clone()
+    fn lock_for(&self, bucket_id: u64) -> Arc<futures::lock::Mutex<()>> {
+        self.bucket_locks.lock_for(bucket_id)
     }
 
     pub(crate) fn load_bucket_vectors(&self, bucket_id: u64) -> Option<Vec<Vector>> {
@@ -249,7 +246,7 @@ impl RebalanceState {
             return;
         }
         let lock = self.lock_for(bucket_id);
-        let _guard = lock.lock();
+        let _guard = block_on(lock.lock());
 
         // Check if bucket was already retired (e.g., by a prior split/merge).
         if self.retired.read().contains(&bucket_id) {
@@ -336,8 +333,13 @@ pub struct RebalanceWorker {
 }
 
 impl RebalanceWorker {
-    pub fn spawn(storage: Storage, routing: Arc<RoutingTable>, pin_cpu: Option<usize>) -> Self {
-        let state = Arc::new(RebalanceState::new(storage, routing));
+    pub fn spawn(
+        storage: Storage,
+        routing: Arc<RoutingTable>,
+        pin_cpu: Option<usize>,
+        bucket_locks: Arc<BucketLocks>,
+    ) -> Self {
+        let state = Arc::new(RebalanceState::new(storage, routing, bucket_locks));
         let state_clone = state.clone();
         let name = "rebalance-loop".to_string();
 
