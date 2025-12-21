@@ -7,6 +7,7 @@ use futures::executor::block_on;
 use satoridb::ingest_counter;
 use satoridb::storage::wal::runtime::Walrus;
 use satoridb::storage::Vector;
+use satoridb::vector_index::VectorIndex;
 use satoridb::wal::{FsyncSchedule, ReadConsistency};
 use satoridb::worker::{run_worker, QueryRequest, WorkerMessage};
 
@@ -26,6 +27,8 @@ fn init_wal(tmp: &tempfile::TempDir) -> Arc<Walrus> {
 fn worker_ingests_and_answers_queries() {
     let tmp = tempfile::tempdir().unwrap();
     let wal = init_wal(&tmp);
+    let index = Arc::new(VectorIndex::open(tmp.path().join("vectors")).expect("index init"));
+    let index_reader = index.clone();
 
     let (tx, rx) = unbounded();
     let handle = thread::spawn(move || {
@@ -33,7 +36,7 @@ fn worker_ingests_and_answers_queries() {
             .name("test-worker")
             .make()
             .expect("make executor");
-        ex.run(run_worker(0, rx, wal));
+        ex.run(run_worker(0, rx, wal, index));
     });
 
     // Ingest a small batch into bucket 0.
@@ -80,6 +83,15 @@ fn worker_ingests_and_answers_queries() {
         "ingest counter did not advance"
     );
 
+    // Index should have stored both vectors.
+    let indexed = index_reader
+        .get_many(&[1, 2])
+        .expect("index read")
+        .into_iter()
+        .map(|(id, v)| (id, v.data))
+        .collect::<Vec<_>>();
+    assert_eq!(indexed.len(), 2);
+
     let (shutdown_tx, shutdown_rx) = oneshot::channel();
     tx.send_blocking(WorkerMessage::Shutdown {
         respond_to: shutdown_tx,
@@ -93,6 +105,7 @@ fn worker_ingests_and_answers_queries() {
 fn worker_flushes_and_shuts_down_cleanly() {
     let tmp = tempfile::tempdir().unwrap();
     let wal = init_wal(&tmp);
+    let index = Arc::new(VectorIndex::open(tmp.path().join("vectors")).expect("index init"));
 
     let (tx, rx) = unbounded();
     let handle = thread::spawn(move || {
@@ -100,7 +113,7 @@ fn worker_flushes_and_shuts_down_cleanly() {
             .name("test-worker2")
             .make()
             .expect("make executor");
-        ex.run(run_worker(1, rx, wal));
+        ex.run(run_worker(1, rx, wal, index));
     });
 
     let (flush_tx, flush_rx) = oneshot::channel();

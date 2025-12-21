@@ -23,6 +23,7 @@ use satoridb::rebalancer::RebalanceWorker;
 use satoridb::router::RoutingTable;
 use satoridb::storage::{Storage, Vector};
 use satoridb::tasks::{ConsistentHashRing, RouterResult, RouterTask};
+use satoridb::vector_index::VectorIndex;
 use satoridb::wal::runtime::Walrus;
 use satoridb::wal::{FsyncSchedule, ReadConsistency};
 use satoridb::worker::{run_worker, QueryRequest, WorkerMessage};
@@ -192,6 +193,9 @@ fn main() -> anyhow::Result<()> {
         ReadConsistency::StrictlyAtOnce,
         FsyncSchedule::NoFsync,
     )?);
+    let vector_index_path =
+        std::env::var("SATORI_VECTOR_INDEX_PATH").unwrap_or_else(|_| "vector_index".to_string());
+    let vector_index = Arc::new(VectorIndex::open(&vector_index_path)?);
 
     // Create Worker Channels (async for backpressure)
     let mut senders = Vec::new();
@@ -201,6 +205,7 @@ fn main() -> anyhow::Result<()> {
         let (sender, receiver) = async_channel::bounded(1000);
         senders.push(sender);
         let wal_clone = wal.clone();
+        let index_clone = vector_index.clone();
         let pin_cpu = i % usable_cores;
         let handle = thread::spawn(move || {
             let builder =
@@ -209,7 +214,7 @@ fn main() -> anyhow::Result<()> {
             builder
                 .make()
                 .expect("failed to create executor")
-                .run(run_worker(i, receiver, wal_clone));
+                .run(run_worker(i, receiver, wal_clone, index_clone));
         });
         worker_handles.push(handle);
     }

@@ -49,6 +49,7 @@ thread_local = "1.1"
 async-trait = "0.1.89"
 env_logger = "0.11.8"
 tempfile = "3.10"
+rocksdb = { version = "0.24", default-features = false, features = ["zstd"] }
 
 [profile.release]
 debug = true

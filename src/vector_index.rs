@@ -1,0 +1,105 @@
+use crate::storage::Vector;
+use anyhow::{anyhow, Context, Result};
+use rkyv::{
+    check_archived_root, ser::serializers::AllocSerializer, ser::Serializer, AlignedVec,
+    Deserialize,
+};
+use rocksdb::{BlockBasedOptions, Cache, Options, WriteBatch, DB};
+use std::path::Path;
+
+/// Persistent map of `vector_id -> archived Vector` stored in RocksDB.
+///
+/// This keeps lookup-by-id feasible at high cardinality without holding everything in RAM.
+pub struct VectorIndex {
+    db: DB,
+}
+
+impl VectorIndex {
+    pub fn open(path: impl AsRef<Path>) -> Result<Self> {
+        let mut opts = Options::default();
+        opts.create_if_missing(true);
+        opts.set_compression_type(rocksdb::DBCompressionType::Zstd);
+        opts.optimize_level_style_compaction(64 * 1024 * 1024);
+        // Keep memory bounded: ~64MB block cache + two 16MB memtables ≈ 96MB.
+        let cache = Cache::new_lru_cache(64 * 1024 * 1024);
+        let mut block_opts = BlockBasedOptions::default();
+        block_opts.set_block_cache(&cache);
+        opts.set_block_based_table_factory(&block_opts);
+        opts.set_write_buffer_size(16 * 1024 * 1024);
+        opts.set_max_write_buffer_number(2);
+        let db = DB::open(&opts, path).context("open vector index")?;
+        Ok(Self { db })
+    }
+
+    /// Insert or overwrite a batch of vectors.
+    pub fn put_batch(&self, vectors: &[Vector]) -> Result<()> {
+        if vectors.is_empty() {
+            return Ok(());
+        }
+        let mut batch = WriteBatch::default();
+        for v in vectors {
+            let mut ser = AllocSerializer::<256>::default();
+            ser.serialize_value(v)
+                .context("serialize vector for index")?;
+            let bytes: AlignedVec = ser.into_serializer().into_inner();
+            batch.put(v.id.to_le_bytes(), bytes);
+        }
+        self.db.write(batch).context("write vector index batch")
+    }
+
+    /// Delete a batch of ids (best-effort; missing keys are ignored).
+    #[allow(dead_code)]
+    pub fn delete_batch(&self, ids: &[u64]) -> Result<()> {
+        if ids.is_empty() {
+            return Ok(());
+        }
+        let mut batch = WriteBatch::default();
+        for id in ids {
+            batch.delete(id.to_le_bytes());
+        }
+        self.db.write(batch).context("delete vector index batch")
+    }
+
+    /// Fetch the stored vectors for the given ids. Missing ids are skipped.
+    pub fn get_many(&self, ids: &[u64]) -> Result<Vec<(u64, Vector)>> {
+        let mut out = Vec::with_capacity(ids.len());
+        for id in ids {
+            if let Some(raw) = self
+                .db
+                .get(id.to_le_bytes())
+                .with_context(|| format!("read id {} from vector index", id))?
+            {
+                let archived = check_archived_root::<Vector>(&raw)
+                    .map_err(|e| anyhow!("validate archived vector: {:?}", e))?;
+                let vec: Vector = archived.deserialize(&mut rkyv::Infallible)?;
+                out.push((*id, vec));
+            }
+        }
+        Ok(out)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn index_round_trip() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let index = VectorIndex::open(dir.path()).expect("open index");
+
+        let v1 = Vector::new(1, vec![1.0, 2.0, 3.0]);
+        let v2 = Vector::new(2, vec![4.0, 5.0, 6.0]);
+        index.put_batch(&[v1.clone(), v2.clone()]).expect("put");
+
+        let got = index
+            .get_many(&[1, 2, 3])
+            .expect("get")
+            .into_iter()
+            .map(|(_, v)| (v.id, v.data))
+            .collect::<Vec<_>>();
+        assert_eq!(got.len(), 2);
+        assert!(got.contains(&(v1.id, v1.data)));
+        assert!(got.contains(&(v2.id, v2.data)));
+    }
+}

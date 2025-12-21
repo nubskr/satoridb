@@ -1,6 +1,7 @@
 use crate::router_manager::{spawn_router_manager, RouterCommand, RouterShutdownRequest};
 use crate::service::SatoriHandle;
 use crate::tasks::ConsistentHashRing;
+use crate::vector_index::VectorIndex;
 use crate::wal::runtime::Walrus;
 use crate::worker::{run_worker, WorkerMessage};
 use anyhow::{anyhow, Result};
@@ -8,6 +9,7 @@ use crossbeam_channel::unbounded;
 use futures::channel::oneshot;
 use futures::executor::block_on;
 use glommio::{LocalExecutorBuilder, Placement};
+use std::path::PathBuf;
 use std::sync::Arc;
 use std::thread;
 
@@ -18,15 +20,21 @@ pub struct SatoriDbConfig {
     pub workers: usize,
     /// Virtual nodes used by the consistent hash ring for bucket->shard mapping.
     pub virtual_nodes: usize,
+    /// Path for the RocksDB-backed vector index (id -> serialized vector payload).
+    pub vector_index_path: PathBuf,
 }
 
 impl SatoriDbConfig {
     /// Create a config with sane defaults.
     pub fn new(wal: Arc<Walrus>) -> Self {
+        let vector_index_path = std::env::var("SATORI_VECTOR_INDEX_PATH")
+            .map(PathBuf::from)
+            .unwrap_or_else(|_| PathBuf::from("vector_index"));
         Self {
             wal,
             workers: num_cpus::get().max(1),
             virtual_nodes: 8,
+            vector_index_path,
         }
     }
 }
@@ -51,6 +59,7 @@ impl SatoriDb {
             return Err(anyhow!("workers must be > 0"));
         }
         let workers = cfg.workers;
+        let vector_index = Arc::new(VectorIndex::open(&cfg.vector_index_path)?);
 
         let mut worker_senders = Vec::new();
         let mut worker_handles = Vec::new();
@@ -59,6 +68,7 @@ impl SatoriDb {
             worker_senders.push(sender);
 
             let wal_clone = cfg.wal.clone();
+            let index_clone = vector_index.clone();
             let pin_cpu = i % num_cpus::get().max(1);
             let handle = thread::spawn(move || {
                 let builder = LocalExecutorBuilder::new(Placement::Fixed(pin_cpu))
@@ -66,7 +76,7 @@ impl SatoriDb {
                 builder
                     .make()
                     .expect("failed to create executor")
-                    .run(run_worker(i, receiver, wal_clone));
+                    .run(run_worker(i, receiver, wal_clone, index_clone));
             });
             worker_handles.push(handle);
         }
@@ -88,7 +98,12 @@ impl SatoriDb {
         block_on(ready_rx)
             .map_err(|e| anyhow!("router manager failed to become ready: {:?}", e))?;
 
-        let api = SatoriHandle::new(router_tx.clone(), ring, worker_senders.clone());
+        let api = SatoriHandle::new(
+            router_tx.clone(),
+            ring,
+            worker_senders.clone(),
+            vector_index.clone(),
+        );
 
         Ok(Self {
             api,

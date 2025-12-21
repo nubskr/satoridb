@@ -131,7 +131,7 @@ pub fn start(cfg: SatoriDbConfig) -> Result<Self> {
         let handle = thread::spawn(move || {
             LocalExecutorBuilder::new(Placement::Fixed(pin_cpu))
                 .make()
-                .run(run_worker(i, receiver, wal_clone));
+                .run(run_worker(i, receiver, wal_clone, vector_index.clone()));
         });
     }
     // Spawn router manager
@@ -200,7 +200,12 @@ pub struct Router {
 Each worker runs on a dedicated thread with a Glommio async executor (`worker.rs:39-144`).
 
 ```rust
-pub async fn run_worker(id: usize, receiver: Receiver<WorkerMessage>, wal: Arc<Walrus>) {
+pub async fn run_worker(
+    id: usize,
+    receiver: Receiver<WorkerMessage>,
+    wal: Arc<Walrus>,
+    vector_index: Arc<VectorIndex>,
+) {
     let storage = Storage::new(wal.clone());
     let cache = WorkerCache::new(64, 64 * 1024 * 1024, 64 * 64 * 1024 * 1024);  // prealloc 64 buckets × 64MB each
     let executor = Rc::new(Executor::new(storage, cache));
@@ -211,8 +216,8 @@ pub async fn run_worker(id: usize, receiver: Receiver<WorkerMessage>, wal: Arc<W
     while let Ok(msg) = receiver.recv().await {
         match msg {
             WorkerMessage::Query(req) => { /* dispatch to executor */ }
-            WorkerMessage::Upsert { .. } => { /* append to WAL */ }
-            WorkerMessage::Ingest { .. } => { /* batch append */ }
+            WorkerMessage::Upsert { .. } => { /* append to WAL + update vector index */ }
+            WorkerMessage::Ingest { .. } => { /* batch append + update vector index */ }
             ...
         }
     }
@@ -632,6 +637,7 @@ On startup (`router_manager.rs:364-391`):
 |---------------------|---------|-------------|
 | `SATORI_ROUTER_REBUILD_EVERY` | 1000 | Rebuild HNSW after N upserts |
 | `SATORI_REBALANCE_THRESHOLD` | 2000 | Split buckets larger than this |
+| `SATORI_VECTOR_INDEX_PATH` | `vector_index` | RocksDB-backed `id -> vector` index location |
 | `WALRUS_DATA_DIR` | `./wal_files` | WAL storage directory |
 
 ---

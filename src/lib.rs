@@ -72,6 +72,8 @@ pub mod service;
 pub mod storage;
 #[doc(hidden)]
 pub mod tasks;
+#[doc(hidden)]
+pub mod vector_index;
 pub mod wal;
 #[doc(hidden)]
 pub mod worker;

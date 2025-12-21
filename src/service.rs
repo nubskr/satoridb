@@ -1,5 +1,6 @@
 use crate::router_manager::{BucketMeta, RouterCommand, RouterStats};
 use crate::tasks::ConsistentHashRing;
+use crate::vector_index::VectorIndex;
 use crate::worker::{QueryRequest, WorkerMessage};
 use anyhow::{anyhow, Result};
 use async_channel::Sender as AsyncSender;
@@ -15,6 +16,7 @@ pub struct SatoriHandle {
     router_tx: CrossbeamSender<RouterCommand>,
     ring: ConsistentHashRing,
     worker_senders: Vec<AsyncSender<WorkerMessage>>,
+    vector_index: Arc<VectorIndex>,
 }
 
 impl SatoriHandle {
@@ -22,11 +24,13 @@ impl SatoriHandle {
         router_tx: CrossbeamSender<RouterCommand>,
         ring: ConsistentHashRing,
         worker_senders: Vec<AsyncSender<WorkerMessage>>,
+        vector_index: Arc<VectorIndex>,
     ) -> Self {
         Self {
             router_tx,
             ring,
             worker_senders,
+            vector_index,
         }
     }
 
@@ -129,6 +133,14 @@ impl SatoriHandle {
             .map_err(|e| anyhow!("fetch failed: {:?}", e))
     }
 
+    /// Fetch vectors globally by id via the RocksDB-backed index.
+    ///
+    /// Missing ids are skipped in the response.
+    pub async fn fetch_vectors_by_id(&self, ids: Vec<u64>) -> Result<Vec<(u64, Vec<f32>)>> {
+        let vectors = self.vector_index.get_many(&ids)?;
+        Ok(vectors.into_iter().map(|(id, v)| (id, v.data)).collect())
+    }
+
     /// Flush worker state and write a router snapshot.
     pub async fn flush(&self) -> Result<()> {
         let mut flush_waiters = Vec::new();
@@ -201,6 +213,11 @@ impl SatoriHandle {
         ids: Vec<u64>,
     ) -> Result<Vec<(u64, Vec<f32>)>> {
         block_on(self.fetch_vectors(bucket_id, ids))
+    }
+
+    /// Blocking wrapper around [`Self::fetch_vectors_by_id`].
+    pub fn fetch_vectors_by_id_blocking(&self, ids: Vec<u64>) -> Result<Vec<(u64, Vec<f32>)>> {
+        block_on(self.fetch_vectors_by_id(ids))
     }
 
     /// Blocking wrapper around [`Self::flush`].

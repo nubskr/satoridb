@@ -69,11 +69,21 @@ for (id, distance, vector) in hits {
 
 Trade-offs: enabling this clones and ships the full vectors—expect higher CPU and larger responses. Leave it off for latency-sensitive or high-QPS paths.
 
+If you just need to fetch vectors by id (without knowing their bucket), use the RocksDB-backed index:
+
+```rust
+let stored = api.fetch_vectors_by_id_blocking(vec![42, 1337])?;
+for (id, vec) in stored {
+    println!("id={id} vec={vec:?}");
+}
+```
+
 ## Configuration via environment variables
 
 - `SATORI_CORES`: total cores to reserve for the process (defaults to `num_cpus`). Router/executor threads are derived from this.
 - `SATORI_WORKER_CACHE_BUCKETS`: max cached buckets per worker executor (default `64`; cache arena is preallocated at startup).
 - `SATORI_WORKER_CACHE_BUCKET_MB`: max size (MB) per cached bucket (default `64`; buckets larger than this are served uncached, and total preallocation is `buckets * MB`).
+- `SATORI_VECTOR_INDEX_PATH`: filesystem path for the RocksDB-backed `id -> vector` index (default `vector_index` in the working directory).
 - `SATORI_ROUTER_REBUILD_EVERY`: how many router updates before rebuilding the in-memory router (default `1000`).
 - `SATORI_REBALANCE_THRESHOLD`: vectors per bucket before triggering a split (default `4`).
 

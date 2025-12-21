@@ -2,6 +2,7 @@ use crate::executor::{Executor, WorkerCache};
 use crate::ingest_counter;
 use crate::storage::wal::runtime::Walrus;
 use crate::storage::{Bucket, Storage, StorageExecMode, Vector};
+use crate::vector_index::VectorIndex;
 use async_channel::Receiver;
 use futures::channel::oneshot;
 use log::{error, info};
@@ -46,7 +47,12 @@ pub enum WorkerMessage {
     },
 }
 
-pub async fn run_worker(id: usize, receiver: Receiver<WorkerMessage>, wal: Arc<Walrus>) {
+pub async fn run_worker(
+    id: usize,
+    receiver: Receiver<WorkerMessage>,
+    wal: Arc<Walrus>,
+    vector_index: Arc<VectorIndex>,
+) {
     info!("Worker {} started.", id);
 
     let storage = Storage::new(wal.clone()).with_mode(StorageExecMode::Offload);
@@ -110,6 +116,14 @@ pub async fn run_worker(id: usize, receiver: Receiver<WorkerMessage>, wal: Arc<W
                 let mut bucket = Bucket::new(bucket_id, Vec::new());
                 bucket.vectors = vec![vector];
                 let result = storage.put_chunk(&bucket).await;
+                if result.is_ok() {
+                    if let Err(e) = vector_index.put_batch(&bucket.vectors) {
+                        error!(
+                            "Worker {} failed to update vector index for bucket {}: {:?}",
+                            id, bucket_id, e
+                        );
+                    }
+                }
                 let _ = respond_to.send(result);
             }
             WorkerMessage::FetchVectors {
@@ -127,6 +141,7 @@ pub async fn run_worker(id: usize, receiver: Receiver<WorkerMessage>, wal: Arc<W
                 limit_tx.send(()).await.unwrap();
                 let limit_rx = limit_rx.clone();
                 let storage = storage.clone();
+                let vector_index = vector_index.clone();
                 glommio::spawn_local(async move {
                     let topic = Storage::topic_for(bucket_id);
                     loop {
@@ -136,6 +151,12 @@ pub async fn run_worker(id: usize, receiver: Receiver<WorkerMessage>, wal: Arc<W
                         {
                             Ok(_) => {
                                 ingest_counter::add(vectors.len() as u64);
+                                if let Err(e) = vector_index.put_batch(&vectors) {
+                                    error!(
+                                        "Worker {} failed to update vector index for bucket {}: {:?}",
+                                        id, bucket_id, e
+                                    );
+                                }
                                 break;
                             }
                             Err(e) => {
