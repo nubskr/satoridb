@@ -7,13 +7,37 @@
 
 </div>
 
-# SatoriDB
-
-Billion scale embedded vector database for approximate nearest neighbor (ANN) search.
-
 # Architecture
 
-SatoriDB uses a two-tier architecture: an HNSW index routes queries to the most relevant buckets (clusters of similar vectors), then CPU-pinned workers scan those buckets in parallel. Vectors are automatically clustered and rebalanced as data grows.
+![architecture](./assets/architecture.png)
+
+SatoriDB runs entirely in-process on a single node. It uses a **two-tier search** architecture:
+
+1. **Routing (HNSW)**: A quantized HNSW index over bucket centroids finds the most relevant clusters in O(log N)
+2. **Scanning (Workers)**: CPU-pinned Glommio executors scan selected buckets in parallel using SIMD-accelerated L2 distance
+
+We use a variant of [SPFresh](https://arxiv.org/pdf/2410.14452), Vectors are organized into **buckets** (clusters of similar vectors). A background rebalancer automatically splits buckets via k-means when they exceed a threshold, keeping search efficient as data grows. All data is persisted to walrus high performance storage engine and we use RocksDB indexes for point lookups.
+
+See [docs/architecture.md](docs/architecture.md) for detailed documentation including:
+- System overview and component diagrams
+- Two-tier search architecture
+- Storage layer (Walrus + RocksDB)
+- Rebalancer and clustering algorithms
+- Data flow diagrams
+
+```
+SatoriHandle ──▶ Router Manager ──▶ HNSW Index (centroids)
+      │                                   │
+      │         ┌─────────────────────────┘
+      │         ▼
+      │    Bucket IDs ──▶ Consistent Hash Ring
+      │                          │
+      ▼                          ▼
+  Workers ◀──────────────── bucket_id → shard
+      │
+      ▼
+  Walrus (storage) + RocksDB (indexes)
+```
 
 ## Features
 
@@ -99,29 +123,6 @@ let vectors = api.fetch_vectors_by_id_blocking(vec![1, 2, 3])?;
 |-----------|-------------|
 | `top_k` | Number of results to return |
 | `router_top_k` | Number of buckets to probe (higher = better recall, slower) |
-
-## Architecture
-
-See [docs/architecture.md](docs/architecture.md) for detailed documentation including:
-- System overview and component diagrams
-- Two-tier search architecture
-- Storage layer (Walrus + RocksDB)
-- Rebalancer and clustering algorithms
-- Data flow diagrams
-
-```
-SatoriHandle ──▶ Router Manager ──▶ HNSW Index (centroids)
-      │                                   │
-      │         ┌─────────────────────────┘
-      │         ▼
-      │    Bucket IDs ──▶ Consistent Hash Ring
-      │                          │
-      ▼                          ▼
-  Workers ◀──────────────── bucket_id → shard
-      │
-      ▼
-  Walrus (storage) + RocksDB (indexes)
-```
 
 ## Configuration
 
