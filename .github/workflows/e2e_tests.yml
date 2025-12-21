@@ -15,6 +15,8 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
+      - name: Install system dependencies
+        run: sudo apt-get update && sudo apt-get install -y clang llvm-dev libclang-dev
       - name: Install Rust
         run: rustup update stable
       - name: Cache dependencies
@@ -33,3 +35,5 @@ jobs:
         run: cargo test --test chaos_rebalance_integration
       - name: Run Serial Tests
         run: cargo test --test serial_tests -- --ignored --test-threads=1
+      - name: Run Extreme Stress (ignored)
+        run: cargo test --test extreme_stress -- --ignored --nocapture
