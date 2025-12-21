@@ -850,43 +850,48 @@ fn deletes_remain_consistent_under_burst() -> Result<()> {
 
     let decode = |storage: &Storage, bucket_id: u64| -> Vec<Vector> {
         let chunks = block_on(storage.get_chunks(bucket_id)).expect("chunks");
-        let Some(chunk) = chunks.last() else {
-            return Vec::new();
-        };
-        if chunk.len() < 16 {
-            return Vec::new();
-        }
-        let mut len_bytes = [0u8; 8];
-        len_bytes.copy_from_slice(&chunk[0..8]);
-        let archive_len = u64::from_le_bytes(len_bytes) as usize;
-        if 8 + archive_len > chunk.len() {
-            return Vec::new();
-        }
         let mut out = Vec::new();
-        let mut off = 8;
-        while off + 16 <= chunk.len() {
-            let mut id_bytes = [0u8; 8];
-            id_bytes.copy_from_slice(&chunk[off..off + 8]);
-            off += 8;
-            let mut dim_bytes = [0u8; 8];
-            dim_bytes.copy_from_slice(&chunk[off..off + 8]);
-            off += 8;
-            let dim = u64::from_le_bytes(dim_bytes) as usize;
-            let bytes_needed = dim.saturating_mul(4);
-            if off + bytes_needed > chunk.len() {
-                break;
+        // Walk reverse to respect latest updates (and tombstones)
+        let mut seen = HashSet::new();
+
+        for chunk in chunks.iter().rev() {
+            if chunk.len() < 16 {
+                continue;
             }
-            let mut data = Vec::with_capacity(dim);
-            for fb in chunk[off..off + bytes_needed].chunks_exact(4) {
-                let mut buf = [0u8; 4];
-                buf.copy_from_slice(fb);
-                data.push(f32::from_bits(u32::from_le_bytes(buf)));
+            let mut len_bytes = [0u8; 8];
+            len_bytes.copy_from_slice(&chunk[0..8]);
+            let archive_len = u64::from_le_bytes(len_bytes) as usize;
+            if 8 + archive_len > chunk.len() {
+                continue;
             }
-            out.push(Vector {
-                id: u64::from_le_bytes(id_bytes),
-                data,
-            });
-            off += bytes_needed;
+            let mut off = 8;
+            while off + 16 <= chunk.len() {
+                let mut id_bytes = [0u8; 8];
+                id_bytes.copy_from_slice(&chunk[off..off + 8]);
+                off += 8;
+                let mut dim_bytes = [0u8; 8];
+                dim_bytes.copy_from_slice(&chunk[off..off + 8]);
+                off += 8;
+                let dim = u64::from_le_bytes(dim_bytes) as usize;
+                let bytes_needed = dim.saturating_mul(4);
+                if off + bytes_needed > chunk.len() {
+                    break;
+                }
+                let mut data = Vec::with_capacity(dim);
+                for fb in chunk[off..off + bytes_needed].chunks_exact(4) {
+                    let mut buf = [0u8; 4];
+                    buf.copy_from_slice(fb);
+                    data.push(f32::from_bits(u32::from_le_bytes(buf)));
+                }
+                let id = u64::from_le_bytes(id_bytes);
+
+                if seen.insert(id) {
+                    if !data.is_empty() {
+                        out.push(Vector { id, data });
+                    }
+                }
+                off += bytes_needed;
+            }
         }
         out
     };

@@ -2,6 +2,7 @@
 
 - `embedded_basic.rs`: minimal blocking setup, two upserts, one query, clean shutdown.
 - `embedded_async.rs`: async API, custom WAL durability (read consistency and fsync schedule), tuned worker/virtual-node counts, router_top_k, bucket-hinted upsert, flush + stats.
+- `api_tour.rs`: comprehensive tour of all APIs including query variants, global vs. bucket-local fetching, bucket resolution, and stats.
 
 ## Tuning Cheatsheet
 

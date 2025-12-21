@@ -1,4 +1,5 @@
 use crate::bucket_index::BucketIndex;
+use crate::rebalancer::DeleteCommand;
 use crate::router_manager::{BucketMeta, RouterCommand, RouterStats};
 use crate::tasks::ConsistentHashRing;
 use crate::vector_index::VectorIndex;
@@ -17,6 +18,7 @@ pub struct SatoriHandle {
     router_tx: CrossbeamSender<RouterCommand>,
     ring: ConsistentHashRing,
     worker_senders: Vec<AsyncSender<WorkerMessage>>,
+    delete_tx: AsyncSender<DeleteCommand>,
     vector_index: Arc<VectorIndex>,
     bucket_index: Arc<BucketIndex>,
 }
@@ -26,6 +28,7 @@ impl SatoriHandle {
         router_tx: CrossbeamSender<RouterCommand>,
         ring: ConsistentHashRing,
         worker_senders: Vec<AsyncSender<WorkerMessage>>,
+        delete_tx: AsyncSender<DeleteCommand>,
         vector_index: Arc<VectorIndex>,
         bucket_index: Arc<BucketIndex>,
     ) -> Self {
@@ -33,6 +36,7 @@ impl SatoriHandle {
             router_tx,
             ring,
             worker_senders,
+            delete_tx,
             vector_index,
             bucket_index,
         }
@@ -107,6 +111,23 @@ impl SatoriHandle {
 
         let meta = self.apply_upsert_to_router(bucket_id, &vector).await?;
         Ok((bucket_id, meta))
+    }
+
+    /// Delete a vector by ID.
+    ///
+    /// This operation is asynchronous and handled by the background rebalancer.
+    /// It updates indexes immediately but space reclamation happens in the background.
+    pub async fn delete(&self, id: u64) -> Result<()> {
+        let (tx, rx) = oneshot::channel();
+        self.delete_tx
+            .send(DeleteCommand {
+                vector_id: id,
+                bucket_hint: None,
+                respond_to: tx,
+            })
+            .await
+            .map_err(|_| anyhow!("rebalance/delete channel closed"))?;
+        rx.await.map_err(|e| anyhow!("delete canceled: {:?}", e))?
     }
 
     /// Fetch vectors by id within a bucket.
@@ -215,6 +236,11 @@ impl SatoriHandle {
         bucket_hint: Option<u64>,
     ) -> Result<(u64, BucketMeta)> {
         block_on(self.upsert(id, vector, bucket_hint))
+    }
+
+    /// Blocking wrapper around [`Self::delete`].
+    pub fn delete_blocking(&self, id: u64) -> Result<()> {
+        block_on(self.delete(id))
     }
 
     /// Blocking wrapper around [`Self::fetch_vectors`].

@@ -1,7 +1,10 @@
 use crate::bucket_index::BucketIndex;
 use crate::bucket_locks::BucketLocks;
+use crate::rebalancer::RebalanceWorker;
+use crate::router::RoutingTable;
 use crate::router_manager::{spawn_router_manager, RouterCommand, RouterShutdownRequest};
 use crate::service::SatoriHandle;
+use crate::storage::Storage;
 use crate::tasks::ConsistentHashRing;
 use crate::vector_index::VectorIndex;
 use crate::wal::runtime::Walrus;
@@ -77,6 +80,11 @@ pub struct SatoriDb {
     router_handle: thread::JoinHandle<()>,
     worker_senders: Vec<async_channel::Sender<WorkerMessage>>,
     worker_handles: Vec<thread::JoinHandle<()>>,
+    // We hold the rebalancer here to keep the background thread alive (if we implemented shutdown later).
+    // For now it just runs detached in background via spawn().
+    #[allow(dead_code)]
+    rebalance_worker: RebalanceWorker,
+    rebalance_thread: Option<thread::JoinHandle<()>>,
 }
 
 impl SatoriDb {
@@ -85,6 +93,7 @@ impl SatoriDb {
     /// This spawns:
     /// - 1 router manager thread
     /// - `cfg.workers` worker threads (each running a Glommio local executor)
+    /// - 1 rebalancer thread
     pub fn start(cfg: SatoriDbConfig) -> Result<Self> {
         if cfg.workers == 0 {
             return Err(anyhow!("workers must be > 0"));
@@ -128,22 +137,23 @@ impl SatoriDb {
         let (router_tx, router_rx) = unbounded::<RouterCommand>();
         let router_handle = spawn_router_manager(cfg.wal.clone(), router_rx);
 
-        // Readiness barrier: ensure the router manager has finished loading state before returning.
-        let (ready_tx, ready_rx) = oneshot::channel();
-        router_tx
-            .send(RouterCommand::Stats(
-                crate::router_manager::RouterStatsRequest {
-                    respond_to: ready_tx,
-                },
-            ))
-            .map_err(|e| anyhow!("router manager not running: {:?}", e))?;
-        block_on(ready_rx)
-            .map_err(|e| anyhow!("router manager failed to become ready: {:?}", e))?;
+        // RoutingTable shared with rebalancer
+        let routing_table = Arc::new(RoutingTable::new());
+
+        // Spawn Rebalancer in delete-only mode
+        let (rebalance_worker, rebalance_thread) = RebalanceWorker::spawn_delete_only(
+            Storage::new(cfg.wal.clone()),
+            vector_index.clone(),
+            bucket_index.clone(),
+            routing_table.clone(),
+            bucket_locks.clone(),
+        );
 
         let api = SatoriHandle::new(
             router_tx.clone(),
             ring,
             worker_senders.clone(),
+            rebalance_worker.delete_tx.clone(),
             vector_index.clone(),
             bucket_index.clone(),
         );
@@ -154,6 +164,8 @@ impl SatoriDb {
             router_handle,
             worker_senders,
             worker_handles,
+            rebalance_worker,
+            rebalance_thread: Some(rebalance_thread),
         })
     }
 
@@ -163,7 +175,7 @@ impl SatoriDb {
     }
 
     /// Flush state (best-effort) and shut down router/workers.
-    pub fn shutdown(self) -> Result<()> {
+    pub fn shutdown(mut self) -> Result<()> {
         // Best-effort: persist a router snapshot so startup can skip replaying the full update log.
         let (flush_tx, flush_rx) = oneshot::channel();
         let _ = self.router_tx.send(RouterCommand::Flush(
@@ -190,6 +202,9 @@ impl SatoriDb {
             let _ = block_on(rx);
         }
 
+        // Close delete channel to signal rebalancer to stop
+        self.rebalance_worker.delete_tx.close();
+
         for sender in &self.worker_senders {
             sender.close();
         }
@@ -202,6 +217,11 @@ impl SatoriDb {
             let _ = h.join();
         }
         let _ = self.router_handle.join();
+
+        if let Some(h) = self.rebalance_thread.take() {
+            let _ = h.join();
+        }
+
         Ok(())
     }
 }

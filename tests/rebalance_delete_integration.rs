@@ -100,7 +100,6 @@ fn delete_removes_vector_and_indexes() -> Result<()> {
 }
 
 #[test]
-#[ignore]
 fn delete_queue_drains_under_burst_load() -> Result<()> {
     // Avoid rebalancing during the burst so we focus on delete behavior.
     std::env::set_var("SATORI_REBALANCE_THRESHOLD", "10000");

@@ -140,7 +140,10 @@ impl RebalanceState {
 
     pub(crate) fn load_bucket_vectors(&self, bucket_id: u64) -> Option<Vec<Vector>> {
         let chunks = Storage::get_chunks_sync(self.storage.wal.clone(), bucket_id).ok()?;
-        let mut vectors: Vec<Vector> = Vec::new();
+        // Use a map to deduplicate IDs, keeping the latest version (append-only log).
+        // This prevents exponential growth when rewriting buckets on delete.
+        let mut vector_map: HashMap<u64, Vector> = HashMap::new();
+
         for chunk in chunks {
             if chunk.len() < 8 {
                 continue;
@@ -151,7 +154,6 @@ impl RebalanceState {
             if 8 + archive_len > chunk.len() || archive_len < 16 {
                 continue;
             }
-            // Current WAL format: len prefix, then id (u64), dim (u64), then dim*f32 bytes.
             let mut off = 8;
             let mut id_bytes = [0u8; 8];
             id_bytes.copy_from_slice(&chunk[off..off + 8]);
@@ -174,9 +176,20 @@ impl RebalanceState {
                 data.push(f32::from_bits(u32::from_le_bytes(fb)));
             }
             let id = u64::from_le_bytes(id_bytes);
-            vectors.push(Vector { id, data });
+
+            if data.is_empty() {
+                // Tombstone
+                vector_map.remove(&id);
+            } else {
+                vector_map.insert(id, Vector { id, data });
+            }
         }
-        (!vectors.is_empty()).then_some(vectors)
+
+        if vector_map.is_empty() {
+            None
+        } else {
+            Some(vector_map.into_values().collect())
+        }
     }
 
     fn retire_bucket_local(&self, bucket_id: u64) {
@@ -361,7 +374,7 @@ impl RebalanceState {
 
 pub struct RebalanceWorker {
     state: Arc<RebalanceState>,
-    delete_tx: async_channel::Sender<DeleteCommand>,
+    pub delete_tx: async_channel::Sender<DeleteCommand>,
 }
 
 impl RebalanceWorker {
@@ -431,6 +444,40 @@ impl RebalanceWorker {
         Self { state, delete_tx }
     }
 
+    /// Spawns a background worker that ONLY handles deletes and does NOT perform
+    /// autonomous rebalancing (splitting/merging).
+    pub fn spawn_delete_only(
+        storage: Storage,
+        vector_index: Arc<VectorIndex>,
+        bucket_index: Arc<BucketIndex>,
+        routing: Arc<RoutingTable>,
+        bucket_locks: Arc<BucketLocks>,
+    ) -> (Self, std::thread::JoinHandle<()>) {
+        let state = Arc::new(RebalanceState::new(
+            storage,
+            vector_index,
+            bucket_index,
+            routing,
+            bucket_locks,
+        ));
+        let state_clone = state.clone();
+        let (delete_tx, delete_rx) = async_channel::bounded(1024);
+        let name = "delete-worker".to_string();
+
+        let handle = thread::Builder::new()
+            .name(name.clone())
+            .spawn(move || {
+                glommio::LocalExecutorBuilder::default()
+                    .name(&name)
+                    .make()
+                    .expect("failed to create delete executor")
+                    .run(run_delete_loop(state_clone, delete_rx));
+            })
+            .expect("delete worker");
+
+        (Self { state, delete_tx }, handle)
+    }
+
     pub async fn prime_centroids(&self, buckets: &[Bucket]) -> Result<()> {
         self.state.prime_centroids(buckets);
         self.state.rebuild_router(Vec::new());
@@ -490,6 +537,17 @@ impl Clone for RebalanceWorker {
         Self {
             state: self.state.clone(),
             delete_tx: self.delete_tx.clone(),
+        }
+    }
+}
+
+async fn run_delete_loop(
+    state: Arc<RebalanceState>,
+    delete_rx: async_channel::Receiver<DeleteCommand>,
+) {
+    while let Ok(cmd) = delete_rx.recv().await {
+        if let Err(e) = handle_delete(&state, cmd).await {
+            warn!("rebalance: delete failed: {:?}", e);
         }
     }
 }
