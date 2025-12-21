@@ -355,6 +355,8 @@ fn restart_recovers_state_after_soak() -> Result<()> {
         let guard = recorded.read();
         guard.keys().copied().collect()
     };
+    drop(handle);
+    drop(wal);
     db.shutdown()?;
 
     // Restart with the same WAL/index paths and validate the persisted payloads.
@@ -477,5 +479,297 @@ fn multi_worker_mixed_workload_churn() -> Result<()> {
         );
     }
     db.shutdown()?;
+    Ok(())
+}
+
+/// Saturate a tiny worker channel to ensure backpressure doesn't panic or drop messages.
+#[test]
+#[ignore]
+fn worker_channel_backpressure_survives_burst() -> Result<()> {
+    let tmp = tempfile::tempdir()?;
+    let wal = init_wal(&tmp);
+    let index = Arc::new(VectorIndex::open(tmp.path().join("vectors"))?);
+    let bucket_index = Arc::new(BucketIndex::open(tmp.path().join("buckets"))?);
+    let bucket_locks = Arc::new(BucketLocks::new());
+
+    // Very small channel to force senders to block.
+    let (tx, rx) = async_channel::bounded(4);
+    let wal_worker = wal.clone();
+    let index_worker = index.clone();
+    let bucket_index_worker = bucket_index.clone();
+    let bucket_locks_worker = bucket_locks.clone();
+    let handle = std::thread::spawn(move || {
+        let ex = glommio::LocalExecutorBuilder::new(glommio::Placement::Unbound)
+            .name("backpressure-worker")
+            .make()
+            .expect("make executor");
+        ex.run(run_worker(
+            0,
+            rx,
+            wal_worker,
+            index_worker,
+            bucket_index_worker,
+            bucket_locks_worker,
+        ));
+    });
+
+    let successes = Arc::new(AtomicU64::new(0));
+    std::thread::scope(|s| {
+        for t in 0..6 {
+            let tx = tx.clone();
+            let successes = successes.clone();
+            s.spawn(move || {
+                let mut seed = 0xdead_beef_0101_0000u64 ^ (t as u64);
+                for _ in 0..200 {
+                    let id = lcg(&mut seed);
+                    let vec = make_vec(&mut seed, 8);
+                    let (resp_tx, resp_rx) = oneshot::channel();
+                    tx.send_blocking(WorkerMessage::Ingest {
+                        bucket_id: 0,
+                        vectors: vec![Vector::new(id, vec)],
+                        respond_to: resp_tx,
+                    })
+                    .expect("send ingest");
+                    block_on(resp_rx).expect("ack recv").expect("ingest ok");
+                    successes.fetch_add(1, Ordering::Relaxed);
+                }
+            });
+        }
+    });
+
+    let (flush_tx, flush_rx) = oneshot::channel();
+    tx.send_blocking(WorkerMessage::Flush {
+        respond_to: flush_tx,
+    })
+    .expect("flush send");
+    block_on(flush_rx).expect("flush ack");
+
+    let (shutdown_tx, shutdown_rx) = oneshot::channel();
+    tx.send_blocking(WorkerMessage::Shutdown {
+        respond_to: shutdown_tx,
+    })
+    .expect("shutdown send");
+    block_on(shutdown_rx).expect("shutdown ack");
+    handle.join().expect("worker thread joined");
+
+    // Ensure most writes landed.
+    let ingested = successes.load(Ordering::Relaxed);
+    assert!(
+        ingested >= 800,
+        "expected high ingest throughput, got {}",
+        ingested
+    );
+    Ok(())
+}
+
+/// Validate that very high-dimensional vectors survive ingest/query and round-trip payload.
+#[test]
+#[ignore]
+fn large_dimension_vectors_roundtrip() -> Result<()> {
+    let tmp = tempfile::tempdir()?;
+    let wal = init_wal(&tmp);
+    let mut cfg = SatoriDbConfig::new(wal);
+    cfg.workers = 2;
+    cfg.virtual_nodes = 16;
+    let db = SatoriDb::start(cfg)?;
+    let handle = db.handle();
+
+    let dim = 4096;
+    let count = 32;
+    let mut seed = 0xabcdef_u64;
+    for i in 0..count {
+        let vec = make_vec(&mut seed, dim);
+        handle.upsert_blocking(10_000 + i, vec, None)?;
+    }
+    handle.flush_blocking()?;
+
+    let q = make_vec(&mut seed, dim);
+    let res = handle.query_with_vectors_blocking(q, 8, 8)?;
+    assert!(!res.is_empty(), "query should return neighbors");
+    for (_id, _dist, v) in res {
+        assert_eq!(v.len(), dim);
+    }
+    db.shutdown()?;
+    Ok(())
+}
+
+/// Router rebuild churn under heavy upserts; ensures router remains ready and pending updates drain.
+#[test]
+#[ignore]
+fn router_rebuild_churn_under_load() -> Result<()> {
+    std::env::set_var("SATORI_ROUTER_REBUILD_EVERY", "1");
+    let tmp = tempfile::tempdir()?;
+    let wal = init_wal(&tmp);
+    let mut cfg = SatoriDbConfig::new(wal);
+    cfg.workers = 3;
+    cfg.virtual_nodes = 24;
+    let db = SatoriDb::start(cfg)?;
+    let handle = db.handle();
+
+    let duration = Duration::from_secs(5);
+    let start = Instant::now();
+    let next_id = Arc::new(AtomicU64::new(50_000));
+
+    std::thread::scope(|s| {
+        for t in 0..4 {
+            let handle = handle.clone();
+            let next_id = next_id.clone();
+            s.spawn(move || {
+                let mut seed = 0x1234_5678u64 ^ (t as u64);
+                while start.elapsed() < duration {
+                    let id = next_id.fetch_add(1, Ordering::Relaxed);
+                    let vec = make_vec(&mut seed, 16);
+                    let _ = handle.upsert_blocking(id, vec.clone(), None);
+                    if id % 7 == 0 {
+                        let _ = handle.query_blocking(vec, 4, 4);
+                    }
+                }
+            });
+        }
+    });
+
+    handle.flush_blocking()?;
+    let stats = block_on(handle.stats());
+    assert!(stats.ready, "router should stay ready under rebuild churn");
+    assert!(
+        stats.pending_updates == 0,
+        "pending updates should drain after rebuild churn (got {})",
+        stats.pending_updates
+    );
+    db.shutdown()?;
+    Ok(())
+}
+
+/// Concurrent fetches against vector and bucket indexes while rebalancer is splitting.
+#[test]
+#[ignore]
+fn fetches_remain_consistent_during_rebalance() -> Result<()> {
+    std::env::set_var("SATORI_REBALANCE_THRESHOLD", "24");
+
+    let tmp = tempfile::tempdir()?;
+    let wal = init_wal(&tmp);
+    let storage = Storage::new(wal.clone());
+    let vector_index = Arc::new(VectorIndex::open(tmp.path().join("vectors"))?);
+    let bucket_index = Arc::new(BucketIndex::open(tmp.path().join("buckets"))?);
+    let bucket_locks = Arc::new(BucketLocks::new());
+    let routing = Arc::new(RoutingTable::new());
+
+    // Seed bucket.
+    let mut b = Bucket::new(0, vec![0.0, 0.0]);
+    for i in 0..40u64 {
+        b.add_vector(Vector::new(i, vec![i as f32, i as f32 * 0.5]));
+    }
+    block_on(storage.put_chunk(&b))?;
+    let rebalance =
+        RebalanceWorker::spawn(storage.clone(), routing.clone(), None, bucket_locks.clone());
+    block_on(rebalance.prime_centroids(&[b]))?;
+
+    let (tx, rx) = unbounded();
+    let wal_worker = wal.clone();
+    let vi_worker = vector_index.clone();
+    let bi_worker = bucket_index.clone();
+    let locks_worker = bucket_locks.clone();
+    let handle = std::thread::spawn(move || {
+        let ex = glommio::LocalExecutorBuilder::new(glommio::Placement::Unbound)
+            .name("fetch-rebalance-worker")
+            .make()
+            .expect("make executor");
+        ex.run(run_worker(
+            0,
+            rx,
+            wal_worker,
+            vi_worker,
+            bi_worker,
+            locks_worker,
+        ));
+    });
+
+    let duration = Duration::from_secs(6);
+    let start = Instant::now();
+    let next_id = Arc::new(AtomicU64::new(1_000_000));
+    let all_ids = Arc::new(parking_lot::RwLock::new(Vec::new()));
+
+    std::thread::scope(|s| {
+        // Ingest new ids to keep indexes moving.
+        for t in 0..2 {
+            let tx = tx.clone();
+            let routing = routing.clone();
+            let next_id = next_id.clone();
+            let all_ids = all_ids.clone();
+            s.spawn(move || {
+                let mut seed = 0x5555_6666_7777_8888u64 ^ (t as u64);
+                while start.elapsed() < duration {
+                    let id = next_id.fetch_add(1, Ordering::Relaxed);
+                    let vec = make_vec(&mut seed, 12);
+                    let bucket_id = routing
+                        .snapshot()
+                        .and_then(|snap| {
+                            snap.router
+                                .query(&vec, 1)
+                                .ok()
+                                .and_then(|ids| ids.first().copied())
+                        })
+                        .unwrap_or(0);
+                    let (resp_tx, resp_rx) = oneshot::channel();
+                    tx.send_blocking(WorkerMessage::Ingest {
+                        bucket_id,
+                        vectors: vec![Vector::new(id, vec)],
+                        respond_to: resp_tx,
+                    })
+                    .expect("ingest send");
+                    let _ = block_on(resp_rx);
+                    all_ids.write().push(id);
+                }
+            });
+        }
+
+        // Fetch vectors/buckets concurrently.
+        for t in 0..2 {
+            let vi = vector_index.clone();
+            let bi = bucket_index.clone();
+            let all_ids = all_ids.clone();
+            s.spawn(move || {
+                let mut seed = 0x9999_aaaa_bbbb_ccccu64 ^ (t as u64);
+                while start.elapsed() < duration {
+                    let sample: Vec<u64> = {
+                        let guard = all_ids.read();
+                        if guard.is_empty() {
+                            Vec::new()
+                        } else {
+                            let mut out = Vec::with_capacity(10);
+                            for _ in 0..10 {
+                                let idx = (lcg(&mut seed) as usize) % guard.len();
+                                out.push(guard[idx]);
+                            }
+                            out
+                        }
+                    };
+                    if sample.is_empty() {
+                        std::thread::sleep(Duration::from_millis(5));
+                        continue;
+                    }
+                    let _ = vi.get_many(&sample);
+                    let _ = bi.get_many(&sample);
+                }
+            });
+        }
+    });
+
+    let (shutdown_tx, shutdown_rx) = oneshot::channel();
+    tx.send_blocking(WorkerMessage::Shutdown {
+        respond_to: shutdown_tx,
+    })
+    .expect("shutdown send");
+    block_on(shutdown_rx).expect("shutdown ack");
+    handle.join().expect("worker thread joined");
+
+    let ids = all_ids.read().clone();
+    let vectors = vector_index.get_many(&ids)?;
+    let buckets = bucket_index.get_many(&ids)?;
+    assert_eq!(
+        vectors.len(),
+        buckets.len(),
+        "vector and bucket indexes diverged during rebalance fetch stress"
+    );
     Ok(())
 }
