@@ -32,7 +32,7 @@ fn oversized_bucket_is_not_cached() -> Result<()> {
     let executor = Executor::new(storage.clone(), cache);
 
     let q = vec![0.0f32; 1024];
-    let first = block_on(executor.query(&q, &[0], 10, 0, Arc::new(Vec::new())))?;
+    let first = block_on(executor.query(&q, &[0], 10, 0, Arc::new(Vec::new()), false))?;
     assert_eq!(first.len(), 2);
 
     // Append another vector to bucket 0. If the bucket were cached, the next query with the same
@@ -40,8 +40,8 @@ fn oversized_bucket_is_not_cached() -> Result<()> {
     // expect the new vector to appear even without a routing bump.
     let new_vec = Vector::new(99, vec![2.0f32; 1024]);
     block_on(storage.put_chunk_raw(0, &[new_vec]))?;
-    let second = block_on(executor.query(&q, &[0], 10, 0, Arc::new(Vec::new())))?;
-    let ids: Vec<u64> = second.iter().map(|(id, _)| *id).collect();
+    let second = block_on(executor.query(&q, &[0], 10, 0, Arc::new(Vec::new()), false))?;
+    let ids: Vec<u64> = second.iter().map(|(id, _, _)| *id).collect();
     assert!(
         ids.contains(&99),
         "bucket 0 should be reloaded on each query when over the cache byte limit"
@@ -63,14 +63,14 @@ fn small_bucket_stays_cached_until_version_bump() -> Result<()> {
     let executor = Executor::new(storage.clone(), cache);
 
     let q = vec![0.0f32; 4];
-    let initial = block_on(executor.query(&q, &[1], 10, 0, Arc::new(Vec::new())))?;
+    let initial = block_on(executor.query(&q, &[1], 10, 0, Arc::new(Vec::new()), false))?;
     assert_eq!(initial.len(), 1);
 
     // Append another vector but do NOT bump routing. Because bucket 1 is small and cached,
     // the next query with the same routing version should still return only the cached content.
     let v1 = Vector::new(2, vec![1.0f32; 4]);
     block_on(storage.put_chunk_raw(1, &[v1]))?;
-    let still_cached = block_on(executor.query(&q, &[1], 10, 0, Arc::new(Vec::new())))?;
+    let still_cached = block_on(executor.query(&q, &[1], 10, 0, Arc::new(Vec::new()), false))?;
     assert_eq!(
         still_cached.len(),
         1,
@@ -78,7 +78,7 @@ fn small_bucket_stays_cached_until_version_bump() -> Result<()> {
     );
 
     // Now bump routing and mark bucket 1 changed; the executor should reload and see both vectors.
-    let refreshed = block_on(executor.query(&q, &[1], 10, 1, Arc::new(vec![1])))?;
+    let refreshed = block_on(executor.query(&q, &[1], 10, 1, Arc::new(vec![1]), false))?;
     assert_eq!(
         refreshed.len(),
         2,

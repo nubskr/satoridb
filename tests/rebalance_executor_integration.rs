@@ -75,9 +75,10 @@ fn split_updates_routing_and_executor_results() -> Result<()> {
         2,
         snap.version,
         snap.changed.clone(),
+        false,
     ))?;
     assert!(
-        results.iter().any(|(id, _)| *id < 50),
+        results.iter().any(|(id, _, _)| *id < 50),
         "expected a vector from the low-id cluster, got {:?}",
         results
     );

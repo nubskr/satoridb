@@ -63,14 +63,15 @@ fn worker_ingests_and_answers_queries() {
         bucket_ids: vec![0],
         routing_version: 0,
         affected_buckets: Arc::new(Vec::new()),
+        include_vectors: false,
         respond_to: resp_tx,
     }))
     .expect("query send");
 
     let results = block_on(resp_rx).expect("query recv").expect("query ok");
     assert_eq!(results.len(), vectors.len());
-    assert!(results.iter().any(|(id, _)| *id == 1));
-    assert!(results.iter().any(|(id, _)| *id == 2));
+    assert!(results.iter().any(|(id, _, _)| *id == 1));
+    assert!(results.iter().any(|(id, _, _)| *id == 2));
 
     // Ingest counter should have advanced by the batch size.
     let after = ingest_counter::get();

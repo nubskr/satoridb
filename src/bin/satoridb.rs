@@ -559,6 +559,7 @@ async fn run_benchmark_mode(
                     bucket_ids: bids,
                     routing_version,
                     affected_buckets: affected_buckets.clone(),
+                    include_vectors: false,
                     respond_to: tx,
                 };
                 let msg = WorkerMessage::Query(req);
@@ -585,7 +586,7 @@ async fn run_benchmark_mode(
             // Deduplicate results preserving the first (best distance) occurrence
             let mut unique_results = Vec::with_capacity(all_results.len());
             let mut seen_ids = std::collections::HashSet::new();
-            for (id, dist) in all_results {
+            for (id, dist, _) in all_results {
                 if seen_ids.insert(id) {
                     unique_results.push((id, dist));
                 }

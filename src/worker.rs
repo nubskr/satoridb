@@ -9,13 +9,18 @@ use std::rc::Rc;
 use std::sync::Arc;
 use std::time::Duration;
 
+type QueryResult = anyhow::Result<Vec<(u64, f32, Option<Vec<f32>>)>>;
+
 pub struct QueryRequest {
     pub query_vec: Vec<f32>,
     pub bucket_ids: Vec<u64>,
     pub routing_version: u64,
     pub affected_buckets: std::sync::Arc<Vec<u64>>,
-    pub respond_to: oneshot::Sender<anyhow::Result<Vec<(u64, f32)>>>,
+    pub include_vectors: bool,
+    pub respond_to: oneshot::Sender<QueryResult>,
 }
+
+type FetchVectorsResult = anyhow::Result<Vec<(u64, Vec<f32>)>>;
 
 pub enum WorkerMessage {
     Query(QueryRequest),
@@ -31,6 +36,11 @@ pub enum WorkerMessage {
     Flush {
         respond_to: oneshot::Sender<()>,
     },
+    FetchVectors {
+        bucket_id: u64,
+        ids: Vec<u64>,
+        respond_to: oneshot::Sender<FetchVectorsResult>,
+    },
     Shutdown {
         respond_to: oneshot::Sender<()>,
     },
@@ -40,7 +50,7 @@ pub async fn run_worker(id: usize, receiver: Receiver<WorkerMessage>, wal: Arc<W
     info!("Worker {} started.", id);
 
     let storage = Storage::new(wal.clone()).with_mode(StorageExecMode::Offload);
-    let cache = WorkerCache::new(512, 64 * 1024 * 1024); // Larger local cache: 512 buckets, 64MB each
+    let cache = WorkerCache::new(128, 64 * 1024 * 1024); // Local cache: 128 buckets, 64MB each
     let executor = Rc::new(Executor::new(storage.clone(), cache));
     // Shared topic cache not easily safe for concurrent access across spawns without RefCell,
     // but computing topic string is cheap. Let's drop the cache for simplicity in concurrent model.
@@ -67,6 +77,7 @@ pub async fn run_worker(id: usize, receiver: Receiver<WorkerMessage>, wal: Arc<W
                             100,
                             req.routing_version,
                             req.affected_buckets,
+                            req.include_vectors,
                         )
                         .await;
                     if req.respond_to.send(result).is_err() {
@@ -86,6 +97,17 @@ pub async fn run_worker(id: usize, receiver: Receiver<WorkerMessage>, wal: Arc<W
                 bucket.vectors = vec![vector];
                 let result = storage.put_chunk(&bucket).await;
                 let _ = respond_to.send(result);
+            }
+            WorkerMessage::FetchVectors {
+                bucket_id,
+                ids,
+                respond_to,
+            } => {
+                let res = executor
+                    .fetch_vectors(bucket_id, &ids)
+                    .await
+                    .map(|vectors| vectors.into_iter().map(|v| (v.id, v.data)).collect());
+                let _ = respond_to.send(res);
             }
             WorkerMessage::Ingest { bucket_id, vectors } => {
                 limit_tx.send(()).await.unwrap();

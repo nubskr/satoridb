@@ -110,14 +110,15 @@ fn executor_cache_survives_version_churn() -> Result<()> {
                         Arc::new(Vec::new())
                     };
                     let q = vec![1.0, 2.0];
-                    let res =
-                        futures::executor::block_on(exec.query(&q, &ids, 4, v as u64, changed));
+                    let res = futures::executor::block_on(
+                        exec.query(&q, &ids, 4, v as u64, changed, false),
+                    );
                     let res = res.expect("query succeeds");
                     assert!(
                         !res.is_empty(),
                         "query should return candidates even during churn"
                     );
-                    for (_id, dist) in res {
+                    for (_id, dist, _) in res {
                         assert!(dist.is_finite());
                     }
                 }
@@ -161,6 +162,7 @@ fn executor_load_failures_do_not_panic() -> Result<()> {
             1,
             1,
             Arc::new(Vec::new()),
+            false,
         ))?;
         if !res.is_empty() {
             last = res;

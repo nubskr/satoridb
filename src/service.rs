@@ -40,54 +40,29 @@ impl SatoriHandle {
         top_k: usize,
         router_top_k: usize,
     ) -> Result<Vec<(u64, f32)>> {
-        let bucket_ids = self.route_query_buckets(&vector, router_top_k).await?;
+        let results = self.query_inner(vector, top_k, router_top_k, false).await?;
+        Ok(results
+            .into_iter()
+            .map(|(id, dist, _)| (id, dist))
+            .collect())
+    }
 
-        let mut pending = Vec::new();
-        let mut requests: Vec<Vec<u64>> = Vec::new();
-        for &bid in &bucket_ids {
-            let shard = self.ring.node_for(bid);
-            if shard >= self.worker_senders.len() {
-                continue;
-            }
-            if requests.len() <= shard {
-                requests.resize_with(shard + 1, Vec::new);
-            }
-            requests[shard].push(bid);
+    /// Query the database and return vectors inline with the scores.
+    ///
+    /// This is an opt-in, heavier variant that clones and returns the stored vector payloads.
+    pub async fn query_with_vectors(
+        &self,
+        vector: Vec<f32>,
+        top_k: usize,
+        router_top_k: usize,
+    ) -> Result<Vec<(u64, f32, Vec<f32>)>> {
+        let results = self.query_inner(vector, top_k, router_top_k, true).await?;
+        let mut with_vectors = Vec::with_capacity(results.len());
+        for (id, dist, payload) in results {
+            let vector = payload.ok_or_else(|| anyhow!("missing vector payload"))?;
+            with_vectors.push((id, dist, vector));
         }
-
-        for (shard, bids) in requests.into_iter().enumerate() {
-            if bids.is_empty() {
-                continue;
-            }
-            let (tx, rx) = oneshot::channel();
-            let req = QueryRequest {
-                query_vec: vector.clone(),
-                bucket_ids: bids,
-                routing_version: 0,
-                affected_buckets: Arc::new(Vec::new()),
-                respond_to: tx,
-            };
-            if self.worker_senders[shard]
-                .send(WorkerMessage::Query(req))
-                .await
-                .is_ok()
-            {
-                pending.push(rx);
-            }
-        }
-
-        let responses = join_all(pending).await;
-        let mut all_results = Vec::new();
-        for res in responses {
-            if let Ok(Ok(candidates)) = res {
-                all_results.extend(candidates);
-            }
-        }
-        all_results.sort_by(|a, b| a.1.partial_cmp(&b.1).unwrap_or(std::cmp::Ordering::Equal));
-        if all_results.len() > top_k {
-            all_results.truncate(top_k);
-        }
-        Ok(all_results)
+        Ok(with_vectors)
     }
 
     /// Insert or update a vector.
@@ -124,6 +99,34 @@ impl SatoriHandle {
 
         let meta = self.apply_upsert_to_router(bucket_id, &vector).await?;
         Ok((bucket_id, meta))
+    }
+
+    /// Fetch vectors by id within a bucket.
+    ///
+    /// Requires the caller to supply the bucket id to avoid a global id index.
+    pub async fn fetch_vectors(
+        &self,
+        bucket_id: u64,
+        ids: Vec<u64>,
+    ) -> Result<Vec<(u64, Vec<f32>)>> {
+        let shard = self.ring.node_for(bucket_id);
+        if shard >= self.worker_senders.len() {
+            return Err(anyhow!("invalid shard for bucket {}", bucket_id));
+        }
+
+        let (tx, rx) = oneshot::channel();
+        let msg = WorkerMessage::FetchVectors {
+            bucket_id,
+            ids,
+            respond_to: tx,
+        };
+        self.worker_senders[shard]
+            .send(msg)
+            .await
+            .map_err(|_| anyhow!("worker channel closed"))?;
+        rx.await
+            .map_err(|e| anyhow!("fetch canceled: {:?}", e))?
+            .map_err(|e| anyhow!("fetch failed: {:?}", e))
     }
 
     /// Flush worker state and write a router snapshot.
@@ -171,6 +174,16 @@ impl SatoriHandle {
         block_on(self.query(vector, top_k, router_top_k))
     }
 
+    /// Blocking wrapper around [`Self::query_with_vectors`].
+    pub fn query_with_vectors_blocking(
+        &self,
+        vector: Vec<f32>,
+        top_k: usize,
+        router_top_k: usize,
+    ) -> Result<Vec<(u64, f32, Vec<f32>)>> {
+        block_on(self.query_with_vectors(vector, top_k, router_top_k))
+    }
+
     /// Blocking wrapper around [`Self::upsert`].
     pub fn upsert_blocking(
         &self,
@@ -181,6 +194,15 @@ impl SatoriHandle {
         block_on(self.upsert(id, vector, bucket_hint))
     }
 
+    /// Blocking wrapper around [`Self::fetch_vectors`].
+    pub fn fetch_vectors_blocking(
+        &self,
+        bucket_id: u64,
+        ids: Vec<u64>,
+    ) -> Result<Vec<(u64, Vec<f32>)>> {
+        block_on(self.fetch_vectors(bucket_id, ids))
+    }
+
     /// Blocking wrapper around [`Self::flush`].
     pub fn flush_blocking(&self) -> Result<()> {
         block_on(self.flush())
@@ -189,6 +211,64 @@ impl SatoriHandle {
     /// Blocking wrapper around [`Self::stats`].
     pub fn stats_blocking(&self) -> RouterStats {
         block_on(self.stats())
+    }
+
+    async fn query_inner(
+        &self,
+        vector: Vec<f32>,
+        top_k: usize,
+        router_top_k: usize,
+        include_vectors: bool,
+    ) -> Result<Vec<(u64, f32, Option<Vec<f32>>)>> {
+        let bucket_ids = self.route_query_buckets(&vector, router_top_k).await?;
+
+        let mut pending = Vec::new();
+        let mut requests: Vec<Vec<u64>> = Vec::new();
+        for &bid in &bucket_ids {
+            let shard = self.ring.node_for(bid);
+            if shard >= self.worker_senders.len() {
+                continue;
+            }
+            if requests.len() <= shard {
+                requests.resize_with(shard + 1, Vec::new);
+            }
+            requests[shard].push(bid);
+        }
+
+        for (shard, bids) in requests.into_iter().enumerate() {
+            if bids.is_empty() {
+                continue;
+            }
+            let (tx, rx) = oneshot::channel();
+            let req = QueryRequest {
+                query_vec: vector.clone(),
+                bucket_ids: bids,
+                routing_version: 0,
+                affected_buckets: Arc::new(Vec::new()),
+                include_vectors,
+                respond_to: tx,
+            };
+            if self.worker_senders[shard]
+                .send(WorkerMessage::Query(req))
+                .await
+                .is_ok()
+            {
+                pending.push(rx);
+            }
+        }
+
+        let responses = join_all(pending).await;
+        let mut all_results = Vec::new();
+        for res in responses {
+            if let Ok(Ok(candidates)) = res {
+                all_results.extend(candidates);
+            }
+        }
+        all_results.sort_by(|a, b| a.1.partial_cmp(&b.1).unwrap_or(std::cmp::Ordering::Equal));
+        if all_results.len() > top_k {
+            all_results.truncate(top_k);
+        }
+        Ok(all_results)
     }
 
     async fn route_query_buckets(&self, vector: &[f32], top_k: usize) -> Result<Vec<u64>> {

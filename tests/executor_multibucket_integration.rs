@@ -37,8 +37,8 @@ fn executor_across_buckets_returns_global_topk() -> Result<()> {
     let executor = Executor::new(storage.clone(), cache);
 
     let query = vec![1.0, 1.0];
-    let results = block_on(executor.query(&query, &[0, 1], 3, 0, Arc::new(Vec::new())))?;
-    let ids: Vec<u64> = results.iter().map(|(id, _)| *id).collect();
+    let results = block_on(executor.query(&query, &[0, 1], 3, 0, Arc::new(Vec::new()), false))?;
+    let ids: Vec<u64> = results.iter().map(|(id, _, _)| *id).collect();
 
     assert_eq!(
         ids,
@@ -60,7 +60,7 @@ fn executor_handles_missing_bucket_gracefully() -> Result<()> {
     let executor = Executor::new(storage.clone(), cache);
 
     let query = vec![0.0f32, 0.0f32];
-    let res = block_on(executor.query(&query, &[42], 5, 0, Arc::new(Vec::new())))?;
+    let res = block_on(executor.query(&query, &[42], 5, 0, Arc::new(Vec::new()), false))?;
     assert!(
         res.is_empty(),
         "missing buckets should not cause errors and return empty results"

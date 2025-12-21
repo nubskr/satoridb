@@ -42,6 +42,7 @@ fn executor_handles_concurrent_queries_and_version_bumps() -> Result<()> {
                 1,
                 version,
                 Arc::new(if version == 1 { vec![0] } else { Vec::new() }),
+                false,
             ))
             .expect("query ok");
             // Either the old or new vector id may win depending on version, but
@@ -62,7 +63,7 @@ fn executor_handles_concurrent_queries_and_version_bumps() -> Result<()> {
     query_handle.join().expect("query joined");
 
     // Final query with a fresh version bump should return the closer id=2.
-    let res = block_on(executor.query(&[100.0, 100.0], &[0], 1, 2, Arc::new(vec![0])))?;
+    let res = block_on(executor.query(&[100.0, 100.0], &[0], 1, 2, Arc::new(vec![0]), false))?;
     assert_eq!(res[0].0, 2);
 
     Ok(())

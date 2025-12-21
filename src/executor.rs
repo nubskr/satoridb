@@ -2,6 +2,7 @@ use crate::storage::{Storage, Vector};
 use anyhow::Result;
 use lru::LruCache;
 use parking_lot::Mutex;
+use std::collections::HashSet;
 use std::convert::TryInto;
 use std::num::NonZeroUsize;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -15,7 +16,7 @@ pub struct Executor {
     last_changed: Mutex<Arc<Vec<u64>>>,
 }
 
-struct CachedBucket {
+pub(crate) struct CachedBucket {
     vectors: Vec<Vector>,
     byte_size: usize,
 }
@@ -84,7 +85,41 @@ impl Executor {
         self.cache_version.load(Ordering::Relaxed)
     }
 
-    async fn load_bucket(&self, bucket_id: u64) -> Result<CachedBucket> {
+    /// Return the vectors for the given ids within a bucket, using the worker cache when possible.
+    pub(crate) async fn fetch_vectors(&self, bucket_id: u64, ids: &[u64]) -> Result<Vec<Vector>> {
+        let wanted: HashSet<u64> = ids.iter().copied().collect();
+        if wanted.is_empty() {
+            return Ok(Vec::new());
+        }
+
+        // Try cache first
+        if let Some(cached_vectors) = {
+            let mut cache = self.cache.lock();
+            cache.get(bucket_id).map(|b| b.vectors.clone())
+        } {
+            let hits = cached_vectors
+                .into_iter()
+                .filter(|v| wanted.contains(&v.id))
+                .collect();
+            return Ok(hits);
+        }
+
+        // Load and populate cache
+        let loaded = self.load_bucket(bucket_id).await?;
+        let hits = loaded
+            .vectors
+            .iter()
+            .filter(|v| wanted.contains(&v.id))
+            .cloned()
+            .collect::<Vec<_>>();
+
+        let mut cache = self.cache.lock();
+        cache.put(bucket_id, loaded);
+
+        Ok(hits)
+    }
+
+    pub(crate) async fn load_bucket(&self, bucket_id: u64) -> Result<CachedBucket> {
         if let Some(h) = FAIL_LOAD_HOOK.lock().expect("fail hook poisoned").as_ref() {
             if h(bucket_id) {
                 anyhow::bail!("executor load hook injected failure");
@@ -138,7 +173,8 @@ impl Executor {
         top_k: usize,
         routing_version: u64,
         changed_buckets: Arc<Vec<u64>>,
-    ) -> Result<Vec<(u64, f32)>> {
+        include_vectors: bool,
+    ) -> Result<Vec<(u64, f32, Option<Vec<f32>>)>> {
         if self.cache_version.load(Ordering::Relaxed) != routing_version {
             let mut cache = self.cache.lock();
             if changed_buckets.is_empty() {
@@ -150,7 +186,19 @@ impl Executor {
             *self.last_changed.lock() = changed_buckets;
         }
 
-        let mut candidates = Vec::new();
+        let mut candidates: Vec<(u64, f32, Option<Vec<f32>>)> = Vec::new();
+        let mut push_candidate = |vector: &Vector| {
+            if vector.data.len() != query_vec.len() {
+                return;
+            }
+            let dist = l2_distance_f32(&vector.data, query_vec);
+            let payload = if include_vectors {
+                Some(vector.data.clone())
+            } else {
+                None
+            };
+            candidates.push((vector.id, dist, payload));
+        };
 
         for &id in bucket_ids {
             // First try cache under a short lock.
@@ -161,11 +209,7 @@ impl Executor {
 
             if let Some(vectors) = cached_vectors {
                 for vector in &vectors {
-                    if vector.data.len() != query_vec.len() {
-                        continue;
-                    }
-                    let dist = l2_distance_f32(&vector.data, query_vec);
-                    candidates.push((vector.id, dist));
+                    push_candidate(vector);
                 }
                 continue;
             }
@@ -174,11 +218,7 @@ impl Executor {
             match self.load_bucket(id).await {
                 Ok(loaded) => {
                     for vector in &loaded.vectors {
-                        if vector.data.len() != query_vec.len() {
-                            continue;
-                        }
-                        let dist = l2_distance_f32(&vector.data, query_vec);
-                        candidates.push((vector.id, dist));
+                        push_candidate(vector);
                     }
                     // Insert into cache after use.
                     let mut cache = self.cache.lock();

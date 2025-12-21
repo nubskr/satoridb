@@ -54,6 +54,7 @@ fn storage_executor_pipeline_finds_nearest_vectors() -> Result<()> {
         1,
         version,
         snap.changed.clone(),
+        false,
     ))?;
     assert_eq!(res_a.len(), 1);
     assert!(
@@ -68,6 +69,7 @@ fn storage_executor_pipeline_finds_nearest_vectors() -> Result<()> {
         1,
         version,
         snap.changed.clone(),
+        false,
     ))?;
     assert_eq!(res_b.len(), 1);
     assert!(
@@ -94,8 +96,15 @@ fn storage_put_and_read_keeps_all_vectors() -> Result<()> {
 
     // Re-read via executor, which exercises the decoding path used in production.
     let executor = Executor::new(storage.clone(), WorkerCache::new(4, usize::MAX));
-    let res = block_on(executor.query(&[0.0, 0.0], &[bucket.id], 10, 0, Arc::new(Vec::new())))?;
-    let ids: Vec<u64> = res.iter().map(|(id, _)| *id).collect();
+    let res = block_on(executor.query(
+        &[0.0, 0.0],
+        &[bucket.id],
+        10,
+        0,
+        Arc::new(Vec::new()),
+        false,
+    ))?;
+    let ids: Vec<u64> = res.iter().map(|(id, _, _)| *id).collect();
     assert_eq!(
         ids.len(),
         bucket.vectors.len(),

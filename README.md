@@ -56,6 +56,19 @@ You can also run the example:
 cargo run --example embedded_basic
 ```
 
+### Returning vectors inline
+
+By default queries return `(id, distance)` to keep payloads small. If you want the stored vector data back on the hot path (e.g., to avoid an extra fetch), use the opt-in helper:
+
+```rust
+let hits = api.query_with_vectors_blocking(vec![1.0, 2.0, 3.0], 5, 50)?;
+for (id, distance, vector) in hits {
+    println!("id={id} dist={distance} vec={vector:?}");
+}
+```
+
+Trade-offs: enabling this clones and ships the full vectors—expect higher CPU and larger responses. Leave it off for latency-sensitive or high-QPS paths.
+
 ### Durability
 
 - Restart durability (clean restart): preserved as long as the process had time to write to the WAL.
