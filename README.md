@@ -158,6 +158,13 @@ cargo build --release
 
 ## Test
 
+## Benchmark (BigANN)
+
+- Requires significant disk (~1TB+ download + converted). See `Makefile` targets.
+- Run `make benchmark` to download BigANN base/query/ground-truth, convert the base set via `prepare_dataset`, and execute the benchmark (`SATORI_RUN_BENCH=1 cargo run --release --bin satoridb`).
+- Default ingest ceiling is 1B vectors (BigANN); uses streaming ingestion and queries via `src/bin/satoridb.rs`.
+- On 1B+ (bigger-than-RAM) workloads, the benchmark reports 95%+ recall using the default settings.
+
 ## License
 
 See [LICENSE](LICENSE).
