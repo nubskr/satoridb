@@ -80,16 +80,29 @@ impl VectorIndex {
     /// Return the first id that already exists in the index, if any.
     pub fn first_existing(&self, ids: &[u64]) -> Result<Option<u64>> {
         for id in ids {
-            if self
-                .db
-                .get(id.to_le_bytes())
-                .with_context(|| format!("read id {} from vector index", id))?
-                .is_some()
-            {
+            if self.exists(*id)? {
                 return Ok(Some(*id));
             }
         }
         Ok(None)
+    }
+
+    /// Check if an id exists in the index.
+    ///
+    /// Uses bloom filter for fast negative lookups, falling back to actual
+    /// read only when the bloom filter indicates the key may exist.
+    pub fn exists(&self, id: u64) -> Result<bool> {
+        let key = id.to_le_bytes();
+        // Fast path: bloom filter says definitely not there
+        if !self.db.key_may_exist(&key) {
+            return Ok(false);
+        }
+        // Slow path: bloom filter uncertain, do actual lookup
+        Ok(self
+            .db
+            .get(&key)
+            .with_context(|| format!("check existence of id {}", id))?
+            .is_some())
     }
 }
 
@@ -115,5 +128,42 @@ mod tests {
         assert_eq!(got.len(), 2);
         assert!(got.contains(&(v1.id, v1.data)));
         assert!(got.contains(&(v2.id, v2.data)));
+    }
+
+    #[test]
+    fn exists_returns_false_for_missing_id() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let index = VectorIndex::open(dir.path()).expect("open index");
+
+        assert!(!index.exists(42).expect("exists check"));
+        assert!(!index.exists(0).expect("exists check"));
+        assert!(!index.exists(u64::MAX).expect("exists check"));
+    }
+
+    #[test]
+    fn exists_returns_true_for_inserted_id() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let index = VectorIndex::open(dir.path()).expect("open index");
+
+        let v1 = Vector::new(1, vec![1.0, 2.0, 3.0]);
+        let v2 = Vector::new(2, vec![4.0, 5.0, 6.0]);
+        index.put_batch(&[v1, v2]).expect("put");
+
+        assert!(index.exists(1).expect("exists check"));
+        assert!(index.exists(2).expect("exists check"));
+        assert!(!index.exists(3).expect("exists check"));
+    }
+
+    #[test]
+    fn first_existing_uses_exists() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let index = VectorIndex::open(dir.path()).expect("open index");
+
+        let v = Vector::new(5, vec![1.0]);
+        index.put_batch(&[v]).expect("put");
+
+        assert_eq!(index.first_existing(&[1, 2, 3]).expect("check"), None);
+        assert_eq!(index.first_existing(&[1, 5, 3]).expect("check"), Some(5));
+        assert_eq!(index.first_existing(&[5, 1, 2]).expect("check"), Some(5));
     }
 }

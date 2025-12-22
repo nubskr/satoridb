@@ -111,6 +111,20 @@ pub async fn run_worker(
                 vector,
                 respond_to,
             } => {
+                // Check for duplicate id before acquiring lock
+                match vector_index.exists(vector.id) {
+                    Ok(true) => {
+                        let _ = respond_to
+                            .send(Err(anyhow::anyhow!("id {} already exists", vector.id)));
+                        continue;
+                    }
+                    Err(e) => {
+                        let _ = respond_to.send(Err(e));
+                        continue;
+                    }
+                    Ok(false) => {}
+                }
+
                 let lock = bucket_locks.lock_for(bucket_id);
                 let _guard = lock.lock().await;
                 let mut bucket = Bucket::new(bucket_id, Vec::new());
