@@ -1,43 +1,26 @@
-use std::sync::Arc;
-
-use satoridb::wal::runtime::Walrus;
-use satoridb::wal::{FsyncSchedule, ReadConsistency};
-use satoridb::{SatoriDb, SatoriDbConfig};
+use satoridb::SatoriDb;
 
 #[test]
-fn fetch_vectors_by_bucket_and_id() {
+fn fetch_vectors_by_id() {
     let tmp = tempfile::tempdir().unwrap();
-    std::env::set_var("WALRUS_QUIET", "1");
 
-    let wal = Arc::new(
-        Walrus::with_data_dir_and_options(
-            tmp.path().to_path_buf(),
-            ReadConsistency::StrictlyAtOnce,
-            FsyncSchedule::NoFsync,
-        )
-        .expect("walrus init"),
-    );
+    let db = SatoriDb::builder("test")
+        .workers(1)
+        .data_dir(tmp.path())
+        .build()
+        .expect("db start");
 
-    let mut cfg = SatoriDbConfig::new(wal);
-    cfg.workers = 1;
+    db.insert(1, vec![0.0, 1.0, 2.0]).expect("insert 1");
+    db.insert(2, vec![3.0, 4.0, 5.0]).expect("insert 2");
+    db.insert(3, vec![9.0, 9.0, 9.0]).expect("insert 3");
 
-    let db = SatoriDb::start(cfg).expect("db start");
-    let api = db.handle();
+    // Fetch vectors by ID
+    let found = db.get(vec![2, 3, 999]).expect("get");
 
-    api.upsert_blocking(1, vec![0.0, 1.0, 2.0], Some(99))
-        .expect("upsert 1");
-    api.upsert_blocking(2, vec![3.0, 4.0, 5.0], Some(99))
-        .expect("upsert 2");
-    api.upsert_blocking(3, vec![9.0, 9.0, 9.0], Some(100))
-        .expect("upsert other bucket");
+    assert_eq!(found.len(), 2, "should find 2 vectors (999 doesn't exist)");
 
-    let found = api
-        .fetch_vectors_blocking(99, vec![2, 3, 999])
-        .expect("fetch");
-
-    assert_eq!(found.len(), 1, "only id=2 in bucket 99 should return");
-    assert_eq!(found[0].0, 2);
-    assert_eq!(found[0].1, vec![3.0, 4.0, 5.0]);
-
-    db.shutdown().expect("shutdown");
+    // Check that we got the right vectors
+    let ids: Vec<u64> = found.iter().map(|(id, _)| *id).collect();
+    assert!(ids.contains(&2));
+    assert!(ids.contains(&3));
 }

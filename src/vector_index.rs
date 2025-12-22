@@ -94,13 +94,13 @@ impl VectorIndex {
     pub fn exists(&self, id: u64) -> Result<bool> {
         let key = id.to_le_bytes();
         // Fast path: bloom filter says definitely not there
-        if !self.db.key_may_exist(&key) {
+        if !self.db.key_may_exist(key) {
             return Ok(false);
         }
         // Slow path: bloom filter uncertain, do actual lookup
         Ok(self
             .db
-            .get(&key)
+            .get(key)
             .with_context(|| format!("check existence of id {}", id))?
             .is_some())
     }

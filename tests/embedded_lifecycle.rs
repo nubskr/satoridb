@@ -1,26 +1,21 @@
-use std::sync::Arc;
-
 use anyhow::Result;
-use satoridb::embedded::{SatoriDb, SatoriDbConfig};
-use satoridb::wal::runtime::Walrus;
-use tempfile::TempDir;
+use satoridb::SatoriDb;
 
-fn init_wal(tempdir: &TempDir) -> Arc<Walrus> {
-    Arc::new(Walrus::with_data_dir(tempdir.path().to_path_buf()).expect("walrus init"))
-}
-
-/// SatoriDb::start with 0 workers should fail.
+/// SatoriDb::builder with 0 workers should fail.
 #[test]
 fn start_with_zero_workers_fails() {
     let tmp = tempfile::tempdir().unwrap();
-    let wal = init_wal(&tmp);
 
-    let mut cfg = SatoriDbConfig::new(wal);
-    cfg.workers = 0;
+    let result = SatoriDb::builder("test")
+        .workers(0)
+        .data_dir(tmp.path())
+        .build();
 
-    let result = SatoriDb::start(cfg);
     assert!(result.is_err(), "0 workers should fail");
-    let err = result.err().expect("should have error");
+    let err = match result {
+        Ok(_) => panic!("should have error"),
+        Err(err) => err,
+    };
     assert!(
         err.to_string().contains("workers must be > 0"),
         "error should mention workers"
@@ -31,115 +26,84 @@ fn start_with_zero_workers_fails() {
 #[test]
 fn start_with_valid_config_succeeds() -> Result<()> {
     let tmp = tempfile::tempdir()?;
-    let wal = init_wal(&tmp);
 
-    let mut cfg = SatoriDbConfig::new(wal);
-    cfg.workers = 1; // Minimal config
+    let db = SatoriDb::builder("test")
+        .workers(1)
+        .data_dir(tmp.path())
+        .build()?;
 
-    let db = SatoriDb::start(cfg)?;
-    db.shutdown()?;
+    drop(db); // auto-shutdown
     Ok(())
 }
 
-/// Handle can be cloned and used independently.
+/// Stats returns ready=true after first insert (router needs data to initialize).
 #[test]
-fn handle_is_cloneable() -> Result<()> {
+fn stats_ready_after_insert() -> Result<()> {
     let tmp = tempfile::tempdir()?;
-    let wal = init_wal(&tmp);
 
-    let mut cfg = SatoriDbConfig::new(wal);
-    cfg.workers = 1;
+    let db = SatoriDb::builder("test")
+        .workers(1)
+        .data_dir(tmp.path())
+        .build()?;
 
-    let db = SatoriDb::start(cfg)?;
-    let handle1 = db.handle();
-    let handle2 = handle1.clone();
-
-    // Both handles should work
-    let stats1 = handle1.stats_blocking();
-    let stats2 = handle2.stats_blocking();
-    assert_eq!(stats1.buckets, stats2.buckets);
-
-    db.shutdown()?;
-    Ok(())
-}
-
-/// Stats returns ready=true after first upsert (router needs data to initialize).
-#[test]
-fn stats_ready_after_upsert() -> Result<()> {
-    let tmp = tempfile::tempdir()?;
-    let wal = init_wal(&tmp);
-
-    let mut cfg = SatoriDbConfig::new(wal);
-    cfg.workers = 1;
-
-    let db = SatoriDb::start(cfg)?;
-    let handle = db.handle();
-
-    // Before any upsert, router is not initialized
-    let stats_before = handle.stats_blocking();
+    // Before any insert, router is not initialized
+    let stats_before = db.stats();
     assert!(
         !stats_before.ready,
-        "router should not be ready before first upsert"
+        "router should not be ready before first insert"
     );
 
-    // After first upsert, router is ready
-    handle.upsert_blocking(1, vec![1.0, 2.0], None)?;
-    let stats_after = handle.stats_blocking();
+    // After first insert, router is ready
+    db.insert(1, vec![1.0, 2.0])?;
+    let stats_after = db.stats();
     assert!(
         stats_after.ready,
-        "router should be ready after first upsert"
+        "router should be ready after first insert"
     );
 
-    db.shutdown()?;
     Ok(())
 }
 
-/// Upsert and query round-trip works.
+/// Insert and query round-trip works.
 #[test]
-fn upsert_and_query_round_trip() -> Result<()> {
+fn insert_and_query_round_trip() -> Result<()> {
     let tmp = tempfile::tempdir()?;
-    let wal = init_wal(&tmp);
 
-    let mut cfg = SatoriDbConfig::new(wal);
-    cfg.workers = 1;
-
-    let db = SatoriDb::start(cfg)?;
-    let handle = db.handle();
+    let db = SatoriDb::builder("test")
+        .workers(1)
+        .data_dir(tmp.path())
+        .build()?;
 
     // Insert a vector
-    let (_bucket_id, meta) = handle.upsert_blocking(42, vec![1.0, 2.0, 3.0], None)?;
-    assert_eq!(meta.count, 1, "first upsert should have count=1");
+    db.insert(42, vec![1.0, 2.0, 3.0])?;
 
     // Query should find it
-    let results = handle.query_blocking(vec![1.0, 2.0, 3.0], 10, 5)?;
+    let results = db.query(vec![1.0, 2.0, 3.0], 10)?;
     assert!(!results.is_empty(), "should find the inserted vector");
     assert_eq!(results[0].0, 42, "should find vector id 42");
 
-    db.shutdown()?;
     Ok(())
 }
 
-/// Multiple upserts to same bucket update count.
+/// Multiple inserts work.
 #[test]
-fn multiple_upserts_increment_count() -> Result<()> {
+fn multiple_inserts_work() -> Result<()> {
     let tmp = tempfile::tempdir()?;
-    let wal = init_wal(&tmp);
 
-    let mut cfg = SatoriDbConfig::new(wal);
-    cfg.workers = 1;
+    let db = SatoriDb::builder("test")
+        .workers(1)
+        .data_dir(tmp.path())
+        .build()?;
 
-    let db = SatoriDb::start(cfg)?;
-    let handle = db.handle();
+    // Insert multiple vectors
+    db.insert(1, vec![1.0, 1.0])?;
+    db.insert(2, vec![1.1, 1.1])?;
+    db.insert(3, vec![1.2, 1.2])?;
 
-    // Insert first vector
-    let (bucket_id, meta1) = handle.upsert_blocking(1, vec![1.0, 1.0], None)?;
-    assert_eq!(meta1.count, 1);
+    // Should be queryable
+    let results = db.query(vec![1.0, 1.0], 10)?;
+    assert!(!results.is_empty(), "should find vectors");
 
-    // Insert second vector to same bucket
-    let (_, meta2) = handle.upsert_blocking(2, vec![1.1, 1.1], Some(bucket_id))?;
-    assert_eq!(meta2.count, 2, "count should increment");
-
-    db.shutdown()?;
     Ok(())
 }
 
@@ -147,37 +111,50 @@ fn multiple_upserts_increment_count() -> Result<()> {
 #[test]
 fn flush_completes() -> Result<()> {
     let tmp = tempfile::tempdir()?;
-    let wal = init_wal(&tmp);
 
-    let mut cfg = SatoriDbConfig::new(wal);
-    cfg.workers = 1;
-
-    let db = SatoriDb::start(cfg)?;
-    let handle = db.handle();
+    let db = SatoriDb::builder("test")
+        .workers(1)
+        .data_dir(tmp.path())
+        .build()?;
 
     // Insert some data
-    handle.upsert_blocking(1, vec![1.0, 2.0], None)?;
+    db.insert(1, vec![1.0, 2.0])?;
 
     // Flush should succeed
-    handle.flush_blocking()?;
+    db.flush()?;
 
-    db.shutdown()?;
     Ok(())
 }
 
-/// Shutdown is idempotent (doesn't panic if called on already-shutdown).
+/// Shutdown is called automatically on drop.
 #[test]
-fn shutdown_is_safe() -> Result<()> {
+fn auto_shutdown_on_drop() -> Result<()> {
     let tmp = tempfile::tempdir()?;
-    let wal = init_wal(&tmp);
 
-    let mut cfg = SatoriDbConfig::new(wal);
-    cfg.workers = 1;
+    {
+        let db = SatoriDb::builder("test")
+            .workers(1)
+            .data_dir(tmp.path())
+            .build()?;
 
-    let db = SatoriDb::start(cfg)?;
-    // Shutdown should succeed
+        db.insert(1, vec![1.0, 2.0])?;
+        // db is dropped here, shutdown should be automatic
+    }
+
+    Ok(())
+}
+
+/// Explicit shutdown works.
+#[test]
+fn explicit_shutdown_works() -> Result<()> {
+    let tmp = tempfile::tempdir()?;
+
+    let db = SatoriDb::builder("test")
+        .workers(1)
+        .data_dir(tmp.path())
+        .build()?;
+
     db.shutdown()?;
-    // Note: Can't call shutdown twice on same instance since it consumes self
     Ok(())
 }
 
@@ -185,15 +162,15 @@ fn shutdown_is_safe() -> Result<()> {
 #[test]
 fn virtual_nodes_config() -> Result<()> {
     let tmp = tempfile::tempdir()?;
-    let wal = init_wal(&tmp);
 
-    let mut cfg = SatoriDbConfig::new(wal);
-    cfg.workers = 2;
-    cfg.virtual_nodes = 16; // Custom virtual nodes
+    let db = SatoriDb::builder("test")
+        .workers(2)
+        .virtual_nodes(16)
+        .data_dir(tmp.path())
+        .build()?;
 
-    let db = SatoriDb::start(cfg)?;
     // Should start without error
-    db.shutdown()?;
+    drop(db);
     Ok(())
 }
 
@@ -201,114 +178,90 @@ fn virtual_nodes_config() -> Result<()> {
 #[test]
 fn query_empty_returns_error() -> Result<()> {
     let tmp = tempfile::tempdir()?;
-    let wal = init_wal(&tmp);
 
-    let mut cfg = SatoriDbConfig::new(wal);
-    cfg.workers = 1;
-
-    let db = SatoriDb::start(cfg)?;
-    let handle = db.handle();
+    let db = SatoriDb::builder("test")
+        .workers(1)
+        .data_dir(tmp.path())
+        .build()?;
 
     // Query on empty database returns error because router not initialized
-    let result = handle.query_blocking(vec![1.0, 2.0], 10, 5);
+    let result = db.query(vec![1.0, 2.0], 10);
     assert!(
         result.is_err(),
         "query on empty database should return error"
     );
 
-    db.shutdown()?;
     Ok(())
 }
 
-/// Default config uses reasonable defaults.
+/// Insert rejects duplicate IDs.
 #[test]
-fn default_config_uses_cpu_count() {
-    let tmp = tempfile::tempdir().unwrap();
-    let wal = init_wal(&tmp);
-
-    let cfg = SatoriDbConfig::new(wal);
-    assert!(cfg.workers >= 1, "should have at least 1 worker");
-    assert_eq!(cfg.virtual_nodes, 8, "default virtual_nodes should be 8");
-}
-
-/// Upsert rejects duplicate IDs.
-#[test]
-fn upsert_rejects_duplicate_id() -> Result<()> {
+fn insert_rejects_duplicate_id() -> Result<()> {
     let tmp = tempfile::tempdir()?;
-    let wal = init_wal(&tmp);
 
-    let mut cfg = SatoriDbConfig::new(wal);
-    cfg.workers = 1;
-
-    let db = SatoriDb::start(cfg)?;
-    let handle = db.handle();
+    let db = SatoriDb::builder("test")
+        .workers(1)
+        .data_dir(tmp.path())
+        .build()?;
 
     // First insert should succeed
-    handle.upsert_blocking(42, vec![1.0, 2.0, 3.0], None)?;
+    db.insert(42, vec![1.0, 2.0, 3.0])?;
 
     // Second insert with same ID should fail
-    let result = handle.upsert_blocking(42, vec![4.0, 5.0, 6.0], None);
+    let result = db.insert(42, vec![4.0, 5.0, 6.0]);
     assert!(result.is_err(), "duplicate id should be rejected");
-    let err = result.err().expect("should have error");
+    let err = match result {
+        Ok(_) => panic!("should have error"),
+        Err(err) => err,
+    };
     assert!(
         err.to_string().contains("already exists"),
         "error should mention id already exists: {}",
         err
     );
 
-    db.shutdown()?;
     Ok(())
 }
 
-/// Upsert allows different IDs.
+/// Insert allows different IDs.
 #[test]
-fn upsert_allows_different_ids() -> Result<()> {
+fn insert_allows_different_ids() -> Result<()> {
     let tmp = tempfile::tempdir()?;
-    let wal = init_wal(&tmp);
 
-    let mut cfg = SatoriDbConfig::new(wal);
-    cfg.workers = 1;
-
-    let db = SatoriDb::start(cfg)?;
-    let handle = db.handle();
+    let db = SatoriDb::builder("test")
+        .workers(1)
+        .data_dir(tmp.path())
+        .build()?;
 
     // Multiple inserts with different IDs should all succeed
-    handle.upsert_blocking(1, vec![1.0, 2.0], None)?;
-    handle.upsert_blocking(2, vec![2.0, 3.0], None)?;
-    handle.upsert_blocking(3, vec![3.0, 4.0], None)?;
+    db.insert(1, vec![1.0, 2.0])?;
+    db.insert(2, vec![2.0, 3.0])?;
+    db.insert(3, vec![3.0, 4.0])?;
 
     // All should be queryable
-    let results = handle.query_blocking(vec![2.0, 3.0], 10, 10)?;
-    assert!(results.len() >= 1, "should find at least one vector");
+    let results = db.query(vec![2.0, 3.0], 10)?;
+    assert!(!results.is_empty(), "should find at least one vector");
 
-    db.shutdown()?;
     Ok(())
 }
 
-/// Regression: duplicate ID rejection works across buckets.
+/// Regression: duplicate ID rejection works across workers.
 #[test]
-fn upsert_rejects_duplicate_across_buckets() -> Result<()> {
+fn insert_rejects_duplicate_across_workers() -> Result<()> {
     let tmp = tempfile::tempdir()?;
-    let wal = init_wal(&tmp);
 
-    let mut cfg = SatoriDbConfig::new(wal);
-    cfg.workers = 2; // Multiple workers to test cross-shard
+    let db = SatoriDb::builder("test")
+        .workers(2)
+        .data_dir(tmp.path())
+        .build()?;
 
-    let db = SatoriDb::start(cfg)?;
-    let handle = db.handle();
+    // Insert
+    db.insert(100, vec![1.0, 2.0])?;
 
-    // Insert to bucket 0
-    let (bucket_id, _) = handle.upsert_blocking(100, vec![1.0, 2.0], None)?;
+    // Try to insert same ID again - should fail
+    let result = db.insert(100, vec![9.0, 9.0]);
+    assert!(result.is_err(), "duplicate id should be rejected");
 
-    // Try to insert same ID to a different bucket - should still fail
-    let different_bucket = if bucket_id == 0 { 1 } else { 0 };
-    let result = handle.upsert_blocking(100, vec![9.0, 9.0], Some(different_bucket));
-    assert!(
-        result.is_err(),
-        "duplicate id should be rejected even with different bucket hint"
-    );
-
-    db.shutdown()?;
     Ok(())
 }
 
@@ -320,25 +273,22 @@ fn upsert_rejects_duplicate_across_buckets() -> Result<()> {
 #[test]
 fn delete_allows_reinsert_of_same_id() -> Result<()> {
     let tmp = tempfile::tempdir()?;
-    let wal = init_wal(&tmp);
 
-    let mut cfg = SatoriDbConfig::new(wal);
-    cfg.workers = 1;
-
-    let db = SatoriDb::start(cfg)?;
-    let handle = db.handle();
+    let db = SatoriDb::builder("test")
+        .workers(1)
+        .data_dir(tmp.path())
+        .build()?;
 
     // Insert
-    handle.upsert_blocking(42, vec![1.0, 2.0, 3.0], None)?;
+    db.insert(42, vec![1.0, 2.0, 3.0])?;
 
     // Delete
-    handle.delete_blocking(42)?;
+    db.delete(42)?;
 
     // Reinsert same ID should succeed
-    let result = handle.upsert_blocking(42, vec![4.0, 5.0, 6.0], None);
+    let result = db.insert(42, vec![4.0, 5.0, 6.0]);
     assert!(result.is_ok(), "reinsert after delete should succeed");
 
-    db.shutdown()?;
     Ok(())
 }
 
@@ -346,22 +296,19 @@ fn delete_allows_reinsert_of_same_id() -> Result<()> {
 #[test]
 fn delete_nonexistent_id_succeeds() -> Result<()> {
     let tmp = tempfile::tempdir()?;
-    let wal = init_wal(&tmp);
 
-    let mut cfg = SatoriDbConfig::new(wal);
-    cfg.workers = 1;
-
-    let db = SatoriDb::start(cfg)?;
-    let handle = db.handle();
+    let db = SatoriDb::builder("test")
+        .workers(1)
+        .data_dir(tmp.path())
+        .build()?;
 
     // Insert something to initialize router
-    handle.upsert_blocking(1, vec![1.0, 2.0], None)?;
+    db.insert(1, vec![1.0, 2.0])?;
 
     // Delete non-existent ID should not error
-    let result = handle.delete_blocking(9999);
+    let result = db.delete(9999);
     assert!(result.is_ok(), "delete of non-existent id should succeed");
 
-    db.shutdown()?;
     Ok(())
 }
 
@@ -373,39 +320,36 @@ fn delete_nonexistent_id_succeeds() -> Result<()> {
 #[test]
 fn query_does_not_find_deleted_vector() -> Result<()> {
     let tmp = tempfile::tempdir()?;
-    let wal = init_wal(&tmp);
 
-    let mut cfg = SatoriDbConfig::new(wal);
-    cfg.workers = 1;
-
-    let db = SatoriDb::start(cfg)?;
-    let handle = db.handle();
+    let db = SatoriDb::builder("test")
+        .workers(1)
+        .data_dir(tmp.path())
+        .build()?;
 
     // Insert vector
-    handle.upsert_blocking(42, vec![1.0, 2.0, 3.0], None)?;
+    db.insert(42, vec![1.0, 2.0, 3.0])?;
 
     // Verify it's queryable
-    let results = handle.query_blocking(vec![1.0, 2.0, 3.0], 10, 10)?;
+    let results = db.query(vec![1.0, 2.0, 3.0], 10)?;
     assert!(
         results.iter().any(|(id, _)| *id == 42),
         "should find vector before delete"
     );
 
     // Delete
-    handle.delete_blocking(42)?;
+    db.delete(42)?;
 
     // The key invariant: ID can be reused after delete
     // (vector_index is cleaned synchronously)
-    handle.upsert_blocking(42, vec![9.0, 9.0, 9.0], None)?;
+    db.insert(42, vec![9.0, 9.0, 9.0])?;
 
     // Query near new location should find the new vector
-    let results_after = handle.query_blocking(vec![9.0, 9.0, 9.0], 10, 10)?;
+    let results_after = db.query(vec![9.0, 9.0, 9.0], 10)?;
     assert!(
         results_after.iter().any(|(id, _)| *id == 42),
         "should find reinserted vector"
     );
 
-    db.shutdown()?;
     Ok(())
 }
 
@@ -413,31 +357,28 @@ fn query_does_not_find_deleted_vector() -> Result<()> {
 #[test]
 fn query_finds_reinserted_vector() -> Result<()> {
     let tmp = tempfile::tempdir()?;
-    let wal = init_wal(&tmp);
 
-    let mut cfg = SatoriDbConfig::new(wal);
-    cfg.workers = 1;
-
-    let db = SatoriDb::start(cfg)?;
-    let handle = db.handle();
+    let db = SatoriDb::builder("test")
+        .workers(1)
+        .data_dir(tmp.path())
+        .build()?;
 
     // Insert vector near origin
-    handle.upsert_blocking(42, vec![0.1, 0.1, 0.1], None)?;
+    db.insert(42, vec![0.1, 0.1, 0.1])?;
 
     // Delete
-    handle.delete_blocking(42)?;
+    db.delete(42)?;
 
     // Reinsert with very different vector
-    handle.upsert_blocking(42, vec![0.9, 0.9, 0.9], None)?;
+    db.insert(42, vec![0.9, 0.9, 0.9])?;
 
     // Query near new location should find it
-    let results = handle.query_blocking(vec![0.9, 0.9, 0.9], 10, 10)?;
+    let results = db.query(vec![0.9, 0.9, 0.9], 10)?;
     assert!(
         results.iter().any(|(id, _)| *id == 42),
         "should find reinserted vector"
     );
 
-    db.shutdown()?;
     Ok(())
 }
 
@@ -445,21 +386,19 @@ fn query_finds_reinserted_vector() -> Result<()> {
 #[test]
 fn multiple_delete_reinsert_cycles() -> Result<()> {
     let tmp = tempfile::tempdir()?;
-    let wal = init_wal(&tmp);
 
-    let mut cfg = SatoriDbConfig::new(wal);
-    cfg.workers = 1;
-
-    let db = SatoriDb::start(cfg)?;
-    let handle = db.handle();
+    let db = SatoriDb::builder("test")
+        .workers(1)
+        .data_dir(tmp.path())
+        .build()?;
 
     for cycle in 0..5 {
         // Insert
         let vec = vec![cycle as f32, cycle as f32 + 0.1];
-        handle.upsert_blocking(100, vec.clone(), None)?;
+        db.insert(100, vec)?;
 
         // Verify duplicate rejected
-        let dup_result = handle.upsert_blocking(100, vec![0.0, 0.0], None);
+        let dup_result = db.insert(100, vec![0.0, 0.0]);
         assert!(
             dup_result.is_err(),
             "cycle {}: duplicate should be rejected",
@@ -467,16 +406,15 @@ fn multiple_delete_reinsert_cycles() -> Result<()> {
         );
 
         // Delete
-        handle.delete_blocking(100)?;
+        db.delete(100)?;
 
         // Verify can reinsert
         // (next iteration will do the insert)
     }
 
     // Final insert after last delete
-    handle.upsert_blocking(100, vec![9.9, 9.9], None)?;
+    db.insert(100, vec![9.9, 9.9])?;
 
-    db.shutdown()?;
     Ok(())
 }
 
@@ -487,45 +425,42 @@ fn multiple_delete_reinsert_cycles() -> Result<()> {
 #[test]
 fn delete_reinsert_multiple_ids() -> Result<()> {
     let tmp = tempfile::tempdir()?;
-    let wal = init_wal(&tmp);
 
-    let mut cfg = SatoriDbConfig::new(wal);
-    cfg.workers = 1;
-
-    let db = SatoriDb::start(cfg)?;
-    let handle = db.handle();
+    let db = SatoriDb::builder("test")
+        .workers(1)
+        .data_dir(tmp.path())
+        .build()?;
 
     let ids: [u64; 5] = [10, 20, 30, 40, 50];
 
     // Insert all
     for id in ids {
-        handle.upsert_blocking(id, vec![id as f32, id as f32], None)?;
+        db.insert(id, vec![id as f32, id as f32])?;
     }
 
     // Verify all IDs are tracked (duplicates rejected)
     for id in ids {
-        let result = handle.upsert_blocking(id, vec![0.0, 0.0], None);
+        let result = db.insert(id, vec![0.0, 0.0]);
         assert!(result.is_err(), "id {} should reject duplicate", id);
     }
 
     // Delete some
-    handle.delete_blocking(20)?;
-    handle.delete_blocking(40)?;
+    db.delete(20)?;
+    db.delete(40)?;
 
     // Key invariant: deleted IDs can be reinserted
-    handle.upsert_blocking(20, vec![200.0, 200.0], None)?;
-    handle.upsert_blocking(40, vec![400.0, 400.0], None)?;
+    db.insert(20, vec![200.0, 200.0])?;
+    db.insert(40, vec![400.0, 400.0])?;
 
     // Non-deleted IDs should still reject duplicates
-    assert!(handle.upsert_blocking(10, vec![0.0, 0.0], None).is_err());
-    assert!(handle.upsert_blocking(30, vec![0.0, 0.0], None).is_err());
-    assert!(handle.upsert_blocking(50, vec![0.0, 0.0], None).is_err());
+    assert!(db.insert(10, vec![0.0, 0.0]).is_err());
+    assert!(db.insert(30, vec![0.0, 0.0]).is_err());
+    assert!(db.insert(50, vec![0.0, 0.0]).is_err());
 
     // Reinserted IDs should now reject duplicates too
-    assert!(handle.upsert_blocking(20, vec![0.0, 0.0], None).is_err());
-    assert!(handle.upsert_blocking(40, vec![0.0, 0.0], None).is_err());
+    assert!(db.insert(20, vec![0.0, 0.0]).is_err());
+    assert!(db.insert(40, vec![0.0, 0.0]).is_err());
 
-    db.shutdown()?;
     Ok(())
 }
 
@@ -533,30 +468,27 @@ fn delete_reinsert_multiple_ids() -> Result<()> {
 #[test]
 fn delete_cleans_vector_index() -> Result<()> {
     let tmp = tempfile::tempdir()?;
-    let wal = init_wal(&tmp);
 
-    let mut cfg = SatoriDbConfig::new(wal);
-    cfg.workers = 1;
-
-    let db = SatoriDb::start(cfg)?;
-    let handle = db.handle();
+    let db = SatoriDb::builder("test")
+        .workers(1)
+        .data_dir(tmp.path())
+        .build()?;
 
     // Insert
-    handle.upsert_blocking(42, vec![1.0, 2.0], None)?;
+    db.insert(42, vec![1.0, 2.0])?;
 
     // Duplicate should fail (proves vector_index has the entry)
-    assert!(handle.upsert_blocking(42, vec![3.0, 4.0], None).is_err());
+    assert!(db.insert(42, vec![3.0, 4.0]).is_err());
 
     // Delete
-    handle.delete_blocking(42)?;
+    db.delete(42)?;
 
     // Now insert should succeed (proves vector_index was cleaned)
     assert!(
-        handle.upsert_blocking(42, vec![5.0, 6.0], None).is_ok(),
+        db.insert(42, vec![5.0, 6.0]).is_ok(),
         "vector_index should be cleaned after delete"
     );
 
-    db.shutdown()?;
     Ok(())
 }
 
@@ -564,28 +496,21 @@ fn delete_cleans_vector_index() -> Result<()> {
 #[test]
 fn delete_cleans_bucket_index() -> Result<()> {
     let tmp = tempfile::tempdir()?;
-    let wal = init_wal(&tmp);
 
-    let mut cfg = SatoriDbConfig::new(wal);
-    cfg.workers = 1;
+    let db = SatoriDb::builder("test")
+        .workers(1)
+        .data_dir(tmp.path())
+        .build()?;
 
-    let db = SatoriDb::start(cfg)?;
-    let handle = db.handle();
-
-    // Insert and get bucket
-    let (bucket_id, _) = handle.upsert_blocking(42, vec![1.0, 2.0], None)?;
+    // Insert
+    db.insert(42, vec![1.0, 2.0])?;
 
     // Delete
-    handle.delete_blocking(42)?;
+    db.delete(42)?;
 
-    // Reinsert - may go to different bucket, but should succeed
-    let (new_bucket_id, _) = handle.upsert_blocking(42, vec![1.0, 2.0], None)?;
+    // Reinsert should succeed
+    db.insert(42, vec![1.0, 2.0])?;
 
-    // Both operations should complete without error
-    // (bucket_id may or may not equal new_bucket_id depending on routing)
-    let _ = (bucket_id, new_bucket_id);
-
-    db.shutdown()?;
     Ok(())
 }
 
@@ -593,34 +518,31 @@ fn delete_cleans_bucket_index() -> Result<()> {
 #[test]
 fn stress_rapid_delete_reinsert() -> Result<()> {
     let tmp = tempfile::tempdir()?;
-    let wal = init_wal(&tmp);
 
-    let mut cfg = SatoriDbConfig::new(wal);
-    cfg.workers = 2;
-
-    let db = SatoriDb::start(cfg)?;
-    let handle = db.handle();
+    let db = SatoriDb::builder("test")
+        .workers(2)
+        .data_dir(tmp.path())
+        .build()?;
 
     // Rapid cycles on multiple IDs
     for id in 1..=20u64 {
-        handle.upsert_blocking(id, vec![id as f32, id as f32], None)?;
+        db.insert(id, vec![id as f32, id as f32])?;
     }
 
     // Delete half
     for id in (1..=20u64).filter(|x| x % 2 == 0) {
-        handle.delete_blocking(id)?;
+        db.delete(id)?;
     }
 
     // Reinsert deleted ones
     for id in (1..=20u64).filter(|x| x % 2 == 0) {
-        handle.upsert_blocking(id, vec![id as f32 * 2.0, id as f32 * 2.0], None)?;
+        db.insert(id, vec![id as f32 * 2.0, id as f32 * 2.0])?;
     }
 
     // Verify all exist
-    let results = handle.query_blocking(vec![10.0, 10.0], 30, 30)?;
+    let results = db.query(vec![10.0, 10.0], 30)?;
     assert!(results.len() >= 10, "should find many vectors");
 
-    db.shutdown()?;
     Ok(())
 }
 
@@ -628,32 +550,30 @@ fn stress_rapid_delete_reinsert() -> Result<()> {
 #[test]
 fn delete_with_multiple_workers() -> Result<()> {
     let tmp = tempfile::tempdir()?;
-    let wal = init_wal(&tmp);
 
-    let mut cfg = SatoriDbConfig::new(wal);
-    cfg.workers = 4; // Multiple workers
-
-    let db = SatoriDb::start(cfg)?;
-    let handle = db.handle();
+    let db = SatoriDb::builder("test")
+        .workers(4)
+        .data_dir(tmp.path())
+        .build()?;
 
     // Insert vectors that may route to different workers
     for id in 0..100u64 {
-        handle.upsert_blocking(id, vec![id as f32 * 0.1, id as f32 * 0.1], None)?;
+        db.insert(id, vec![id as f32 * 0.1, id as f32 * 0.1])?;
     }
 
     // Delete every 3rd
     for id in (0..100u64).filter(|x| x % 3 == 0) {
-        handle.delete_blocking(id)?;
+        db.delete(id)?;
     }
 
     // Reinsert deleted
     for id in (0..100u64).filter(|x| x % 3 == 0) {
-        handle.upsert_blocking(id, vec![id as f32 * 0.2, id as f32 * 0.2], None)?;
+        db.insert(id, vec![id as f32 * 0.2, id as f32 * 0.2])?;
     }
 
     // Verify no duplicates possible
     for id in 0..100u64 {
-        let result = handle.upsert_blocking(id, vec![0.0, 0.0], None);
+        let result = db.insert(id, vec![0.0, 0.0]);
         assert!(
             result.is_err(),
             "id {} should already exist and reject duplicate",
@@ -661,7 +581,6 @@ fn delete_with_multiple_workers() -> Result<()> {
         );
     }
 
-    db.shutdown()?;
     Ok(())
 }
 
@@ -669,23 +588,20 @@ fn delete_with_multiple_workers() -> Result<()> {
 #[test]
 fn delete_immediately_after_insert() -> Result<()> {
     let tmp = tempfile::tempdir()?;
-    let wal = init_wal(&tmp);
 
-    let mut cfg = SatoriDbConfig::new(wal);
-    cfg.workers = 1;
-
-    let db = SatoriDb::start(cfg)?;
-    let handle = db.handle();
+    let db = SatoriDb::builder("test")
+        .workers(1)
+        .data_dir(tmp.path())
+        .build()?;
 
     for _ in 0..10 {
-        handle.upsert_blocking(999, vec![1.0, 1.0], None)?;
-        handle.delete_blocking(999)?;
+        db.insert(999, vec![1.0, 1.0])?;
+        db.delete(999)?;
     }
 
     // Final state: should be able to insert
-    handle.upsert_blocking(999, vec![2.0, 2.0], None)?;
+    db.insert(999, vec![2.0, 2.0])?;
 
-    db.shutdown()?;
     Ok(())
 }
 
@@ -693,24 +609,63 @@ fn delete_immediately_after_insert() -> Result<()> {
 #[test]
 fn delete_same_id_multiple_times() -> Result<()> {
     let tmp = tempfile::tempdir()?;
-    let wal = init_wal(&tmp);
 
-    let mut cfg = SatoriDbConfig::new(wal);
-    cfg.workers = 1;
+    let db = SatoriDb::builder("test")
+        .workers(1)
+        .data_dir(tmp.path())
+        .build()?;
 
-    let db = SatoriDb::start(cfg)?;
-    let handle = db.handle();
-
-    handle.upsert_blocking(42, vec![1.0, 2.0], None)?;
+    db.insert(42, vec![1.0, 2.0])?;
 
     // Delete multiple times - should not error
-    handle.delete_blocking(42)?;
-    handle.delete_blocking(42)?;
-    handle.delete_blocking(42)?;
+    db.delete(42)?;
+    db.delete(42)?;
+    db.delete(42)?;
 
     // Should still be able to reinsert
-    handle.upsert_blocking(42, vec![3.0, 4.0], None)?;
+    db.insert(42, vec![3.0, 4.0])?;
 
-    db.shutdown()?;
+    Ok(())
+}
+
+/// Get vectors by ID.
+#[test]
+fn get_vectors_by_id() -> Result<()> {
+    let tmp = tempfile::tempdir()?;
+
+    let db = SatoriDb::builder("test")
+        .workers(1)
+        .data_dir(tmp.path())
+        .build()?;
+
+    db.insert(1, vec![1.0, 2.0, 3.0])?;
+    db.insert(2, vec![4.0, 5.0, 6.0])?;
+
+    let vectors = db.get(vec![1, 2, 999])?; // 999 doesn't exist
+    assert_eq!(vectors.len(), 2, "should find 2 vectors");
+
+    Ok(())
+}
+
+/// Query with vectors returns data.
+#[test]
+fn query_with_vectors_returns_data() -> Result<()> {
+    let tmp = tempfile::tempdir()?;
+
+    let db = SatoriDb::builder("test")
+        .workers(1)
+        .data_dir(tmp.path())
+        .build()?;
+
+    db.insert(1, vec![1.0, 2.0, 3.0])?;
+
+    let results = db.query_with_vectors(vec![1.0, 2.0, 3.0], 10)?;
+    assert!(!results.is_empty(), "should find vector");
+    assert_eq!(
+        results[0].2,
+        vec![1.0, 2.0, 3.0],
+        "should return vector data"
+    );
+
     Ok(())
 }

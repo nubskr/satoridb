@@ -1,85 +1,67 @@
 //! An embedded vector database for approximate nearest neighbor search.
 //!
-//! `satoridb` runs a router manager plus a set of worker shards inside your process. Writes and
-//! routing state are persisted to the bundled WAL implementation (“Walrus”), so a clean restart can
-//! recover routing and keep queries accurate. Queries are approximate (HNSW-based) and meant for a
-//! single process; there is no distributed mode.
+//! # Quick Start
 //!
-//! # Quickstart
 //! ```no_run
-//! use std::sync::Arc;
-//!
-//! use satoridb::wal::runtime::Walrus;
-//! use satoridb::wal::{FsyncSchedule, ReadConsistency};
-//! use satoridb::{SatoriDb, SatoriDbConfig};
+//! use satoridb::SatoriDb;
 //!
 //! fn main() -> anyhow::Result<()> {
-//!     // By default Walrus writes under `wal_files/<key>` (relative to the current working dir).
-//!     // Set `WALRUS_DATA_DIR=/some/dir` to control the parent directory.
-//!     let wal = Arc::new(Walrus::with_consistency_and_schedule_for_key(
-//!         "example",
-//!         ReadConsistency::StrictlyAtOnce,
-//!         FsyncSchedule::Milliseconds(200),
-//!     )?);
+//!     let db = SatoriDb::open("my_app")?;
 //!
-//!     let mut cfg = SatoriDbConfig::new(wal);
-//!     cfg.workers = 4;
-//!     let db = SatoriDb::start(cfg)?;
-//!     let api = db.handle();
+//!     db.insert(1, vec![0.1, 0.2, 0.3])?;
+//!     db.insert(2, vec![0.2, 0.3, 0.4])?;
+//!     db.insert(3, vec![0.9, 0.8, 0.7])?;
 //!
-//!     api.upsert_blocking(42, vec![1.0, 2.0, 3.0], None)?;
-//!     let results = api.query_blocking(vec![1.0, 2.0, 3.0], 10, 200)?;
-//!     println!("results={:?}", results);
+//!     let results = db.query(vec![0.15, 0.25, 0.35], 10)?;
+//!     for (id, distance) in results {
+//!         println!("id={id} distance={distance}");
+//!     }
 //!
-//!     db.shutdown()?;
+//!     Ok(()) // auto-shutdown on drop
+//! }
+//! ```
+//!
+//! # Configuration
+//!
+//! For custom configuration, use the builder:
+//!
+//! ```no_run
+//! use satoridb::SatoriDb;
+//!
+//! fn main() -> anyhow::Result<()> {
+//!     let db = SatoriDb::builder("my_app")
+//!         .workers(4)
+//!         .fsync_ms(100)
+//!         .data_dir("/custom/path")
+//!         .build()?;
+//!
+//!     db.insert(1, vec![0.1, 0.2, 0.3])?;
+//!     // ...
+//!
 //!     Ok(())
 //! }
 //! ```
 //!
-//! ## Async API
+//! # Async API
+//!
 //! ```no_run
-//! # use std::sync::Arc;
-//! # use futures::executor::block_on;
-//! # use satoridb::wal::runtime::Walrus;
-//! # use satoridb::wal::{FsyncSchedule, ReadConsistency};
-//! # use satoridb::{SatoriDb, SatoriDbConfig};
-//! # fn main() -> anyhow::Result<()> {
-//! let wal = Arc::new(Walrus::with_consistency_and_schedule_for_key(
-//!     "async_quickstart",
-//!     ReadConsistency::AtLeastOnce { persist_every: 1 },
-//!     FsyncSchedule::NoFsync,
-//! )?);
-//! let db = SatoriDb::start(SatoriDbConfig::new(wal))?;
-//! let api = db.handle();
-//! block_on(async {
-//!     api.upsert(1, vec![0.1, 0.2], None).await?;
-//!     let hits = api.query(vec![0.1, 0.2], 5, 16).await?;
-//!     println!("{hits:?}");
-//!     api.flush().await?;
-//!     Ok::<(), anyhow::Error>(())
-//! })?;
-//! db.shutdown()?;
-//! # Ok(()) }
+//! use satoridb::SatoriDb;
+//!
+//! async fn example() -> anyhow::Result<()> {
+//!     let db = SatoriDb::open("my_app")?;
+//!
+//!     db.insert_async(1, vec![0.1, 0.2, 0.3]).await?;
+//!     let results = db.query_async(vec![0.1, 0.2, 0.3], 10).await?;
+//!
+//!     Ok(())
+//! }
 //! ```
 //!
-//! # Configuration
-//! - `SatoriDbConfig.workers`: worker shard threads (defaults to logical cores).
-//! - `SatoriDbConfig.virtual_nodes`: consistent-hash ring granularity for bucket placement.
-//! - Per-query `router_top_k`: probe more buckets for higher recall at the cost of more work.
-//! - WAL durability: choose `ReadConsistency` (`StrictlyAtOnce` or `AtLeastOnce { persist_every }`)
-//!   and `FsyncSchedule` (`NoFsync`, `Milliseconds(u64)`, `SyncEach`) via `Walrus::with_*` helpers.
-//! - Paths: override RocksDB locations with `SATORI_VECTOR_INDEX_PATH` and
-//!   `SATORI_BUCKET_INDEX_PATH`; set `WALRUS_DATA_DIR` to choose the WAL parent directory.
-//!
 //! # Platform & Stability
-//! - Linux-only for now (Glommio/io_uring).
-//! - Pre-`1.0`: expect breaking API changes.
-//! - Single-process embedded database; approximate recall only.
 //!
-//! # Examples
-//! - `examples/embedded_basic.rs`: minimal blocking setup and query.
-//! - `examples/embedded_async.rs`: async API, durability tuning, and topology knobs.
-//! - `examples/api_tour.rs`: comprehensive end-to-end tour of queries, fetches, deletes, flush, and stats.
+//! - Linux-only (Glommio/io_uring)
+//! - Pre-`1.0`: expect breaking API changes
+//! - Single-process embedded database
 
 // Public library exports so integration tests and external tooling can use the same modules.
 #[doc(hidden)]
@@ -126,5 +108,4 @@ pub mod worker;
 
 pub mod embedded;
 
-pub use embedded::{SatoriDb, SatoriDbConfig};
-pub use service::SatoriHandle;
+pub use embedded::{SatoriDb, SatoriDbBuilder, Stats};

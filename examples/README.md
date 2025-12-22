@@ -1,13 +1,45 @@
-# Examples and Tuning
+# Examples
 
-- `embedded_basic.rs`: minimal blocking setup, two upserts, one query, clean shutdown.
-- `embedded_async.rs`: async API, custom WAL durability (read consistency and fsync schedule), tuned worker/virtual-node counts, router_top_k, bucket-hinted upsert, flush + stats.
-- `api_tour.rs`: comprehensive tour of all APIs including query variants, global vs. bucket-local fetching, bucket resolution, and stats.
+- `embedded_basic.rs`: minimal setup - open, insert, query
+- `embedded_async.rs`: async API with custom configuration
+- `api_tour.rs`: comprehensive tour of all public APIs
 
-## Tuning Cheatsheet
+## Quick Start
 
-- **WAL location**: set `WALRUS_DATA_DIR=/path` to move WAL files; `*_for_key` helpers namespace files under that root.
-- **Durability**: pick `ReadConsistency::StrictlyAtOnce` (default) or `AtLeastOnce { persist_every }`; choose `FsyncSchedule::{NoFsync, Milliseconds(u64), SyncEach}` to trade durability vs throughput.
-- **Topology**: adjust `SatoriDbConfig.workers` (threads) and `virtual_nodes` (hash ring granularity).
-- **Routing**: pass a higher `router_top_k` to `query` for better recall; use `bucket_hint` in `upsert` to force placement when you already know the destination bucket.
-- **Maintenance**: call `flush` to persist worker state and router snapshots; `stats` reports bucket count, total vectors, pending router updates, and readiness.
+```rust
+use satoridb::SatoriDb;
+
+fn main() -> anyhow::Result<()> {
+    let db = SatoriDb::open("my_app")?;
+
+    db.insert(1, vec![0.1, 0.2, 0.3])?;
+    db.insert(2, vec![0.2, 0.3, 0.4])?;
+
+    let results = db.query(vec![0.15, 0.25, 0.35], 10)?;
+    for (id, distance) in results {
+        println!("id={id} distance={distance}");
+    }
+
+    Ok(())
+}
+```
+
+## Configuration
+
+```rust
+let db = SatoriDb::builder("my_app")
+    .workers(4)              // Worker threads (default: num_cpus)
+    .fsync_ms(100)           // Fsync interval (default: 200ms)
+    .data_dir("/custom/path") // Custom data directory
+    .virtual_nodes(16)       // Hash ring granularity (default: 8)
+    .build()?;
+```
+
+## Environment Variables
+
+| Variable | Default | Description |
+|----------|---------|-------------|
+| `SATORI_REBALANCE_THRESHOLD` | `2000` | Split bucket when vector count exceeds this |
+| `SATORI_ROUTER_REBUILD_EVERY` | `1000` | Rebuild HNSW index after N inserts |
+| `SATORI_WORKER_CACHE_BUCKETS` | `64` | Max buckets cached per worker |
+| `SATORI_WORKER_CACHE_BUCKET_MB` | `64` | Max MB per cached bucket |

@@ -60,43 +60,22 @@ cargo add satoridb
 ## Quick Start
 
 ```rust
-use std::sync::Arc;
-use satoridb::wal::runtime::Walrus;
-use satoridb::wal::{FsyncSchedule, ReadConsistency};
-use satoridb::{SatoriDb, SatoriDbConfig};
+use satoridb::SatoriDb;
 
 fn main() -> anyhow::Result<()> {
-    // Initialize storage (writes to wal_files/my_app/)
-    let wal = Arc::new(Walrus::with_consistency_and_schedule_for_key(
-        "my_app",
-        ReadConsistency::StrictlyAtOnce,
-        FsyncSchedule::Milliseconds(200),
-    )?);
+    let db = SatoriDb::open("my_app")?;
 
-    // Start database with 4 worker threads
-    let mut cfg = SatoriDbConfig::new(wal);
-    cfg.workers = 4;
-    let db = SatoriDb::start(cfg)?;
-    let api = db.handle();
+    db.insert(1, vec![0.1, 0.2, 0.3])?;
+    db.insert(2, vec![0.2, 0.3, 0.4])?;
+    db.insert(3, vec![0.9, 0.8, 0.7])?;
 
-    // Upsert vectors
-    api.upsert_blocking(1, vec![0.1, 0.2, 0.3], None)?;
-    api.upsert_blocking(2, vec![0.2, 0.3, 0.4], None)?;
-    api.upsert_blocking(3, vec![0.9, 0.8, 0.7], None)?;
-
-    // Query: find 10 nearest neighbors, probe 200 buckets
-    let results = api.query_blocking(vec![0.15, 0.25, 0.35], 10, 200)?;
+    let results = db.query(vec![0.15, 0.25, 0.35], 10)?;
     for (id, distance) in results {
         println!("id={id} distance={distance}");
     }
 
-    db.shutdown()?;
-    Ok(())
+    Ok(()) // auto-shutdown on drop
 }
-```
-
-```bash
-cargo run --example embedded_basic
 ```
 
 ## API
@@ -104,52 +83,53 @@ cargo run --example embedded_basic
 ### Core Operations
 
 ```rust
-// Insert a vector (id, data, optional bucket_hint)
-api.upsert_blocking(id, vector, None)?;
+// Insert a vector (rejects duplicates)
+db.insert(id, vector)?;
 
-// Query: returns Vec<(id, distance)>
-let results = api.query_blocking(query_vector, top_k, router_top_k)?;
+// Delete a vector
+db.delete(id)?;
+
+// Query nearest neighbors: returns Vec<(id, distance)>
+let results = db.query(query_vector, top_k)?;
 
 // Query with vectors inline: returns Vec<(id, distance, vector)>
-let results = api.query_with_vectors_blocking(query_vector, top_k, router_top_k)?;
+let results = db.query_with_vectors(query_vector, top_k)?;
 
-// Fetch vectors by ID (via RocksDB index)
-let vectors = api.fetch_vectors_by_id_blocking(vec![1, 2, 3])?;
+// Fetch vectors by ID
+let vectors = db.get(vec![1, 2, 3])?;
+
+// Get stats
+let stats = db.stats();
+println!("buckets={} vectors={}", stats.buckets, stats.vectors);
 ```
 
-### Parameters
+### Async API
 
-| Parameter | Description |
-|-----------|-------------|
-| `top_k` | Number of results to return |
-| `router_top_k` | Number of buckets to probe (higher = better recall, slower) |
+```rust
+db.insert_async(id, vector).await?;
+db.delete_async(id).await?;
+let results = db.query_async(query_vector, top_k).await?;
+let vectors = db.get_async(ids).await?;
+```
 
 ## Configuration
+
+```rust
+let db = SatoriDb::builder("my_app")
+    .workers(4)              // Worker threads (default: num_cpus)
+    .fsync_ms(100)           // Fsync interval (default: 200ms)
+    .data_dir("/custom/path") // Data directory
+    .build()?;
+```
+
+### Environment Variables
 
 | Variable | Default | Description |
 |----------|---------|-------------|
 | `SATORI_REBALANCE_THRESHOLD` | `2000` | Split bucket when vector count exceeds this |
-| `SATORI_ROUTER_REBUILD_EVERY` | `1000` | Rebuild HNSW index after N upserts |
+| `SATORI_ROUTER_REBUILD_EVERY` | `1000` | Rebuild HNSW index after N inserts |
 | `SATORI_WORKER_CACHE_BUCKETS` | `64` | Max buckets cached per worker |
 | `SATORI_WORKER_CACHE_BUCKET_MB` | `64` | Max MB per cached bucket |
-| `SATORI_VECTOR_INDEX_PATH` | `vector_index` | RocksDB path for id→vector index |
-| `SATORI_BUCKET_INDEX_PATH` | `bucket_index` | RocksDB path for id→bucket index |
-| `WALRUS_DATA_DIR` | `./wal_files` | Storage directory |
-
-### Durability
-
-Configure via `FsyncSchedule` when creating Walrus:
-
-```rust
-// Fsync every 200ms (default), balances durability and throughput
-FsyncSchedule::Milliseconds(200)
-
-// Fsync every write, maximum durability
-FsyncSchedule::SyncEach
-
-// No fsync, maximum throughput, data loss on crash
-FsyncSchedule::NoFsync
-```
 
 ## Build
 

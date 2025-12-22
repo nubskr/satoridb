@@ -1,78 +1,47 @@
-use std::sync::Arc;
-
 use satoridb::wal::runtime::Walrus;
-use satoridb::wal::{FsyncSchedule, ReadConsistency};
-use satoridb::{SatoriDb, SatoriDbConfig};
+use satoridb::SatoriDb;
 
 #[test]
 fn routing_and_data_survive_restart() {
     let tmp = tempfile::tempdir().expect("tempdir");
-    std::env::set_var("WALRUS_QUIET", "1");
 
+    // First session: insert data
     {
-        let wal = Arc::new(
-            Walrus::with_data_dir_and_options(
-                tmp.path().to_path_buf(),
-                ReadConsistency::StrictlyAtOnce,
-                FsyncSchedule::NoFsync,
-            )
-            .expect("walrus"),
-        );
-        let mut cfg = SatoriDbConfig::new(wal);
-        cfg.workers = 1;
-        let db = SatoriDb::start(cfg).expect("start");
-        let api = db.handle();
+        let db = SatoriDb::builder("test")
+            .workers(1)
+            .data_dir(tmp.path())
+            .build()
+            .expect("start");
 
-        api.upsert_blocking(1, vec![0.0, 0.0], Some(1))
-            .expect("upsert b1");
-        api.upsert_blocking(2, vec![10.0, 10.0], Some(2))
-            .expect("upsert b2");
+        db.insert(1, vec![0.0, 0.0]).expect("insert 1");
+        db.insert(2, vec![10.0, 10.0]).expect("insert 2");
 
         db.shutdown().expect("shutdown");
     }
 
+    // Verify WAL has data before restart
     {
-        let wal = Arc::new(
-            Walrus::with_data_dir_and_options(
-                tmp.path().to_path_buf(),
-                ReadConsistency::StrictlyAtOnce,
-                FsyncSchedule::NoFsync,
-            )
-            .expect("walrus"),
-        );
-        // Verify routing metadata made it to the WAL before we even start the DB.
+        let wal = Walrus::with_data_dir(tmp.path().to_path_buf()).expect("walrus");
         let snap_size = wal.get_topic_size("router_snapshot");
         let upd_size = wal.get_topic_size("router_updates");
         assert!(snap_size > 0, "router_snapshot empty after restart");
         assert!(upd_size > 0, "router_updates empty after restart");
-        let snap_entries = wal
-            .batch_read_for_topic("router_snapshot", snap_size as usize + 1024, false, Some(0))
-            .expect("read router_snapshot");
-        let upd_entries = wal
-            .batch_read_for_topic("router_updates", upd_size as usize + 1024, false, Some(0))
-            .expect("read router_updates");
-        assert!(
-            !snap_entries.is_empty(),
-            "router_snapshot has size but no entries"
-        );
-        assert!(
-            !upd_entries.is_empty(),
-            "router_updates has size but no entries"
-        );
+    }
 
-        let mut cfg = SatoriDbConfig::new(wal);
-        cfg.workers = 1;
-        let db = SatoriDb::start(cfg).expect("start");
-        let api = db.handle();
+    // Second session: verify data persists
+    {
+        let db = SatoriDb::builder("test")
+            .workers(1)
+            .data_dir(tmp.path())
+            .build()
+            .expect("start");
 
-        let near_10 = api.query_blocking(vec![10.0, 10.0], 1, 1).expect("query");
+        let near_10 = db.query(vec![10.0, 10.0], 1).expect("query");
         assert_eq!(near_10.len(), 1);
         assert_eq!(near_10[0].0, 2);
 
-        let near_0 = api.query_blocking(vec![0.0, 0.0], 1, 1).expect("query");
+        let near_0 = db.query(vec![0.0, 0.0], 1).expect("query");
         assert_eq!(near_0.len(), 1);
         assert_eq!(near_0[0].0, 1);
-
-        db.shutdown().expect("shutdown");
     }
 }
