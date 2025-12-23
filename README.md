@@ -4,9 +4,8 @@
        width="8%">
   <div>SatoriDB: Billion scale embedded vector database</div>
 
-[![Crates.io](https://img.shields.io/crates/v/satoridb.svg)](https://crates.io/crates/walrus-rust)
+[![Crates.io](https://img.shields.io/crates/v/satoridb.svg)](https://crates.io/crates/satoridb)
 [![Documentation](https://docs.rs/satoridb/badge.svg)](https://docs.rs/satoridb)
-[![CI](https://github.com/satoridb/satoridb/actions/workflows/ci.yml/badge.svg)](https://github.com/satoridb/satoridb/actions)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
   <br>
 
