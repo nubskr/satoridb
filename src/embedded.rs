@@ -121,7 +121,13 @@ impl SatoriDbBuilder {
             .map_err(|e| anyhow!("failed to initialize storage: {}", e))?,
         );
 
-        SatoriDb::start_internal(wal, self.workers, self.virtual_nodes, vector_index_path, bucket_index_path)
+        SatoriDb::start_internal(
+            wal,
+            self.workers,
+            self.virtual_nodes,
+            vector_index_path,
+            bucket_index_path,
+        )
     }
 }
 
@@ -488,4 +494,3 @@ pub struct Stats {
     /// Approximate number of vectors.
     pub vectors: u64,
 }
-
