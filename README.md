@@ -144,4 +144,4 @@ cargo build --release
 
 See [LICENSE](LICENSE).
 
-> **Note**: SatoriDB is in early development (v0.1.1). APIs may change between versions. See [CHANGELOG.md](CHANGELOG.md) for release notes.
+> **Note**: SatoriDB is in early development (v0.1.2). APIs may change between versions. See [CHANGELOG.md](CHANGELOG.md) for release notes.

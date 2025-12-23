@@ -2,6 +2,12 @@
 
 All notable changes to SatoriDB will be documented in this file.
 
+## [0.1.2] - 2025-12-23
+
+### Bug Fixes
+
+- **Fixed index persistence**: VectorIndex and BucketIndex now stored inside `data_dir` instead of random temp paths. Fixes duplicate detection not working across restarts.
+
 ## [0.1.1] - 2025-12-23
 
 ### Breaking Changes

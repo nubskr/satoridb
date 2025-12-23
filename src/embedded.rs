@@ -16,7 +16,7 @@ use futures::channel::oneshot;
 use futures::executor::block_on;
 use glommio::{LocalExecutorBuilder, Placement};
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::thread;
 
@@ -97,27 +97,31 @@ impl SatoriDbBuilder {
             return Err(anyhow!("workers must be > 0"));
         }
 
-        let wal = if let Some(data_dir) = self.data_dir {
-            Arc::new(
-                Walrus::with_data_dir_and_options(
-                    data_dir,
-                    crate::wal::runtime::ReadConsistency::StrictlyAtOnce,
-                    FsyncSchedule::Milliseconds(self.fsync_ms),
-                )
-                .map_err(|e| anyhow!("failed to initialize storage: {}", e))?,
-            )
+        // Determine base directory for all data (wal, indexes)
+        let base_dir = if let Some(ref dir) = self.data_dir {
+            dir.clone()
         } else {
-            Arc::new(
-                Walrus::with_consistency_and_schedule_for_key(
-                    &self.name,
-                    crate::wal::runtime::ReadConsistency::StrictlyAtOnce,
-                    FsyncSchedule::Milliseconds(self.fsync_ms),
-                )
-                .map_err(|e| anyhow!("failed to initialize storage: {}", e))?,
-            )
+            PathBuf::from("./wal_files").join(&self.name)
         };
 
-        SatoriDb::start_internal(wal, self.workers, self.virtual_nodes)
+        // Ensure base directory exists
+        std::fs::create_dir_all(&base_dir)
+            .map_err(|e| anyhow!("failed to create data directory: {}", e))?;
+
+        // Store indexes inside base_dir
+        let vector_index_path = base_dir.join("vector_index");
+        let bucket_index_path = base_dir.join("bucket_index");
+
+        let wal = Arc::new(
+            Walrus::with_data_dir_and_options(
+                base_dir,
+                crate::wal::runtime::ReadConsistency::StrictlyAtOnce,
+                FsyncSchedule::Milliseconds(self.fsync_ms),
+            )
+            .map_err(|e| anyhow!("failed to initialize storage: {}", e))?,
+        );
+
+        SatoriDb::start_internal(wal, self.workers, self.virtual_nodes, vector_index_path, bucket_index_path)
     }
 }
 
@@ -387,9 +391,15 @@ impl SatoriDb {
     // Internal
     // ========================================================================
 
-    fn start_internal(wal: Arc<Walrus>, workers: usize, virtual_nodes: usize) -> Result<Self> {
-        let vector_index = Arc::new(VectorIndex::open(default_vector_index_path())?);
-        let bucket_index = Arc::new(BucketIndex::open(default_bucket_index_path())?);
+    fn start_internal(
+        wal: Arc<Walrus>,
+        workers: usize,
+        virtual_nodes: usize,
+        vector_index_path: PathBuf,
+        bucket_index_path: PathBuf,
+    ) -> Result<Self> {
+        let vector_index = Arc::new(VectorIndex::open(vector_index_path)?);
+        let bucket_index = Arc::new(BucketIndex::open(bucket_index_path)?);
         let bucket_locks = Arc::new(BucketLocks::new());
 
         let mut worker_senders = Vec::new();
@@ -479,26 +489,3 @@ pub struct Stats {
     pub vectors: u64,
 }
 
-// ============================================================================
-// Helpers
-// ============================================================================
-
-fn default_vector_index_path() -> PathBuf {
-    if let Ok(p) = std::env::var("SATORI_VECTOR_INDEX_PATH") {
-        return PathBuf::from(p);
-    }
-
-    static COUNTER: AtomicU64 = AtomicU64::new(0);
-    let n = COUNTER.fetch_add(1, Ordering::Relaxed);
-    std::env::temp_dir().join(format!("vector_index_{}_{}", std::process::id(), n))
-}
-
-fn default_bucket_index_path() -> PathBuf {
-    if let Ok(p) = std::env::var("SATORI_BUCKET_INDEX_PATH") {
-        return PathBuf::from(p);
-    }
-
-    static COUNTER: AtomicU64 = AtomicU64::new(0);
-    let n = COUNTER.fetch_add(1, Ordering::Relaxed);
-    std::env::temp_dir().join(format!("bucket_index_{}_{}", std::process::id(), n))
-}
