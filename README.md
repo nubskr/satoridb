@@ -3,9 +3,16 @@
        alt="octopii"
        width="8%">
   <div>SatoriDB: Billion scale embedded vector database</div>
+
+[![Crates.io](https://img.shields.io/crates/v/satoridb.svg)](https://crates.io/crates/walrus-rust)
+[![Documentation](https://docs.rs/satoridb/badge.svg)](https://docs.rs/satoridb)
+[![CI](https://github.com/satoridb/satoridb/actions/workflows/ci.yml/badge.svg)](https://github.com/satoridb/satoridb/actions)
+[![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
   <br>
 
 </div>
+
+SatoriDB is an embedded vector database built for bigger than memory workloads for ANN search and handles billion scale datasets with 95%+ recall and predictable latencies.
 
 # Architecture
 
