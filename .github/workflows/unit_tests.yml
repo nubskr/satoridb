@@ -8,6 +8,7 @@ on:
 
 env:
   CARGO_TERM_COLOR: always
+  WALRUS_QUIET: "1"
 
 jobs:
   test:

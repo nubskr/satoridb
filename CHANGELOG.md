@@ -2,6 +2,53 @@
 
 All notable changes to SatoriDB will be documented in this file.
 
+## [0.1.1] - 2025-12-23
+
+### Breaking Changes
+
+Complete public API redesign. The old `SatoriHandle` + `SatoriDbConfig` API is gone.
+
+### New API
+
+**Simple open:**
+```rust
+let db = SatoriDb::open("my_app")?;
+```
+
+**Builder for configuration:**
+```rust
+let db = SatoriDb::builder("my_app")
+    .workers(4)
+    .fsync_ms(100)
+    .data_dir("/custom/path")
+    .virtual_nodes(8)
+    .build()?;
+```
+
+**Core operations:**
+- `db.insert(id, vector)` — insert (rejects duplicates)
+- `db.delete(id)` — delete by ID
+- `db.query(vector, top_k)` — nearest neighbor search
+- `db.query_with_probes(vector, top_k, probes)` — query with custom probe count
+- `db.query_with_vectors(vector, top_k)` — query returning stored vectors
+- `db.get(ids)` — fetch vectors by ID
+- `db.stats()` — database statistics
+- `db.flush()` — flush pending writes
+
+**Async variants:** `insert_async`, `delete_async`, `query_async`, `get_async`
+
+### Improvements
+
+- **Auto-shutdown on Drop** — no manual shutdown required
+- **Duplicate ID rejection** — bloom filter optimization for fast duplicate detection
+- **Walrus logs suppressed by default** — set `WALRUS_QUIET=0` to enable
+
+### Removed
+
+- `SatoriDbConfig` struct
+- `SatoriHandle` direct access
+- `upsert_blocking`, `query_blocking` naming
+
 ## [0.1.0] - 2025-12-21
 
 Initial release.

@@ -1,4 +1,7 @@
-//! An embedded vector database for approximate nearest neighbor search.
+//! SatoriDB: Billion-scale embedded vector database.
+//!
+//! Two-tier architecture: HNSW routing in RAM + parallel bucket scanning on disk.
+//! Handles 1B+ vectors with 95%+ recall.
 //!
 //! # Quick Start
 //!
@@ -9,21 +12,13 @@
 //!     let db = SatoriDb::open("my_app")?;
 //!
 //!     db.insert(1, vec![0.1, 0.2, 0.3])?;
-//!     db.insert(2, vec![0.2, 0.3, 0.4])?;
-//!     db.insert(3, vec![0.9, 0.8, 0.7])?;
-//!
 //!     let results = db.query(vec![0.15, 0.25, 0.35], 10)?;
-//!     for (id, distance) in results {
-//!         println!("id={id} distance={distance}");
-//!     }
 //!
 //!     Ok(()) // auto-shutdown on drop
 //! }
 //! ```
 //!
 //! # Configuration
-//!
-//! For custom configuration, use the builder:
 //!
 //! ```no_run
 //! use satoridb::SatoriDb;
@@ -34,24 +29,47 @@
 //!         .fsync_ms(100)
 //!         .data_dir("/custom/path")
 //!         .build()?;
-//!
-//!     db.insert(1, vec![0.1, 0.2, 0.3])?;
-//!     // ...
-//!
-//!     Ok(())
+//!     # Ok(())
 //! }
+//! ```
+//!
+//! # Core Operations
+//!
+//! ```no_run
+//! # use satoridb::SatoriDb;
+//! # fn main() -> anyhow::Result<()> {
+//! # let db = SatoriDb::open("my_app")?;
+//! // Insert (rejects duplicates)
+//! db.insert(1, vec![0.1, 0.2, 0.3])?;
+//!
+//! // Query nearest neighbors
+//! let results = db.query(vec![0.1, 0.2, 0.3], 10)?;
+//!
+//! // Query with vectors returned
+//! let results = db.query_with_vectors(vec![0.1, 0.2, 0.3], 10)?;
+//!
+//! // Fetch by ID
+//! let vectors = db.get(vec![1, 2, 3])?;
+//!
+//! // Delete
+//! db.delete(1)?;
+//!
+//! // Flush to disk
+//! db.flush()?;
+//! # Ok(())
+//! # }
 //! ```
 //!
 //! # Async API
 //!
 //! ```no_run
-//! use satoridb::SatoriDb;
-//!
+//! # use satoridb::SatoriDb;
 //! async fn example() -> anyhow::Result<()> {
 //!     let db = SatoriDb::open("my_app")?;
 //!
 //!     db.insert_async(1, vec![0.1, 0.2, 0.3]).await?;
 //!     let results = db.query_async(vec![0.1, 0.2, 0.3], 10).await?;
+//!     db.delete_async(1).await?;
 //!
 //!     Ok(())
 //! }
@@ -59,8 +77,8 @@
 //!
 //! # Platform & Stability
 //!
-//! - Linux-only (Glommio/io_uring)
-//! - Pre-`1.0`: expect breaking API changes
+//! - Linux-only (requires io_uring, kernel 5.8+)
+//! - Pre-1.0: expect breaking API changes
 //! - Single-process embedded database
 
 // Public library exports so integration tests and external tooling can use the same modules.

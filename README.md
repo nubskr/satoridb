@@ -11,33 +11,23 @@
 
 ![architecture](./assets/architecture.png)
 
-SatoriDB runs entirely in-process on a single node. It uses a **two-tier search** architecture:
+SatoriDB is a two-tier search system: a small "hot" index in RAM routes queries to "cold" vector data on disk. This lets us handle billion-scale datasets without holding everything in memory.
 
-1. **Routing (HNSW)**: A quantized HNSW index over bucket centroids finds the most relevant clusters in O(log N)
-2. **Scanning (Workers)**: CPU-pinned Glommio executors scan selected buckets in parallel using SIMD-accelerated L2 distance
+**Routing (Hot Tier)**
 
-We use a variant of [SPFresh](https://arxiv.org/pdf/2410.14452), Vectors are organized into **buckets** (clusters of similar vectors). A background rebalancer automatically splits buckets via k-means when they exceed a threshold, keeping search efficient as data grows. All data is persisted to walrus high performance storage engine and we use RocksDB indexes for point lookups.
+Quantized HNSW index over bucket centroids. Centroids are scalar-quantized (f32 → u8) so the whole routing index fits in RAM even at 500k+ buckets. When a query comes in, HNSW finds the top-K most relevant buckets in O(log N). We only search those, not the entire dataset.
 
-See [docs/architecture.md](docs/architecture.md) for detailed documentation including:
-- System overview and component diagrams
-- Two-tier search architecture
-- Storage layer (Walrus + RocksDB)
-- Rebalancer and clustering algorithms
-- Data flow diagrams
+**Scanning (Cold Tier)**
 
-```
-SatoriHandle ──▶ Router Manager ──▶ HNSW Index (centroids)
-      │                                   │
-      │         ┌─────────────────────────┘
-      │         ▼
-      │    Bucket IDs ──▶ Consistent Hash Ring
-      │                          │
-      ▼                          ▼
-  Workers ◀──────────────── bucket_id → shard
-      │
-      ▼
-  Walrus (storage) + RocksDB (indexes)
-```
+CPU-pinned Glommio workers scan selected buckets in parallel. Shared-nothing: each worker has its own io_uring ring, LRU cache, and pre-allocated heap. No cross-core synchronization on the query path. SIMD everywhere: L2 distance, dot products, quantization, k-means assignments all have AVX2/AVX-512 paths. Cache misses stream from disk without blocking.
+
+**Clustering & Rebalancing**
+
+Vectors are grouped into buckets (clusters) via k-means. A background rebalancer automatically splits buckets when they exceed ~2000 vectors, keeping bucket sizes predictable. Predictable sizes = predictable query latency. Inspired by [SPFresh](https://arxiv.org/pdf/2410.14452).
+
+**Storage**
+
+Walrus handles bulk vector storage (append-only, io_uring, topic-per-bucket). RocksDB indexes handle point lookups (fetch-by-id, duplicate detection). See [docs/architecture.md](docs/architecture.md) for the full deep-dive.
 
 ## Features
 
@@ -63,7 +53,11 @@ cargo add satoridb
 use satoridb::SatoriDb;
 
 fn main() -> anyhow::Result<()> {
-    let db = SatoriDb::open("my_app")?;
+    let db = SatoriDb::builder("my_app")
+        .workers(4)              // Worker threads (default: num_cpus)
+        .fsync_ms(100)           // Fsync interval (default: 200ms)
+        .data_dir("/tmp/mydb")   // Data directory
+        .build()?;
 
     db.insert(1, vec![0.1, 0.2, 0.3])?;
     db.insert(2, vec![0.2, 0.3, 0.4])?;
@@ -150,4 +144,4 @@ cargo build --release
 
 See [LICENSE](LICENSE).
 
-> **Note**: SatoriDB is in early development (v0.1.0). APIs may change between versions. See [CHANGELOG.md](CHANGELOG.md) for release notes.
+> **Note**: SatoriDB is in early development (v0.1.1). APIs may change between versions. See [CHANGELOG.md](CHANGELOG.md) for release notes.

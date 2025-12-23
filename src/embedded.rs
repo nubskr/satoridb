@@ -88,6 +88,11 @@ impl SatoriDbBuilder {
 
     /// Build and start the database.
     pub fn build(self) -> Result<SatoriDb> {
+        // Suppress Walrus logs by default (user can override with WALRUS_QUIET=0)
+        if std::env::var("WALRUS_QUIET").is_err() {
+            std::env::set_var("WALRUS_QUIET", "1");
+        }
+
         if self.workers == 0 {
             return Err(anyhow!("workers must be > 0"));
         }
