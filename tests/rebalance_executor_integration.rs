@@ -31,7 +31,7 @@ fn wait_until(timeout: Duration, mut f: impl FnMut() -> bool) -> bool {
 #[test]
 fn split_updates_routing_and_executor_results() -> Result<()> {
     // Force split on small buckets (8 vectors > 4)
-    std::env::set_var("SATORI_REBALANCE_THRESHOLD", "4");
+    let threshold = 4;
 
     let tmp = tempfile::tempdir()?;
     let wal = init_wal(&tmp);
@@ -40,13 +40,14 @@ fn split_updates_routing_and_executor_results() -> Result<()> {
     let storage = Storage::new(wal);
     let routing = Arc::new(RoutingTable::new());
     let bucket_locks = Arc::new(BucketLocks::new());
-    let worker = RebalanceWorker::spawn(
+    let worker = RebalanceWorker::spawn_with_threshold(
         storage.clone(),
         vector_index.clone(),
         bucket_index.clone(),
         routing.clone(),
         None,
         bucket_locks,
+        threshold,
     );
 
     // One bucket containing two clear clusters: near (0,0) and near (100,100).

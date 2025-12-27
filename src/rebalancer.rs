@@ -451,25 +451,30 @@ impl RebalanceState {
             total_moved += batch_entries.len();
 
             // Commit (Consume)
-            // We read exactly as many entries as we peeked to advance the cursor.
-            // StrictlyAtOnce will persist the offset.
-            let mut remaining = batch_entries.len();
+            // We use batch_read_for_topic with checkpoint=true to consume efficiently.
+            // StrictlyAtOnce will persist the offset once per batch.
+            let remaining = batch_entries.len();
+
+            // Calculate exact payload bytes to consume so we don't over-consume new writes
+            let payload_bytes: usize = batch_entries.iter().map(|e| e.data.len()).sum();
+
             let mut commit_error = false;
-            while remaining > 0 {
-                match self.wal.read_next(&topic, true) {
-                    Ok(Some(_)) => remaining -= 1,
-                    Ok(None) => {
-                        error!(
-                            "rebalance: commit failed (unexpected EOF) for {}, {} remaining",
-                            topic, remaining
-                        );
-                        commit_error = true;
-                        break;
+            if remaining > 0 {
+                match self
+                    .wal
+                    .batch_read_for_topic(&topic, payload_bytes, true, None)
+                {
+                    Ok(batch) => {
+                        if batch.len() != remaining {
+                            error!(
+                                "rebalance: commit mismatch for {}: expected {} entries, consumed {}",
+                                topic, remaining, batch.len()
+                            );
+                        }
                     }
                     Err(e) => {
                         error!("rebalance: commit failed for {}: {:?}", topic, e);
                         commit_error = true;
-                        break;
                     }
                 }
             }
@@ -524,6 +529,27 @@ impl RebalanceWorker {
         pin_cpu: Option<usize>,
         bucket_locks: Arc<BucketLocks>,
     ) -> Self {
+        let threshold = read_rebalance_threshold();
+        Self::spawn_with_threshold(
+            storage,
+            vector_index,
+            bucket_index,
+            routing,
+            pin_cpu,
+            bucket_locks,
+            threshold,
+        )
+    }
+
+    pub fn spawn_with_threshold(
+        storage: Storage,
+        vector_index: Arc<VectorIndex>,
+        bucket_index: Arc<BucketIndex>,
+        routing: Arc<RoutingTable>,
+        pin_cpu: Option<usize>,
+        bucket_locks: Arc<BucketLocks>,
+        threshold: usize,
+    ) -> Self {
         let state = Arc::new(RebalanceState::new(
             storage,
             vector_index,
@@ -543,7 +569,7 @@ impl RebalanceWorker {
                     builder
                         .make()
                         .expect("failed to create rebalance executor")
-                        .run(run_autonomous_loop(state_clone, delete_rx));
+                        .run(run_autonomous_loop(state_clone, delete_rx, threshold));
                 });
             }
             None => {
@@ -554,7 +580,7 @@ impl RebalanceWorker {
                             .name(&name)
                             .make()
                             .expect("failed to create default rebalance executor")
-                            .run(run_autonomous_loop(state_clone, delete_rx));
+                            .run(run_autonomous_loop(state_clone, delete_rx, threshold));
                     })
                     .expect("rebalance worker");
             }
@@ -672,12 +698,8 @@ async fn run_delete_loop(
 async fn run_autonomous_loop(
     state: Arc<RebalanceState>,
     delete_rx: async_channel::Receiver<DeleteCommand>,
+    threshold: usize,
 ) {
-    let threshold: usize = std::env::var("SATORI_REBALANCE_THRESHOLD")
-        .ok()
-        .and_then(|v| v.parse().ok())
-        .unwrap_or(2000);
-
     loop {
         while let Ok(cmd) = delete_rx.try_recv() {
             if let Err(e) = handle_delete(&state, cmd).await {
@@ -707,6 +729,13 @@ async fn run_autonomous_loop(
             glommio::timer::Timer::new(Duration::from_millis(500)).await;
         }
     }
+}
+
+fn read_rebalance_threshold() -> usize {
+    std::env::var("SATORI_REBALANCE_THRESHOLD")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(2000)
 }
 
 async fn perform_delete(
@@ -921,9 +950,9 @@ mod tests {
 
         let dir = tempdir().unwrap();
         let wal_path = dir.path().join("wal");
-        std::env::set_var("WALRUS_DATA_DIR", wal_path.to_str().unwrap());
+        // std::env::set_var("WALRUS_DATA_DIR", wal_path.to_str().unwrap());
 
-        let wal = Arc::new(Walrus::new().unwrap());
+        let wal = Arc::new(Walrus::with_data_dir(wal_path).unwrap());
         let storage = Storage::new(wal.clone());
 
         let vi_path = dir.path().join("vector_index");
@@ -1062,9 +1091,9 @@ mod tests {
 
         let dir = tempdir().unwrap();
         let wal_path = dir.path().join("wal_conc");
-        std::env::set_var("WALRUS_DATA_DIR", wal_path.to_str().unwrap());
+        // std::env::set_var("WALRUS_DATA_DIR", wal_path.to_str().unwrap());
 
-        let wal = Arc::new(Walrus::new().unwrap());
+        let wal = Arc::new(Walrus::with_data_dir(wal_path).unwrap());
         let storage = Storage::new(wal.clone());
 
         let vi_path = dir.path().join("vector_index_conc");
@@ -1253,13 +1282,13 @@ mod tests {
         use tempfile::tempdir;
 
         // Set low threshold to trigger rebalancing easily
-        std::env::set_var("SATORI_REBALANCE_THRESHOLD", "10");
+        let threshold = 10;
 
         let dir = tempdir().unwrap();
         let wal_path = dir.path().join("wal_keep");
-        std::env::set_var("WALRUS_DATA_DIR", wal_path.to_str().unwrap());
+        // std::env::set_var("WALRUS_DATA_DIR", wal_path.to_str().unwrap());
 
-        let wal = Arc::new(Walrus::new().unwrap());
+        let wal = Arc::new(Walrus::with_data_dir(wal_path).unwrap());
         let storage = Storage::new(wal.clone());
 
         let vi_path = dir.path().join("vector_index_keep");
@@ -1272,13 +1301,14 @@ mod tests {
         let bucket_locks = Arc::new(BucketLocks::new());
 
         // Use RebalanceWorker::spawn to get the autonomous loop running
-        let worker = RebalanceWorker::spawn(
+        let worker = RebalanceWorker::spawn_with_threshold(
             storage.clone(),
             vector_index.clone(),
             bucket_index.clone(),
             routing.clone(),
             None,
             bucket_locks.clone(),
+            threshold,
         );
 
         // 1. Prime Bucket 0
@@ -1333,328 +1363,162 @@ mod tests {
             thread::sleep(Duration::from_millis(50));
         }
 
-                assert!(second_split, "Rebalancer stopped working! Second split failed.");
+        assert!(
+            second_split,
+            "Rebalancer stopped working! Second split failed."
+        );
+    }
 
-            }
+    #[test]
 
-        
+    fn test_continuous_splitting_under_load() {
+        use crate::bucket_index::BucketIndex;
 
-            #[test]
+        use crate::bucket_locks::BucketLocks;
 
-            fn test_continuous_splitting_under_load() {
+        use crate::router::RoutingTable;
 
-                use crate::bucket_index::BucketIndex;
+        use crate::storage::wal::runtime::Walrus;
 
-                use crate::bucket_locks::BucketLocks;
+        use crate::vector_index::VectorIndex;
 
-                use crate::router::RoutingTable;
+        use std::sync::Arc;
 
-                use crate::storage::wal::runtime::Walrus;
+        use std::thread;
 
-                use crate::vector_index::VectorIndex;
+        use std::time::{Duration, Instant};
 
-                use std::sync::Arc;
+        use tempfile::tempdir;
 
-                use std::thread;
+        let _ = env_logger::builder().is_test(true).try_init();
 
-                use std::time::{Duration, Instant};
+        // 1. Setup with low threshold to force frequent splits
 
-                use tempfile::tempdir;
+        let threshold = 100;
 
-        
+        let dir = tempdir().unwrap();
 
-                let _ = env_logger::builder().is_test(true).try_init();
+        let wal_path = dir.path().join("wal_load");
 
-        
+        // std::env::set_var("WALRUS_DATA_DIR", wal_path.to_str().unwrap());
 
-                // 1. Setup with low threshold to force frequent splits
+        let wal = Arc::new(Walrus::with_data_dir(wal_path).unwrap());
 
-                std::env::set_var("SATORI_REBALANCE_THRESHOLD", "100");
+        let storage = Storage::new(wal.clone());
 
-        
+        let vector_index = Arc::new(VectorIndex::open(dir.path().join("vi")).unwrap());
 
-                let dir = tempdir().unwrap();
+        let bucket_index = Arc::new(BucketIndex::open(dir.path().join("bi")).unwrap());
 
-                let wal_path = dir.path().join("wal_load");
+        let routing = Arc::new(RoutingTable::new());
 
-                std::env::set_var("WALRUS_DATA_DIR", wal_path.to_str().unwrap());
+        let bucket_locks = Arc::new(BucketLocks::new());
 
-        
+        let worker = RebalanceWorker::spawn_with_threshold(
+            storage.clone(),
+            vector_index.clone(),
+            bucket_index.clone(),
+            routing.clone(),
+            None,
+            bucket_locks.clone(),
+            threshold,
+        );
 
-                let wal = Arc::new(Walrus::new().unwrap());
+        // 2. Prime Bucket 0
 
-                let storage = Storage::new(wal.clone());
+        block_on(worker.prime_centroids(&[Bucket {
+            id: 0,
 
-                let vector_index = Arc::new(VectorIndex::open(&dir.path().join("vi")).unwrap());
+            centroid: vec![0.0, 0.0],
 
-                let bucket_index = Arc::new(BucketIndex::open(&dir.path().join("bi")).unwrap());
+            vectors: vec![],
+        }]))
+        .unwrap();
 
-                let routing = Arc::new(RoutingTable::new());
+        // 3. Heavy Load Writer (Router-aware)
 
-                let bucket_locks = Arc::new(BucketLocks::new());
+        let routing_clone = routing.clone();
 
-        
+        let storage_clone = storage.clone();
 
-                let worker = RebalanceWorker::spawn(
+        let total_vectors = 10_000;
 
-                    storage.clone(),
+        thread::spawn(move || {
+            for i in 0..total_vectors {
+                // Generate diverse vectors to ensure splits
 
-                    vector_index.clone(),
+                let val = (i as f32) / 10.0;
 
-                    bucket_index.clone(),
+                let vec_data = vec![val, val];
 
-                    routing.clone(),
+                let vec = Vector::new(i, vec_data.clone());
 
-                    None,
+                // Route using the shared routing table (simulating real workers)
 
-                    bucket_locks.clone(),
+                // Retry loop to handle race where router might be empty briefly or updating
 
-                );
-
-        
-
-                // 2. Prime Bucket 0
-
-                block_on(worker.prime_centroids(&[Bucket {
-
-                    id: 0,
-
-                    centroid: vec![0.0, 0.0],
-
-                    vectors: vec![],
-
-                }]))
-
-                .unwrap();
-
-        
-
-                // 3. Heavy Load Writer (Router-aware)
-
-                let routing_clone = routing.clone();
-
-                let storage_clone = storage.clone();
-
-                let total_vectors = 10_000;
-
-                
-
-                thread::spawn(move || {
-
-                    for i in 0..total_vectors {
-
-                        // Generate diverse vectors to ensure splits
-
-                        let val = (i as f32) / 10.0; 
-
-                        let vec_data = vec![val, val];
-
-                        let vec = Vector::new(i, vec_data.clone());
-
-        
-
-                        // Route using the shared routing table (simulating real workers)
-
-                        // Retry loop to handle race where router might be empty briefly or updating
-
-                        let target = loop {
-
-                            if let Some(snap) = routing_clone.snapshot() {
-
-                                if let Ok(ids) = snap.router.query(&vec_data, 1) {
-
-                                    if !ids.is_empty() {
-
-                                        break ids[0];
-
-                                    }
-
-                                }
-
+                let target = loop {
+                    if let Some(snap) = routing_clone.snapshot() {
+                        if let Ok(ids) = snap.router.query(&vec_data, 1) {
+                            if !ids.is_empty() {
+                                break ids[0];
                             }
-
-                            // Fallback to 0 if router not ready (shouldn't happen often after prime)
-
-                            // But if 0 is removed, we must wait for new buckets.
-
-                            thread::sleep(Duration::from_millis(1));
-
-                        };
-
-        
-
-                        block_on(storage_clone.put_chunk_raw(target, &[vec])).unwrap();
-
-                        
-
-                        if i % 100 == 0 {
-
-                            thread::sleep(Duration::from_micros(100)); // Slight pacing
-
                         }
-
                     }
 
-                });
+                    // Fallback to 0 if router not ready (shouldn't happen often after prime)
 
-        
+                    // But if 0 is removed, we must wait for new buckets.
 
-                // 4. Monitor Splits
+                    thread::sleep(Duration::from_millis(1));
+                };
 
-                // We expect bucket count to grow significantly.
+                block_on(storage_clone.put_chunk_raw(target, &[vec])).unwrap();
 
-                // Threshold 100, 10000 vectors -> theoretically ~100 buckets.
+                if i % 100 == 0 {
+                    thread::sleep(Duration::from_micros(100)); // Slight pacing
+                }
+            }
+        });
 
-                // We'll accept anything > 10 as proof of continuous operation.
+        // 4. Monitor Splits
 
-                
+        // We expect bucket count to grow significantly.
 
-                        let start = Instant::now();
+        // Threshold 100, 10000 vectors -> theoretically ~100 buckets.
 
-                
+        // We'll accept anything > 10 as proof of continuous operation.
 
-                        let mut max_buckets = 0;
+        let start = Instant::now();
 
-                
+        let mut max_buckets = 0;
 
-                        
+        while start.elapsed() < Duration::from_secs(30) {
+            let sizes = worker.snapshot_sizes();
 
-                
+            let count = sizes.len();
 
-                        while start.elapsed() < Duration::from_secs(30) {
+            if count > max_buckets {
+                max_buckets = count;
 
-                
+                println!("Bucket count grew to: {}", max_buckets);
+            }
 
-                            let sizes = worker.snapshot_sizes();
+            if max_buckets >= 5 {
+                println!(
+                    "Success: Bucket count reached {}, proving continuous rebalancing.",
+                    max_buckets
+                );
 
-                
+                return;
+            }
 
-                            let count = sizes.len();
+            thread::sleep(Duration::from_millis(100));
+        }
 
-                
-
-                            if count > max_buckets {
-
-                
-
-                                max_buckets = count;
-
-                
-
-                                println!("Bucket count grew to: {}", max_buckets);
-
-                
-
-                            }
-
-                
-
-                            
-
-                
-
-                                        if max_buckets >= 5 {
-
-                
-
-                            
-
-                
-
-                                            println!("Success: Bucket count reached {}, proving continuous rebalancing.", max_buckets);
-
-                
-
-                            
-
-                
-
-                                            return;
-
-                
-
-                            
-
-                
-
-                                        }
-
-                
-
-                            
-
-                
-
-                                        
-
-                
-
-                            
-
-                
-
-                                        thread::sleep(Duration::from_millis(100));
-
-                
-
-                            
-
-                
-
-                                    }
-
-                
-
-                            
-
-                
-
-                            
-
-                
-
-                            
-
-                
-
-                                    panic!(
-
-                
-
-                            
-
-                
-
-                                        "Rebalancer failed to split enough times. Max buckets reached: {} (expected >= 5)",
-
-                
-
-                            
-
-                
-
-                                        max_buckets
-
-                
-
-                            
-
-                
-
-                                    );
-
-                
-
-                            
-
-                
-
-                                }
-
-                
-
-                            
-
-                
-
-                            }
+        panic!(
+            "Rebalancer failed to split enough times. Max buckets reached: {} (expected >= 5)",
+            max_buckets
+        );
+    }
+}
