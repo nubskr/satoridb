@@ -63,8 +63,12 @@ fn split_updates_routing_and_executor_results() -> Result<()> {
     // Autonomous loop should split bucket 0
 
     // Wait for routing to advance and for sizes to show multiple buckets.
+    // Also wait for rebalance to finish (total count settles back to 8).
+    // During streaming rebalance, we might see duplicates (transiently 16, then 12, then 8).
     let progressed = wait_until(Duration::from_secs(3), || {
-        worker.snapshot_sizes().len() > 1 && routing.current_version() > 0
+        let sizes = worker.snapshot_sizes();
+        let total: usize = sizes.values().sum();
+        sizes.len() > 1 && routing.current_version() > 0 && total == 8
     });
     assert!(progressed, "split did not finish in time");
 
