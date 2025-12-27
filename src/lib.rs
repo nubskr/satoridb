@@ -113,6 +113,8 @@ pub mod router_hnsw;
 #[doc(hidden)]
 pub mod router_manager;
 #[doc(hidden)]
+pub mod s3_reader;
+#[doc(hidden)]
 pub mod service;
 #[doc(hidden)]
 pub mod storage;

@@ -33,7 +33,14 @@ $(BASE_F32): $(BASE)
 	$(CARGO) run --release --bin prepare_dataset -- $< $@
 
 benchmark: bigann-download bigann-prepare
-	SATORI_RUN_BENCH=1 $(CARGO) run --release --bin satoridb
+	WALRUS_QUIET=1 SATORI_RUN_BENCH=1 $(CARGO) run --release --bin satoridb
+
+clean-db:
+	rm -rf wal_files vector_index bucket_index
+
+benchmark-s3: clean-db $(QUERY) $(GND)
+	@echo "Running benchmark with S3 streaming (requires .env with R2 credentials)..."
+	WALRUS_QUIET=1 RUST_LOG=info SATORI_RUN_BENCH=1 $(CARGO) run --release --bin satoridb
 
 clean-benchmark-data:
 	rm -f $(BASE) $(BASE_F32) $(QUERY) $(GND)

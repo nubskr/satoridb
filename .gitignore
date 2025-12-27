@@ -1,5 +1,5 @@
+.env
 /.tmp
-/vector_index
 *.f32bin
 *.svg
 perf.*

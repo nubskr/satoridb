@@ -20,12 +20,27 @@ impl VectorIndex {
         opts.create_if_missing(true);
         opts.set_compression_type(rocksdb::DBCompressionType::Zstd);
         opts.optimize_level_style_compaction(64 * 1024 * 1024);
+
+        // Enforce FD limits by disabling mmap
+        opts.set_max_open_files(1024);
+        opts.set_allow_mmap_reads(false);
+        opts.set_allow_mmap_writes(false);
+
+        // Increase background jobs for compaction
+        opts.set_max_background_jobs(4);
+
+        // Enforce backpressure
+        opts.set_level_zero_file_num_compaction_trigger(4);
+        opts.set_level_zero_slowdown_writes_trigger(20);
+        opts.set_level_zero_stop_writes_trigger(36);
+
         let cache = Cache::new_lru_cache(64 * 1024 * 1024);
         let mut block_opts = BlockBasedOptions::default();
         block_opts.set_block_cache(&cache);
         opts.set_block_based_table_factory(&block_opts);
-        opts.set_write_buffer_size(16 * 1024 * 1024);
-        opts.set_max_write_buffer_number(2);
+        opts.set_write_buffer_size(64 * 1024 * 1024); // Increase buffer size
+        opts.set_max_write_buffer_number(4);
+
         let db = DB::open(&opts, path).context("open vector index")?;
         Ok(Self { db })
     }
